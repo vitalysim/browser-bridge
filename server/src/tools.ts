@@ -306,10 +306,142 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
     async ({ tabId }) => textResult(await hub.call("debugger_status", { tabId })),
   );
 
+  // ---- web-security capabilities: WS frames, identities, in-session replay, authz diffing ----
+
+  tool(
+    "net_get_ws_frames",
+    "Return captured WebSocket / EventSource frames (dir, opcode, payload) from the active capture. " +
+      "Requires net_capture_start first.",
+    {
+      urlFilter: z.string().optional().describe("Only frames whose socket URL contains this substring"),
+      limit: z.number().optional().describe("Max frames (default 200, newest kept)"),
+      tabId: tabIdParam,
+    },
+    async ({ urlFilter, limit, tabId }) => textResult(await hub.call("net_get_ws_frames", { urlFilter, limit, tabId })),
+  );
+
+  tool(
+    "identity_capture",
+    "Snapshot the current tab's session as a named identity: cookies (incl. HttpOnly, via the debugger), " +
+      "local/sessionStorage, and any Authorization bearer seen in the capture buffer. Log in as the account " +
+      "first, then capture. Use the names with replay_request/authz_matrix. Shows the debugging banner.",
+    {
+      name: z.string().describe("Identity name, e.g. 'A', 'B', or 'admin'"),
+      domain: z.string().optional().describe("Only keep cookies for this domain (e.g. 'example.com')"),
+      tabId: tabIdParam,
+    },
+    async ({ name, domain, tabId }) => textResult(await hub.call("identity_capture", { name, domain, tabId })),
+  );
+
+  tool(
+    "identity_list",
+    "List captured identities (name, cookie count, whether a bearer was captured).",
+    {},
+    async () => textResult(await hub.call("identity_list", {})),
+  );
+
+  tool(
+    "identity_purge",
+    "Delete a captured identity from memory.",
+    { name: z.string().describe("Identity name to remove") },
+    async ({ name }) => textResult(await hub.call("identity_purge", { name })),
+  );
+
+  tool(
+    "replay_request",
+    "Re-issue a request from the tab's live session (an in-session Repeater). Give a requestId (from " +
+      "net_get_requests) or an ad-hoc {url,method,headers,body}; optional overrides {url,method,headers,body}. " +
+      "Set identity to send as a captured identity or 'anon' (strips cookies/bearer) — this uses the CDP Fetch " +
+      "path to override forbidden headers like Cookie. Returns {status,headers,body}. Shows the banner when identity/forbidden headers are used.",
+    {
+      requestId: z.string().optional().describe("requestId from net_get_requests to replay"),
+      url: z.string().optional().describe("Ad-hoc request URL (if no requestId)"),
+      method: z.string().optional().describe("HTTP method (default GET)"),
+      headers: z.record(z.string()).optional().describe("Ad-hoc request headers"),
+      body: z.string().optional().describe("Request body"),
+      overrides: z
+        .object({ url: z.string().optional(), method: z.string().optional(), headers: z.record(z.string()).optional(), body: z.string().optional() })
+        .optional()
+        .describe("Fields to override on the base request"),
+      identity: z.string().optional().describe("Send as this captured identity, or 'anon'"),
+      viaAppClient: z.boolean().optional().describe("Route through the page's own fetch (reserved)"),
+      tabId: tabIdParam,
+    },
+    async (args) => textResult(await hub.call("replay_request", args, 45_000)),
+  );
+
+  tool(
+    "authz_matrix",
+    "Access-control (BOLA/IDOR/BFLA) oracle: replay each captured request under each identity and diff the " +
+      "responses. Flags when a non-baseline identity (or 'anon') reaches the same resource as the baseline. " +
+      "Set mutateIds:true to also probe an id+1 neighbor. Shows the banner.",
+    {
+      requestIds: z.array(z.string()).describe("requestIds (from net_get_requests) to test"),
+      identities: z.array(z.string()).describe("Identity names to replay as; first is the baseline. Include 'anon' to test unauthenticated."),
+      mutateIds: z.boolean().optional().describe("Also replay an id+1 neighbor of each request"),
+      tabId: tabIdParam,
+    },
+    async ({ requestIds, identities, mutateIds, tabId }) => {
+      const res = await hub.call("authz_matrix", { requestIds, identities, mutateIds, tabId }, 90_000);
+      // annotate cells with response_diff vs the baseline identity + access-control flags
+      for (const row of res.rows ?? []) {
+        const base = row.cells?.[0];
+        for (const cell of row.cells ?? []) {
+          if (!base || cell === base || cell.error) continue;
+          cell.diff = responseDiff(base, cell);
+          if (cell.status && cell.status < 400 && cell.diff.similarity > 0.6)
+            cell.flag = "ACCESS-CONTROL: reached the same resource as the baseline identity";
+          else if (cell.identity === "anon" && cell.status && cell.status < 400) cell.flag = "BROKEN-AUTH: anonymous access succeeded";
+        }
+      }
+      return textResult(res);
+    },
+  );
+
+  tool(
+    "response_diff",
+    "Structurally diff two responses (status equality, length delta, token-Jaccard similarity with " +
+      "nonce/CSRF/timestamp noise suppressed). Pass a and b as {status, body}.",
+    {
+      a: z.object({ status: z.number().optional(), body: z.string().optional() }).describe("Baseline response"),
+      b: z.object({ status: z.number().optional(), body: z.string().optional() }).describe("Comparison response"),
+    },
+    async ({ a, b }) => textResult(responseDiff(a as any, b as any)),
+  );
+
   tool(
     "bridge_status",
     "Check whether the Chrome extension is currently connected to the bridge.",
     {},
     async () => textResult({ extensionConnected: hub.connected })
   );
+}
+
+// ---- server-side response diffing (used by authz_matrix + the response_diff tool) ----
+
+const NOISE = /("(?:csrf|token|nonce|_token|authenticity_token|timestamp|ts|time|date|expires|iat|exp|sid|requestid)"\s*:\s*"[^"]*")/gi;
+
+function tokenize(s: string): Set<string> {
+  return new Set((String(s || "").toLowerCase().replace(NOISE, "").match(/[a-z0-9_]+/g) || []).slice(0, 5000));
+}
+
+function jaccard(a: string, b: string): number {
+  const A = tokenize(a);
+  const B = tokenize(b);
+  if (!A.size && !B.size) return 1;
+  let inter = 0;
+  for (const t of A) if (B.has(t)) inter++;
+  return inter / (A.size + B.size - inter);
+}
+
+function responseDiff(a: { status?: number; body?: string; bytes?: number }, b: { status?: number; body?: string; bytes?: number }) {
+  const aLen = a.bytes ?? (a.body ? a.body.length : 0);
+  const bLen = b.bytes ?? (b.body ? b.body.length : 0);
+  return {
+    sameStatus: a.status === b.status,
+    statusA: a.status,
+    statusB: b.status,
+    lenDelta: bLen - aLen,
+    similarity: Number(jaccard(a.body || "", b.body || "").toFixed(3)),
+  };
 }

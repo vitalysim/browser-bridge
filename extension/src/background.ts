@@ -1,6 +1,6 @@
 /// <reference types="chrome" />
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const PING_INTERVAL_MS = 20_000; // WS traffic resets the MV3 service-worker idle timer (Chrome 116+)
 const RECONNECT_MAX_MS = 30_000;
 
@@ -420,10 +420,28 @@ interface NetEntry {
   requestHeaders?: Record<string, string>;
   responseHeaders?: Record<string, string>;
   requestBody?: string;
+  timing?: any;
   finished?: boolean;
   failed?: string;
   ts?: number;
 }
+
+interface ExtraInfo {
+  reqHeaders?: Record<string, string>;
+  respHeaders?: Record<string, string>;
+  setCookie?: string[];
+}
+
+interface WsFrame {
+  requestId: string;
+  url?: string;
+  dir: "sent" | "received" | "create" | "close" | "sse";
+  opcode?: number;
+  payload?: string;
+  ts: number;
+}
+
+const WS_MAX_FRAMES = 1000;
 
 interface Session {
   attachedAt: number;
@@ -431,10 +449,18 @@ interface Session {
   net: NetEntry[];
   netOn: boolean;
   netFilter?: string; // if set, only buffer requests whose URL contains this
+  extra: Map<string, ExtraInfo>; // requestId -> raw ExtraInfo headers (incl. Set-Cookie / sent Cookie)
+  wsUrls: Map<string, string>; // ws requestId -> url
+  wsFrames: WsFrame[];
   refNodes: Map<number, number>; // snapshot ref -> CDP backendNodeId
 }
 
 const sessions = new Map<number, Session>();
+
+// Named identity snapshots (cookies incl. HttpOnly + storage + bearer) for replay/authz_matrix.
+const identities = new Map<string, { cookies: any[]; storage: any; bearer?: string }>();
+// Transient CDP Fetch interceptors, keyed by tabId, used during replay to override headers.
+const interceptors = new Map<number, (p: any) => void>();
 
 function cmd(tabId: number, method: string, params?: any): Promise<any> {
   return new Promise((resolve, reject) => {
@@ -470,7 +496,16 @@ async function ensureAttached(tabId: number): Promise<Session> {
     await attach(tabId);
     await cmd(tabId, "DOM.enable");
     await cmd(tabId, "Page.enable");
-    s = { attachedAt: Date.now(), lastUsedAt: Date.now(), net: [], netOn: false, refNodes: new Map() };
+    s = {
+      attachedAt: Date.now(),
+      lastUsedAt: Date.now(),
+      net: [],
+      netOn: false,
+      extra: new Map(),
+      wsUrls: new Map(),
+      wsFrames: [],
+      refNodes: new Map(),
+    };
     sessions.set(tabId, s);
   }
   s.lastUsedAt = Date.now();
@@ -497,6 +532,13 @@ function idleSweep() {
 function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, params: any) {
   const tabId = source.tabId;
   if (tabId == null) return;
+  // Fetch interception (replay) — handled before the capture guard, may fire with netOn=false.
+  if (method === "Fetch.requestPaused") {
+    const h = interceptors.get(tabId);
+    if (h) h(params);
+    else cmd(tabId, "Fetch.continueRequest", { requestId: params.requestId }).catch(() => {});
+    return;
+  }
   const s = sessions.get(tabId);
   if (!s || !s.netOn) return;
   const find = (id: string) => s.net.find((e) => e.requestId === id);
@@ -519,15 +561,62 @@ function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, param
       e.status = params.response?.status;
       e.mimeType = params.response?.mimeType;
       e.responseHeaders = params.response?.headers;
+      e.timing = params.response?.timing;
       if (!e.type && params.type) e.type = params.type;
     }
+  } else if (method === "Network.requestWillBeSentExtraInfo") {
+    // raw request headers incl. the Cookie actually sent
+    const x = s.extra.get(params.requestId) ?? {};
+    x.reqHeaders = params.headers;
+    s.extra.set(params.requestId, x);
+  } else if (method === "Network.responseReceivedExtraInfo") {
+    // raw response headers incl. Set-Cookie (dropped from Network.responseReceived.headers)
+    const x = s.extra.get(params.requestId) ?? {};
+    x.respHeaders = params.headers;
+    const sc = params.headers?.["set-cookie"] ?? params.headers?.["Set-Cookie"];
+    if (sc) x.setCookie = String(sc).split("\n");
+    s.extra.set(params.requestId, x);
   } else if (method === "Network.loadingFinished") {
     const e = find(params.requestId);
     if (e) e.finished = true;
   } else if (method === "Network.loadingFailed") {
     const e = find(params.requestId);
     if (e) e.failed = params.errorText || "failed";
+  } else if (method === "Network.webSocketCreated") {
+    s.wsUrls.set(params.requestId, params.url);
+    pushWs(s, { requestId: params.requestId, url: params.url, dir: "create", ts: Date.now() });
+  } else if (method === "Network.webSocketFrameSent") {
+    pushWs(s, wsFrame(s, params, "sent"));
+  } else if (method === "Network.webSocketFrameReceived") {
+    pushWs(s, wsFrame(s, params, "received"));
+  } else if (method === "Network.webSocketClosed") {
+    pushWs(s, { requestId: params.requestId, url: s.wsUrls.get(params.requestId), dir: "close", ts: Date.now() });
+  } else if (method === "Network.eventSourceMessageReceived") {
+    pushWs(s, {
+      requestId: params.requestId,
+      url: s.wsUrls.get(params.requestId),
+      dir: "sse",
+      payload: String(params.data ?? "").slice(0, BODY_CAP),
+      ts: Date.now(),
+    });
   }
+}
+
+function pushWs(s: Session, f: WsFrame) {
+  if (s.wsFrames.length >= WS_MAX_FRAMES) s.wsFrames.shift();
+  s.wsFrames.push(f);
+}
+
+function wsFrame(s: Session, params: any, dir: "sent" | "received"): WsFrame {
+  const payload = params.response?.payloadData;
+  return {
+    requestId: params.requestId,
+    url: s.wsUrls.get(params.requestId),
+    dir,
+    opcode: params.response?.opcode,
+    payload: payload != null ? String(payload).slice(0, BODY_CAP) : undefined,
+    ts: Date.now(),
+  };
 }
 
 async function getResponseBody(tabId: number, requestId: string): Promise<{ body: string; base64: boolean }> {
@@ -535,6 +624,140 @@ async function getResponseBody(tabId: number, requestId: string): Promise<{ body
   let body = r?.body ?? "";
   if (typeof body === "string" && body.length > BODY_CAP) body = body.slice(0, BODY_CAP) + "\n…[truncated]";
   return { body, base64: !!r?.base64Encoded };
+}
+
+// ---- request replay ----
+// Injected in the page MAIN world; reads the full response (status, headers, body) after a fetch.
+function bbFetch(url: string, method: string, headers: Record<string, string> | null, body: string | null) {
+  return fetch(url, { method, headers: headers || undefined, body: body ?? undefined, credentials: "include" })
+    .then(async (r) => {
+      const h: Record<string, string> = {};
+      r.headers.forEach((v, k) => (h[k] = v));
+      return { status: r.status, headers: h, body: (await r.text()).slice(0, 512 * 1024) };
+    })
+    .catch((e) => ({ error: String(e) }));
+}
+
+// Same-identity replay: page fetch with the tab's live session (cookies/SameSite honored).
+async function replayViaMainFetch(tab: chrome.tabs.Tab, url: string, method: string, headers: Record<string, string>, body?: string) {
+  const r = await inject(tab, bbFetch, [url, method, Object.keys(headers).length ? headers : null, body ?? null], "MAIN");
+  return { ...r, via: "page-fetch" };
+}
+
+// Full-control replay via CDP Fetch: override any header (incl. forbidden Cookie/Origin/etc.) or strip
+// them (identity swap / anon). Never mutates the live cookie jar.
+async function replayViaCdpFetch(
+  tab: chrome.tabs.Tab,
+  url: string,
+  method: string,
+  overrideHeaders: Record<string, string | null>,
+  body?: string
+) {
+  const tabId = tab.id!;
+  await ensureAttached(tabId);
+  await cmd(tabId, "Fetch.enable", { patterns: [{ urlPattern: url, requestStage: "Request" }] });
+  let intercepted = false;
+  interceptors.set(tabId, (p: any) => {
+    intercepted = true;
+    // start from the real headers the browser built, then apply overrides (null = drop, case-insensitive)
+    const merged: Record<string, string> = {};
+    for (const [k, v] of Object.entries(p.request?.headers ?? {})) merged[String(k).toLowerCase()] = String(v);
+    for (const [k, v] of Object.entries(overrideHeaders)) {
+      const key = k.toLowerCase();
+      if (v == null) delete merged[key];
+      else merged[key] = String(v);
+    }
+    const headers = Object.entries(merged).map(([name, value]) => ({ name, value }));
+    cmd(tabId, "Fetch.continueRequest", { requestId: p.requestId, headers }).catch(() => {});
+  });
+  // Watchdog: if our request never pauses, don't leave Fetch enabled forever.
+  const watchdog = setTimeout(() => interceptors.delete(tabId), 15_000);
+  try {
+    const r = await inject(tab, bbFetch, [url, method, null, body ?? null], "MAIN");
+    return { ...r, via: "cdp-fetch", intercepted };
+  } finally {
+    clearTimeout(watchdog);
+    interceptors.delete(tabId);
+    await cmd(tabId, "Fetch.disable").catch(() => {});
+  }
+}
+
+function djb2(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(16);
+}
+
+// Return the URL with its last integer (path segment or id-like query value) incremented, or null.
+function neighborUrl(url: string): string | null {
+  const m = url.match(/(\d+)(?!.*\d)/);
+  if (!m) return null;
+  const n = String(Number(m[1]) + 1);
+  return url.slice(0, m.index!) + n + url.slice(m.index! + m[1].length);
+}
+
+const FORBIDDEN_HEADER = /^(cookie|host|origin|referer|user-agent|sec-|connection|content-length|accept-encoding)/i;
+
+// Resolve a replay's base request (from a captured requestId or an ad-hoc spec) + overrides + identity,
+// then pick the page-fetch or CDP-fetch path.
+async function doReplay(tab: chrome.tabs.Tab, params: any): Promise<any> {
+  const tabId = tab.id!;
+  let base: { url?: string; method: string; headers: Record<string, string>; body?: string } = {
+    url: params.url,
+    method: (params.method || "GET").toUpperCase(),
+    headers: params.headers || {},
+    body: params.body,
+  };
+  if (params.requestId) {
+    const s = sessions.get(tabId);
+    const e = s?.net.find((x) => x.requestId === params.requestId);
+    if (!e) throw new Error("requestId not found in this tab's capture buffer");
+    base = {
+      url: e.url,
+      method: (e.method || "GET").toUpperCase(),
+      headers: s!.extra.get(e.requestId)?.reqHeaders ?? e.requestHeaders ?? {},
+      body: e.requestBody,
+    };
+    if (base.body == null && ["POST", "PUT", "PATCH", "DELETE"].includes(base.method)) {
+      try {
+        const pd = await cmd(tabId, "Network.getRequestPostData", { requestId: params.requestId });
+        base.body = pd?.postData;
+      } catch {
+        /* body unavailable */
+      }
+    }
+  }
+  const ov = params.overrides || {};
+  const url = ov.url || base.url;
+  if (!url) throw new Error("Provide a url (or a requestId to replay)");
+  const method = (ov.method || base.method).toUpperCase();
+  const headers: Record<string, string> = { ...base.headers, ...(ov.headers || {}) };
+  const body = ov.body !== undefined ? ov.body : base.body;
+
+  // identity → header overrides (Cookie / Authorization), or strip for anon
+  const identityHeaders: Record<string, string | null> = {};
+  let useIdentity = false;
+  if (params.identity) {
+    useIdentity = true;
+    if (params.identity === "anon") {
+      identityHeaders["cookie"] = null;
+      identityHeaders["authorization"] = null;
+    } else {
+      const id = identities.get(params.identity);
+      if (!id) throw new Error(`identity '${params.identity}' not captured — call identity_capture first`);
+      if (id.cookies?.length) identityHeaders["cookie"] = id.cookies.map((c: any) => `${c.name}=${c.value}`).join("; ");
+      if (id.bearer) identityHeaders["authorization"] = id.bearer;
+    }
+  }
+
+  const needCdp = useIdentity || Object.keys(headers).some((h) => FORBIDDEN_HEADER.test(h));
+  if (needCdp) {
+    const overrideHeaders: Record<string, string | null> = {};
+    for (const [k, v] of Object.entries(headers)) overrideHeaders[k.toLowerCase()] = v;
+    for (const [k, v] of Object.entries(identityHeaders)) overrideHeaders[k.toLowerCase()] = v;
+    return replayViaCdpFetch(tab, url, method, overrideHeaders, body);
+  }
+  return replayViaMainFetch(tab, url, method, headers, body);
 }
 
 // ---- CDP element resolution (for trusted input / closed shadow / file upload) ----
@@ -793,9 +1016,12 @@ async function dispatch(method: string, params: any): Promise<any> {
       const s = await ensureAttached(tab.id!);
       await cmd(tab.id!, "Network.enable");
       s.net = [];
+      s.extra = new Map();
+      s.wsUrls = new Map();
+      s.wsFrames = [];
       s.netOn = true;
       s.netFilter = params.urlFilter || undefined;
-      return { capturing: true, tabId: tab.id!, note: "Now navigate/reload the tab to capture its load traffic. Banner is showing while attached." };
+      return { capturing: true, tabId: tab.id!, note: "Now navigate/reload the tab to capture its load traffic (incl. Set-Cookie and WebSocket frames). Banner is showing while attached." };
     }
 
     case "net_get_requests": {
@@ -809,6 +1035,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       if (entries.length > limit) entries = entries.slice(-limit);
       const out: any[] = [];
       for (const e of entries) {
+        const x = s.extra.get(e.requestId);
         const row: any = {
           requestId: e.requestId,
           method: e.method,
@@ -817,9 +1044,12 @@ async function dispatch(method: string, params: any): Promise<any> {
           status: e.status,
           mimeType: e.mimeType,
           failed: e.failed,
-          requestHeaders: e.requestHeaders,
-          responseHeaders: e.responseHeaders,
+          timing: e.timing,
+          // prefer the raw ExtraInfo header sets (they include Set-Cookie and the sent Cookie)
+          requestHeaders: x?.reqHeaders ?? e.requestHeaders,
+          responseHeaders: x?.respHeaders ?? e.responseHeaders,
         };
+        if (x?.setCookie) row.setCookie = x.setCookie;
         if (e.requestBody) row.requestBody = e.requestBody;
         if (params.includeBodies && e.finished && !e.failed) {
           try {
@@ -842,6 +1072,119 @@ async function dispatch(method: string, params: any): Promise<any> {
       s.lastUsedAt = Date.now();
       const b = await getResponseBody(tab.id!, params.requestId);
       return { requestId: params.requestId, base64: b.base64, body: b.body };
+    }
+
+    case "net_get_ws_frames": {
+      const tab = await targetTab(params.tabId);
+      const s = sessions.get(tab.id!);
+      if (!s) throw new Error("Not capturing on this tab — call net_capture_start first.");
+      s.lastUsedAt = Date.now();
+      const filter: string | undefined = params.urlFilter;
+      let frames = s.wsFrames.filter((f) => !filter || (f.url ?? "").includes(filter));
+      const limit = params.limit ?? 200;
+      if (frames.length > limit) frames = frames.slice(-limit);
+      return { count: frames.length, totalBuffered: s.wsFrames.length, frames };
+    }
+
+    case "identity_capture": {
+      const tab = await targetTab(params.tabId);
+      await ensureAttached(tab.id!);
+      await cmd(tab.id!, "Network.enable");
+      const domain: string | undefined = params.domain;
+      const all = await cmd(tab.id!, "Network.getAllCookies");
+      let cookies: any[] = all?.cookies ?? [];
+      if (domain) {
+        const d = domain.replace(/^\./, "");
+        cookies = cookies.filter((c) => {
+          const cd = String(c.domain || "").replace(/^\./, "");
+          return cd === d || cd.endsWith("." + d) || d.endsWith("." + cd) || cd.endsWith(d);
+        });
+      }
+      let storage: any = {};
+      try {
+        storage = await inject(
+          tab,
+          () => ({
+            local: Object.fromEntries(Object.entries(localStorage)),
+            session: Object.fromEntries(Object.entries(sessionStorage)),
+          }),
+          [],
+          "MAIN"
+        );
+      } catch {
+        /* not scriptable */
+      }
+      let bearer: string | undefined;
+      const s = sessions.get(tab.id!);
+      if (s) {
+        for (let i = s.net.length - 1; i >= 0 && !bearer; i--) {
+          const h = s.extra.get(s.net[i].requestId)?.reqHeaders ?? s.net[i].requestHeaders;
+          if (h) bearer = (h as any).authorization ?? (h as any).Authorization;
+        }
+      }
+      identities.set(params.name, { cookies, storage, bearer });
+      return {
+        name: params.name,
+        cookies: cookies.length,
+        httpOnly: cookies.filter((c) => c.httpOnly).length,
+        hasStorage: !!(storage && (Object.keys(storage.local || {}).length || Object.keys(storage.session || {}).length)),
+        hasBearer: !!bearer,
+      };
+    }
+
+    case "identity_list":
+      return {
+        identities: [...identities.entries()].map(([name, v]) => ({
+          name,
+          cookies: v.cookies?.length ?? 0,
+          hasBearer: !!v.bearer,
+        })),
+      };
+
+    case "identity_purge":
+      return { purged: identities.delete(params.name), name: params.name };
+
+    case "replay_request": {
+      const tab = await targetTab(params.tabId);
+      return doReplay(tab, params);
+    }
+
+    case "authz_matrix": {
+      const tab = await targetTab(params.tabId);
+      const reqIds: string[] = params.requestIds ?? [];
+      const idents: string[] = params.identities ?? [];
+      if (!reqIds.length || !idents.length) throw new Error("Provide requestIds[] and identities[]");
+      const s = sessions.get(tab.id!);
+      const rows: any[] = [];
+      const runOne = async (rid: string, urlOverride?: string, label?: string) => {
+        const e = s?.net.find((x) => x.requestId === rid);
+        const cells: any[] = [];
+        for (const ident of idents) {
+          try {
+            const r = await doReplay(tab, {
+              tabId: tab.id,
+              requestId: urlOverride == null ? rid : undefined,
+              url: urlOverride ?? undefined,
+              method: e?.method,
+              identity: ident,
+            });
+            const body = typeof r.body === "string" ? r.body : "";
+            cells.push({ identity: ident, status: r.status, bytes: body.length, bodyHash: djb2(body), body: body.slice(0, 2000) });
+          } catch (err) {
+            cells.push({ identity: ident, error: err instanceof Error ? err.message : String(err) });
+          }
+        }
+        rows.push({ requestId: rid, url: urlOverride ?? e?.url, method: e?.method, label, cells });
+      };
+      for (const rid of reqIds) {
+        await runOne(rid);
+        if (params.mutateIds) {
+          const e = s?.net.find((x) => x.requestId === rid);
+          const nb = e?.url ? neighborUrl(e.url) : null;
+          if (nb) await runOne(rid, nb, "id+1 neighbor");
+        }
+      }
+      return { rows };
     }
 
     case "debugger_detach": {
