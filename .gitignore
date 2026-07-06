@@ -1,0 +1,6 @@
+node_modules/
+server/dist/
+extension/background.js
+extension/options.js
+*.log
+.DS_Store
