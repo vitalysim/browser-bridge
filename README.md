@@ -3,7 +3,7 @@
 > **Drive your real, logged-in Chrome from an AI agent** — over the Model Context Protocol. No headless browser, no fresh profile, no re-login. Your agent reads and acts inside the exact sessions you're already signed into.
 
 <p>
-  <img alt="version"  src="https://img.shields.io/badge/version-0.4.2-4f46e5">
+  <img alt="version"  src="https://img.shields.io/badge/version-0.4.5-4f46e5">
   <img alt="tools"    src="https://img.shields.io/badge/tools-32-7c3aed">
   <img alt="protocol" src="https://img.shields.io/badge/MCP-streamable_HTTP-7c3aed">
   <img alt="browser"  src="https://img.shields.io/badge/Chrome%2FEdge-Manifest_V3-2563eb">
@@ -60,7 +60,7 @@ It ships **32 tools** spanning everyday browsing, DevTools-grade network capture
 
 **Browse & interact** — open/close/switch/list tabs, navigate, back/forward, click, fill, hover, type, press keys, scroll, and upload files. Interaction reaches **into iframes** (including cross-origin) and **open shadow DOM** out of the box.
 
-**Read & inspect** — extract page text (the workhorse for summarizing), snapshot interactive elements with stable refs, screenshot the viewport, and evaluate JavaScript in the page.
+**Read & inspect** — extract page text (the workhorse for summarizing), snapshot interactive elements with stable refs, screenshot (viewport by default, or **`fullPage`** for the entire scrollable page, **`scale:2`** for retina/high-DPI, `format`/`quality`, `selector` to clip an element, `savePath` to write a file), and evaluate JavaScript in the page.
 
 **DevTools-grade network capture** — record requests with **full request/response bodies**, response headers, `Set-Cookie` (via CDP ExtraInfo), timings, and **WebSocket/SSE frames** — the things a `webRequest`-based extension fundamentally can't read.
 
@@ -90,7 +90,7 @@ It ships **32 tools** spanning everyday browsing, DevTools-grade network capture
 |---|---|
 | `get_page_text` | Rendered text of the page (and its iframes) |
 | `snapshot` | Interactive elements with refs; `deep:true` pierces **closed** shadow roots |
-| `screenshot` | PNG of the visible viewport |
+| `screenshot` | Visible viewport (banner-free) by default; `fullPage` for the whole page, `scale` for retina, `format`/`quality`, `selector` to clip, `savePath` to write a file |
 | `eval_js` | Evaluate JavaScript in the page's main world |
 | `bridge_status` | Is the extension connected? |
 </details>

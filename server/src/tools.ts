@@ -1,8 +1,29 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { writeFileSync } from "fs";
 import type { ExtensionHub } from "./hub.js";
 
 const MAX_TEXT_CHARS = 60_000;
+
+// Parse pixel dimensions from a PNG or JPEG buffer (header only).
+function imageDims(buf: Buffer): { width: number; height: number } | null {
+  if (buf.length > 24 && buf[0] === 0x89 && buf[1] === 0x50) {
+    return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) }; // PNG IHDR
+  }
+  if (buf.length > 4 && buf[0] === 0xff && buf[1] === 0xd8) {
+    let o = 2;
+    while (o + 9 < buf.length) {
+      if (buf[o] !== 0xff) {
+        o++;
+        continue;
+      }
+      const marker = buf[o + 1];
+      if (marker >= 0xc0 && marker <= 0xc3) return { height: buf.readUInt16BE(o + 5), width: buf.readUInt16BE(o + 7) };
+      o += 2 + buf.readUInt16BE(o + 2);
+    }
+  }
+  return null;
+}
 
 function textResult(value: unknown) {
   let text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
@@ -226,12 +247,33 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
 
   tool(
     "screenshot",
-    "Take a PNG screenshot of a tab's visible viewport (activates the tab first).",
-    { tabId: tabIdParam },
-    async ({ tabId }) => {
-      const result = await hub.call("screenshot", { tabId });
+    "Screenshot a tab. Default: banner-free visible-viewport PNG. Options (these use chrome.debugger, " +
+      "showing the banner): fullPage:true captures the ENTIRE scrollable page; scale (e.g. 2) renders at " +
+      "high DPI/retina; format 'jpeg'+quality for smaller files; selector clips to one element; savePath " +
+      "writes the image to that absolute path and returns metadata instead of the (possibly large) inline image.",
+    {
+      tabId: tabIdParam,
+      fullPage: z.boolean().optional().describe("Capture the entire scrollable page (chrome.debugger)"),
+      scale: z.number().optional().describe("Device scale factor, e.g. 2 for retina-crisp output"),
+      format: z.enum(["png", "jpeg"]).optional().describe("Image format (default png)"),
+      quality: z.number().optional().describe("JPEG quality 0–100 (default 90)"),
+      selector: z.string().optional().describe("Clip to this CSS element instead of the page/viewport"),
+      savePath: z.string().optional().describe("Absolute path to write the image to (returns metadata, not the image)"),
+    },
+    async ({ tabId, fullPage, scale, format, quality, selector, savePath }) => {
+      const r = await hub.call("screenshot", { tabId, fullPage, scale, format, quality, selector }, 120_000);
+      const buf = Buffer.from(r.base64, "base64");
+      const dims = imageDims(buf);
+      const mimeType = r.format === "jpeg" ? ("image/jpeg" as const) : ("image/png" as const);
+      if (savePath) {
+        writeFileSync(savePath, buf);
+        return textResult({ path: savePath, bytes: buf.length, width: dims?.width, height: dims?.height, format: r.format });
+      }
       return {
-        content: [{ type: "image" as const, data: result.base64, mimeType: "image/png" }],
+        content: [
+          { type: "image" as const, data: r.base64, mimeType },
+          { type: "text" as const, text: `${dims?.width ?? "?"}×${dims?.height ?? "?"} ${r.format}, ${buf.length} bytes` },
+        ],
       };
     }
   );

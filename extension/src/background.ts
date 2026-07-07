@@ -1,6 +1,6 @@
 /// <reference types="chrome" />
 
-const VERSION = "0.4.2";
+const VERSION = "0.4.5";
 const PING_INTERVAL_MS = 20_000; // WS traffic resets the MV3 service-worker idle timer (Chrome 116+)
 const RECONNECT_MAX_MS = 30_000;
 
@@ -750,6 +750,84 @@ async function cdpResolve(tabId: number, ref: number | null, selector: string | 
   throw new Error("Provide either ref (from a deep snapshot) or selector");
 }
 
+const SHOT_MAX_PX = 16384; // Chrome's per-dimension surface limit
+
+// Full-page / high-DPI / element screenshot via CDP Page.captureScreenshot (shows the debugger banner).
+// `scale` is the FINAL output multiplier over CSS pixels (default 1 = CSS-resolution; 2 = retina).
+// CDP's clip.scale multiplies on top of the display's device pixel ratio, so we divide the DPR out to
+// keep output dimensions predictable (= CSS size × scale) and default file sizes reasonable.
+async function cdpScreenshot(tab: chrome.tabs.Tab, params: any): Promise<any> {
+  const tabId = tab.id!;
+  // Surface capture requires the tab to be visible/active, else it returns empty.
+  await chrome.tabs.update(tabId, { active: true });
+  await chrome.windows.update(tab.windowId!, { focused: true }).catch(() => {});
+  await ensureAttached(tabId);
+  await sleep(250);
+
+  const format = params.format === "jpeg" ? "jpeg" : "png";
+  const scale = typeof params.scale === "number" && params.scale > 0 ? params.scale : 1;
+  const quality = typeof params.quality === "number" ? params.quality : 90;
+
+  // True page dimensions + DPR straight from the page (Page.getLayoutMetrics under-reports content size).
+  const pd = await inject(
+    tab,
+    () => ({
+      sw: Math.max(document.documentElement.scrollWidth, document.body ? document.body.scrollWidth : 0, window.innerWidth),
+      sh: Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0, window.innerHeight),
+      iw: window.innerWidth,
+      ih: window.innerHeight,
+      sx: window.scrollX,
+      sy: window.scrollY,
+      dpr: window.devicePixelRatio || 1,
+    }),
+    [],
+    "MAIN"
+  );
+  const clipScale = scale / (pd.dpr || 1); // so output px = cssSize × scale
+
+  let clip: any;
+  if (params.selector) {
+    const nodeId = await cdpResolveBySelector(tabId, params.selector);
+    let model: any;
+    try {
+      model = (await cmd(tabId, "DOM.getBoxModel", { nodeId })).model;
+    } catch {
+      /* no box */
+    }
+    if (!model) throw new Error(`Element has no rendered box (offscreen/hidden): ${params.selector}`);
+    const q: number[] = model.border; // [x1,y1,x2,y2,x3,y3,x4,y4]
+    const xs = [q[0], q[2], q[4], q[6]];
+    const ys = [q[1], q[3], q[5], q[7]];
+    const x = Math.min(...xs);
+    const y = Math.min(...ys);
+    clip = { x, y, width: Math.max(...xs) - x, height: Math.max(...ys) - y, scale: clipScale };
+  } else if (params.fullPage) {
+    if (pd.sw * scale > SHOT_MAX_PX || pd.sh * scale > SHOT_MAX_PX) {
+      throw new Error(`Page too large for a single capture (${pd.sw}x${pd.sh} @${scale}x, limit ${SHOT_MAX_PX}px). Use a selector, a smaller scale, or capture regions.`);
+    }
+    clip = { x: 0, y: 0, width: pd.sw, height: pd.sh, scale: clipScale };
+  } else {
+    clip = { x: pd.sx, y: pd.sy, width: pd.iw, height: pd.ih, scale: clipScale };
+  }
+
+  const capture = async (fmt: "png" | "jpeg", q?: number): Promise<string> => {
+    const opts: any = { format: fmt, clip, captureBeyondViewport: true, fromSurface: true };
+    if (fmt === "jpeg") opts.quality = q ?? 90;
+    const res = await cmd(tabId, "Page.captureScreenshot", opts);
+    return res?.data || "";
+  };
+
+  let data = await capture(format, quality);
+  let outFormat = format;
+  // Large PNGs can exceed chrome.debugger's result-size limit and come back empty — fall back to JPEG.
+  if (!data && format === "png") {
+    data = await capture("jpeg", 92);
+    outFormat = "jpeg";
+  }
+  if (!data) throw new Error("Screenshot returned empty — the page may be too large; try a smaller scale, a selector, or format:'jpeg'.");
+  return { base64: data, format: outFormat, fellBackToJpeg: outFormat !== format || undefined };
+}
+
 async function trustedAction(tabId: number, action: string, ref: number | null, selector: string | null, text?: string): Promise<any> {
   await ensureAttached(tabId);
   const nodeId = await cdpResolve(tabId, ref, selector);
@@ -1206,11 +1284,14 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "screenshot": {
       const tab = await targetTab(params.tabId);
+      const rich = params.fullPage || params.selector || params.scale || (params.format && params.format !== "png");
+      if (rich) return cdpScreenshot(tab, params);
+      // default: banner-free visible-viewport PNG
       await chrome.tabs.update(tab.id!, { active: true });
       await chrome.windows.update(tab.windowId!, { focused: true });
       await sleep(350);
       const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId!, { format: "png" });
-      return { base64: dataUrl.replace(/^data:image\/png;base64,/, "") };
+      return { base64: dataUrl.replace(/^data:image\/png;base64,/, ""), format: "png" };
     }
 
     case "eval_js": {
