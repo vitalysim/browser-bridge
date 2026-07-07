@@ -123,7 +123,7 @@ It ships **32 tools** spanning everyday browsing, DevTools-grade network capture
 ## 🚀 Getting started
 
 ### Prerequisites
-- **Node.js 18+** and **Chrome or Edge** (Chromium-based; not Brave/Arc, not WSL)
+- **Node.js 18+** and **Chrome, Chromium, or Edge** — on **Linux, macOS, or Windows** (Chromium-based; not Brave/Arc, not WSL)
 - **Claude Code ≥ 2.0.73** and/or **OpenAI Codex CLI**
 
 ### 1 · Build
@@ -137,18 +137,27 @@ cd browser-bridge
 
 ### 2 · Run the server
 
+The server generates a random bearer token on first run and stores it at `~/.browser-bridge/token` (also
+printed on startup). Pick one:
+
+**Autostart (recommended)** — one command installs a background service for your OS (**systemd** user
+service on Linux, **launchd** LaunchAgent on macOS):
+
 ```bash
-cd server && npm start
+cd server && npm run install-service     # runs at login, restarts on crash
+# Linux: to start at boot without an active login:  loginctl enable-linger "$USER"
+# remove later with:  npm run uninstall-service
 ```
 
-The server generates a random bearer token on first run and stores it at `~/.browser-bridge/token` (also printed on startup). To keep it running across logins on macOS, install a **LaunchAgent**:
+**Manual** — just run it in a terminal:
 
 ```bash
-# adjust paths, then:
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/browser-bridge.plist
-tail -f ~/.browser-bridge/server.log
-curl -s http://127.0.0.1:8765/health          # {"ok":true,"extensionConnected":false}
+cd server && npm start        # or: nohup node dist/index.js >~/.browser-bridge/server.log 2>&1 &
 ```
+
+Verify: `curl -s http://127.0.0.1:8765/health` → `{"ok":true,"extensionConnected":false}` (becomes `true`
+once the extension is loaded). Logs: Linux `journalctl --user -u browser-bridge -f`; macOS/manual
+`tail -f ~/.browser-bridge/server.log`.
 
 ### 3 · Load the extension
 
@@ -190,6 +199,9 @@ With Chrome open and logged in, just ask your agent in natural language:
 list my open tabs
 open github.com, read my notifications, and summarize them
 
+# Screenshots
+take a full-page retina screenshot of this page and save it to ~/Downloads/page.png
+
 # Network capture
 start a network capture on this tab, reload it, and show me the JSON API responses
 
@@ -199,6 +211,31 @@ replay the invoices request as A, B and anon and show me the authz_matrix
 ```
 
 Both Claude Code and Codex drive the same live browser through the same endpoint.
+
+### Screenshots
+
+`screenshot` defaults to a banner-free capture of the visible viewport. Options (these use
+`chrome.debugger`, so they show the debugging banner):
+
+| Want | Call |
+|---|---|
+| Entire scrollable page | `screenshot(fullPage: true)` |
+| Retina / high-DPI (dimensions = CSS × scale) | `screenshot(fullPage: true, scale: 2)` |
+| Smaller file | `screenshot(format: "jpeg", quality: 85)` |
+| Just one element | `screenshot(selector: "#invoice")` |
+| Write to disk (best for large full pages) | `screenshot(fullPage: true, savePath: "/abs/path.png")` |
+
+`savePath` returns `{ path, bytes, width, height }` instead of a multi-MB inline image. Limits: capture
+maxes out at Chrome's ~16384px surface size (a very tall page at `scale:2` errors clearly), and an
+oversized PNG auto-falls back to JPEG.
+
+### Platform support
+
+| OS | Server | Extension | Autostart |
+|---|:---:|:---:|---|
+| **Linux** | ✅ | ✅ | systemd user service (`npm run install-service`) |
+| **macOS** | ✅ | ✅ | launchd LaunchAgent (`npm run install-service`) |
+| **Windows** | ✅ | ✅ | manual (`npm start`); register with your service manager |
 
 ---
 
@@ -239,6 +276,7 @@ extension/              Manifest V3 extension (bundled with esbuild)
   src/background.ts       service worker: WS client, injection, chrome.debugger (CDP) layer
   src/options.ts          token + connection UI
   icons/                  generated app icons
+scripts/                install-service.mjs / uninstall-service.mjs (systemd or launchd)
 ```
 
 ---
