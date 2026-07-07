@@ -1,6 +1,6 @@
 /// <reference types="chrome" />
 
-const VERSION = "0.4.0";
+const VERSION = "0.4.2";
 const PING_INTERVAL_MS = 20_000; // WS traffic resets the MV3 service-worker idle timer (Chrome 116+)
 const RECONNECT_MAX_MS = 30_000;
 
@@ -459,8 +459,6 @@ const sessions = new Map<number, Session>();
 
 // Named identity snapshots (cookies incl. HttpOnly + storage + bearer) for replay/authz_matrix.
 const identities = new Map<string, { cookies: any[]; storage: any; bearer?: string }>();
-// Transient CDP Fetch interceptors, keyed by tabId, used during replay to override headers.
-const interceptors = new Map<number, (p: any) => void>();
 
 function cmd(tabId: number, method: string, params?: any): Promise<any> {
   return new Promise((resolve, reject) => {
@@ -532,13 +530,6 @@ function idleSweep() {
 function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, params: any) {
   const tabId = source.tabId;
   if (tabId == null) return;
-  // Fetch interception (replay) — handled before the capture guard, may fire with netOn=false.
-  if (method === "Fetch.requestPaused") {
-    const h = interceptors.get(tabId);
-    if (h) h(params);
-    else cmd(tabId, "Fetch.continueRequest", { requestId: params.requestId }).catch(() => {});
-    return;
-  }
   const s = sessions.get(tabId);
   if (!s || !s.netOn) return;
   const find = (id: string) => s.net.find((e) => e.requestId === id);
@@ -626,62 +617,6 @@ async function getResponseBody(tabId: number, requestId: string): Promise<{ body
   return { body, base64: !!r?.base64Encoded };
 }
 
-// ---- request replay ----
-// Injected in the page MAIN world; reads the full response (status, headers, body) after a fetch.
-function bbFetch(url: string, method: string, headers: Record<string, string> | null, body: string | null) {
-  return fetch(url, { method, headers: headers || undefined, body: body ?? undefined, credentials: "include" })
-    .then(async (r) => {
-      const h: Record<string, string> = {};
-      r.headers.forEach((v, k) => (h[k] = v));
-      return { status: r.status, headers: h, body: (await r.text()).slice(0, 512 * 1024) };
-    })
-    .catch((e) => ({ error: String(e) }));
-}
-
-// Same-identity replay: page fetch with the tab's live session (cookies/SameSite honored).
-async function replayViaMainFetch(tab: chrome.tabs.Tab, url: string, method: string, headers: Record<string, string>, body?: string) {
-  const r = await inject(tab, bbFetch, [url, method, Object.keys(headers).length ? headers : null, body ?? null], "MAIN");
-  return { ...r, via: "page-fetch" };
-}
-
-// Full-control replay via CDP Fetch: override any header (incl. forbidden Cookie/Origin/etc.) or strip
-// them (identity swap / anon). Never mutates the live cookie jar.
-async function replayViaCdpFetch(
-  tab: chrome.tabs.Tab,
-  url: string,
-  method: string,
-  overrideHeaders: Record<string, string | null>,
-  body?: string
-) {
-  const tabId = tab.id!;
-  await ensureAttached(tabId);
-  await cmd(tabId, "Fetch.enable", { patterns: [{ urlPattern: url, requestStage: "Request" }] });
-  let intercepted = false;
-  interceptors.set(tabId, (p: any) => {
-    intercepted = true;
-    // start from the real headers the browser built, then apply overrides (null = drop, case-insensitive)
-    const merged: Record<string, string> = {};
-    for (const [k, v] of Object.entries(p.request?.headers ?? {})) merged[String(k).toLowerCase()] = String(v);
-    for (const [k, v] of Object.entries(overrideHeaders)) {
-      const key = k.toLowerCase();
-      if (v == null) delete merged[key];
-      else merged[key] = String(v);
-    }
-    const headers = Object.entries(merged).map(([name, value]) => ({ name, value }));
-    cmd(tabId, "Fetch.continueRequest", { requestId: p.requestId, headers }).catch(() => {});
-  });
-  // Watchdog: if our request never pauses, don't leave Fetch enabled forever.
-  const watchdog = setTimeout(() => interceptors.delete(tabId), 15_000);
-  try {
-    const r = await inject(tab, bbFetch, [url, method, null, body ?? null], "MAIN");
-    return { ...r, via: "cdp-fetch", intercepted };
-  } finally {
-    clearTimeout(watchdog);
-    interceptors.delete(tabId);
-    await cmd(tabId, "Fetch.disable").catch(() => {});
-  }
-}
-
 function djb2(s: string): string {
   let h = 5381;
   for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
@@ -695,8 +630,6 @@ function neighborUrl(url: string): string | null {
   const n = String(Number(m[1]) + 1);
   return url.slice(0, m.index!) + n + url.slice(m.index! + m[1].length);
 }
-
-const FORBIDDEN_HEADER = /^(cookie|host|origin|referer|user-agent|sec-|connection|content-length|accept-encoding)/i;
 
 // Resolve a replay's base request (from a captured requestId or an ad-hoc spec) + overrides + identity,
 // then pick the page-fetch or CDP-fetch path.
@@ -731,33 +664,53 @@ async function doReplay(tab: chrome.tabs.Tab, params: any): Promise<any> {
   const url = ov.url || base.url;
   if (!url) throw new Error("Provide a url (or a requestId to replay)");
   const method = (ov.method || base.method).toUpperCase();
-  const headers: Record<string, string> = { ...base.headers, ...(ov.headers || {}) };
   const body = ov.body !== undefined ? ov.body : base.body;
 
-  // identity → header overrides (Cookie / Authorization), or strip for anon
-  const identityHeaders: Record<string, string | null> = {};
-  let useIdentity = false;
-  if (params.identity) {
-    useIdentity = true;
-    if (params.identity === "anon") {
-      identityHeaders["cookie"] = null;
-      identityHeaders["authorization"] = null;
+  // Build request headers: preserve content-type/accept from the base, apply explicit overrides,
+  // and drop headers fetch() forbids (Cookie/Host/Content-Length). Identity is handled via credentials.
+  const headers: Record<string, string> = {};
+  const bh = base.headers || {};
+  const baseCT = bh["content-type"] ?? bh["Content-Type"];
+  const baseAccept = bh["accept"] ?? bh["Accept"];
+  if (baseCT && body != null) headers["content-type"] = baseCT;
+  if (baseAccept) headers["accept"] = baseAccept;
+  for (const [k, v] of Object.entries(ov.headers || {})) {
+    if (!/^(cookie|host|content-length)$/i.test(k)) headers[k] = v as string;
+  }
+
+  // identity: current session (default) · anon (no cookies) · captured bearer
+  let credentials: RequestCredentials = "include";
+  let note: string | undefined;
+  if (params.identity === "anon") {
+    credentials = "omit";
+  } else if (params.identity) {
+    const id = identities.get(params.identity);
+    if (!id) throw new Error(`identity '${params.identity}' not captured — call identity_capture first`);
+    if (id.bearer) {
+      headers["authorization"] = id.bearer;
+      credentials = "omit";
     } else {
-      const id = identities.get(params.identity);
-      if (!id) throw new Error(`identity '${params.identity}' not captured — call identity_capture first`);
-      if (id.cookies?.length) identityHeaders["cookie"] = id.cookies.map((c: any) => `${c.name}=${c.value}`).join("; ");
-      if (id.bearer) identityHeaders["authorization"] = id.bearer;
+      note = `identity '${params.identity}' has no bearer; used the current tab session (cookie-jar swap not supported via background fetch)`;
     }
   }
 
-  const needCdp = useIdentity || Object.keys(headers).some((h) => FORBIDDEN_HEADER.test(h));
-  if (needCdp) {
-    const overrideHeaders: Record<string, string | null> = {};
-    for (const [k, v] of Object.entries(headers)) overrideHeaders[k.toLowerCase()] = v;
-    for (const [k, v] of Object.entries(identityHeaders)) overrideHeaders[k.toLowerCase()] = v;
-    return replayViaCdpFetch(tab, url, method, overrideHeaders, body);
+  // Replay from the extension BACKGROUND context: <all_urls> host permission sends the session
+  // cookies, and it is NOT subject to the page's CSP or CORS (unlike an injected fetch).
+  const t0 = Date.now();
+  try {
+    const r = await fetch(url, { method, headers, body: body ?? undefined, credentials });
+    const h: Record<string, string> = {};
+    r.headers.forEach((v, k) => (h[k] = v));
+    let text = "";
+    try {
+      text = (await r.text()).slice(0, BODY_CAP);
+    } catch {
+      /* opaque / binary */
+    }
+    return { status: r.status, statusText: r.statusText, redirected: r.redirected, headers: h, body: text, ms: Date.now() - t0, via: "bg-fetch", identity: params.identity ?? null, note };
+  } catch (e) {
+    return { error: String(e), via: "bg-fetch", url, method };
   }
-  return replayViaMainFetch(tab, url, method, headers, body);
 }
 
 // ---- CDP element resolution (for trusted input / closed shadow / file upload) ----
@@ -1168,8 +1121,12 @@ async function dispatch(method: string, params: any): Promise<any> {
               method: e?.method,
               identity: ident,
             });
-            const body = typeof r.body === "string" ? r.body : "";
-            cells.push({ identity: ident, status: r.status, bytes: body.length, bodyHash: djb2(body), body: body.slice(0, 2000) });
+            if (r && r.error) {
+              cells.push({ identity: ident, error: r.error });
+            } else {
+              const body = typeof r.body === "string" ? r.body : "";
+              cells.push({ identity: ident, status: r.status, bytes: body.length, bodyHash: djb2(body), body: body.slice(0, 2000) });
+            }
           } catch (err) {
             cells.push({ identity: ident, error: err instanceof Error ? err.message : String(err) });
           }

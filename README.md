@@ -3,7 +3,8 @@
 > **Drive your real, logged-in Chrome from an AI agent** — over the Model Context Protocol. No headless browser, no fresh profile, no re-login. Your agent reads and acts inside the exact sessions you're already signed into.
 
 <p>
-  <img alt="version"  src="https://img.shields.io/badge/version-0.4.0-4f46e5">
+  <img alt="version"  src="https://img.shields.io/badge/version-0.4.2-4f46e5">
+  <img alt="tools"    src="https://img.shields.io/badge/tools-32-7c3aed">
   <img alt="protocol" src="https://img.shields.io/badge/MCP-streamable_HTTP-7c3aed">
   <img alt="browser"  src="https://img.shields.io/badge/Chrome%2FEdge-Manifest_V3-2563eb">
   <img alt="lang"     src="https://img.shields.io/badge/TypeScript-strict-3178c6">
