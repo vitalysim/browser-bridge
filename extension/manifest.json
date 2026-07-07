@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Browser Bridge (MCP)",
-  "version": "0.4.6",
+  "version": "0.4.10",
   "description": "Bridges this browser to a local MCP server so AI agents (Claude Code, Codex) can read and drive your real tabs.",
   "permissions": ["tabs", "scripting", "storage", "alarms", "webNavigation", "debugger"],
   "host_permissions": ["<all_urls>"],

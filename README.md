@@ -3,8 +3,8 @@
 > **Drive your real, logged-in Chrome from an AI agent** — over the Model Context Protocol. No headless browser, no fresh profile, no re-login. Your agent reads and acts inside the exact sessions you're already signed into.
 
 <p>
-  <img alt="version"  src="https://img.shields.io/badge/version-0.4.6-4f46e5">
-  <img alt="tools"    src="https://img.shields.io/badge/tools-32-7c3aed">
+  <img alt="version"  src="https://img.shields.io/badge/version-0.4.10-4f46e5">
+  <img alt="tools"    src="https://img.shields.io/badge/tools-33-7c3aed">
   <img alt="protocol" src="https://img.shields.io/badge/MCP-streamable_HTTP-7c3aed">
   <img alt="browser"  src="https://img.shields.io/badge/Chrome%2FEdge-Manifest_V3-2563eb">
   <img alt="lang"     src="https://img.shields.io/badge/TypeScript-strict-3178c6">
@@ -13,7 +13,7 @@
 
 Browser Bridge is a local **MCP server + Manifest V3 Chrome extension** that lets AI coding agents — **Claude Code** and **OpenAI Codex CLI** — control the Chrome you use every day. Because it runs *inside* your real profile, the agent inherits your cookies, `HttpOnly` sessions, SSO, and 2FA state automatically. Ask it to *"read my feed and summarize it"* or *"capture the API traffic on this page and show me the responses"* — and it works against the live, authenticated app.
 
-It ships **32 tools** spanning everyday browsing, DevTools-grade network capture, and a web-security testing toolkit (in-session request replay + access-control diffing).
+It ships **33 tools** spanning everyday browsing, DevTools-grade network capture, and a web-security testing toolkit (in-session request replay + access-control diffing).
 
 ---
 
@@ -58,7 +58,7 @@ It ships **32 tools** spanning everyday browsing, DevTools-grade network capture
 
 ## 🧰 What it can do
 
-**Browse & interact** — open/close/switch/list tabs, navigate, back/forward, click, fill, hover, type, press keys, scroll, and upload files. Interaction reaches **into iframes** (including cross-origin) and **open shadow DOM** out of the box.
+**Browse & interact** — open/close/switch/list tabs, navigate, back/forward, click, fill, hover, type, press keys, scroll, upload files, and **paste images** into rich-text editors (with a trusted-clipboard mode for strict editors). Interaction reaches **into iframes** (including cross-origin) and **open shadow DOM** out of the box.
 
 **Read & inspect** — extract page text (the workhorse for summarizing), snapshot interactive elements with stable refs, screenshot (viewport by default, or **`fullPage`** for the entire scrollable page, **`scale:2`** for retina/high-DPI, `format`/`quality`, `selector` to clip an element, `savePath` to write a file), and evaluate JavaScript in the page.
 
@@ -70,7 +70,7 @@ It ships **32 tools** spanning everyday browsing, DevTools-grade network capture
 
 ---
 
-## 📇 Tool reference (32)
+## 📇 Tool reference (33)
 
 <details open>
 <summary><b>Browsing & interaction</b></summary>
@@ -81,6 +81,7 @@ It ships **32 tools** spanning everyday browsing, DevTools-grade network capture
 | `navigate` · `go_back` · `go_forward` · `wait_for` | Navigation |
 | `click` · `fill` · `hover` · `type` · `press_key` · `scroll` | Interaction (iframe + open-shadow aware; `trusted:true` for real CDP input) |
 | `file_upload` | Set a file input via base64 or a local `path` (`DOM.setFileInputFiles`) |
+| `paste_image` | Paste a local image into a rich-text / contenteditable field; `trusted:true` uses the real OS clipboard + a genuine Cmd/Ctrl+V for strict editors (e.g. YesWeHack) that ignore synthetic events |
 </details>
 
 <details open>

@@ -1,6 +1,6 @@
 /// <reference types="chrome" />
 
-const VERSION = "0.4.6";
+const VERSION = "0.4.10";
 const PING_INTERVAL_MS = 20_000; // WS traffic resets the MV3 service-worker idle timer (Chrome 116+)
 const RECONNECT_MAX_MS = 30_000;
 
@@ -356,6 +356,160 @@ function bbFileUpload(sel: string | null, ref: number | null, filename: string, 
   el.dispatchEvent(new Event("input", { bubbles: true }));
   el.dispatchEvent(new Event("change", { bubbles: true }));
   return { uploaded: filename, size: bytes.length };
+}
+
+// Paste (or drop) an image into a rich text / contenteditable field via synthetic clipboard/drag events.
+function bbPasteImage(sel: string | null, ref: number | null, b64: string, mimeType: string, method: string) {
+  const deepFind = (pred: (e: Element) => boolean): HTMLElement | null => {
+    const stack: (Document | ShadowRoot)[] = [document];
+    while (stack.length) {
+      const root = stack.pop()!;
+      let els: NodeListOf<Element>;
+      try {
+        els = root.querySelectorAll("*");
+      } catch {
+        continue;
+      }
+      for (const el of Array.from(els)) {
+        try {
+          if (pred(el)) return el as HTMLElement;
+        } catch {}
+        const sr = (el as HTMLElement).shadowRoot;
+        if (sr) stack.push(sr);
+      }
+    }
+    return null;
+  };
+  const el =
+    ref != null
+      ? deepFind((e) => e.getAttribute("data-bb-ref") === String(ref))
+      : deepFind((e) => {
+          try {
+            return (e as HTMLElement).matches(sel!);
+          } catch {
+            return false;
+          }
+        });
+  if (!el) return { notFound: true };
+  let bytes: Uint8Array;
+  try {
+    const bin = atob(b64);
+    bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  } catch {
+    return { error: "Invalid base64 content" };
+  }
+  const type = mimeType || "image/png";
+  const ext = (type.split("/")[1] || "png").split("+")[0];
+  const file = new File([bytes as BlobPart], `image.${ext}`, { type });
+  const makeDT = () => {
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    return dt;
+  };
+
+  el.focus();
+  const did: string[] = [];
+  if (method === "paste" || method === "both") {
+    const dt = makeDT();
+    let ev: ClipboardEvent;
+    try {
+      ev = new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true });
+    } catch {
+      ev = new Event("paste", { bubbles: true, cancelable: true }) as ClipboardEvent;
+    }
+    if (!ev.clipboardData) {
+      try {
+        Object.defineProperty(ev, "clipboardData", { value: dt });
+      } catch {}
+    }
+    el.dispatchEvent(ev);
+    did.push("paste");
+  }
+  if (method === "drop" || method === "both") {
+    const r = el.getBoundingClientRect();
+    const base: any = { bubbles: true, cancelable: true, composed: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+    for (const t of ["dragenter", "dragover", "drop"]) {
+      const dt = makeDT();
+      let de: DragEvent;
+      try {
+        de = new DragEvent(t, { ...base, dataTransfer: dt });
+      } catch {
+        de = new Event(t, base) as DragEvent;
+        try {
+          Object.defineProperty(de, "dataTransfer", { value: dt });
+        } catch {}
+      }
+      el.dispatchEvent(de);
+    }
+    did.push("drop");
+  }
+  return { pasted: true, method: did.join("+") || method, tag: el.tagName.toLowerCase(), size: bytes.length };
+}
+
+// Locate an element (by data-bb-ref or CSS selector, piercing open shadow roots), scroll it into view,
+// and return its viewport-center coordinates — for the trusted (CDP Input) paste path.
+function bbLocate(sel: string | null, ref: number | null) {
+  const deepFind = (pred: (e: Element) => boolean): HTMLElement | null => {
+    const stack: (Document | ShadowRoot)[] = [document];
+    while (stack.length) {
+      const root = stack.pop()!;
+      let els: NodeListOf<Element>;
+      try {
+        els = root.querySelectorAll("*");
+      } catch {
+        continue;
+      }
+      for (const el of Array.from(els)) {
+        try {
+          if (pred(el)) return el as HTMLElement;
+        } catch {}
+        const sr = (el as HTMLElement).shadowRoot;
+        if (sr) stack.push(sr);
+      }
+    }
+    return null;
+  };
+  const el =
+    ref != null
+      ? deepFind((e) => e.getAttribute("data-bb-ref") === String(ref))
+      : deepFind((e) => {
+          try {
+            return (e as HTMLElement).matches(sel!);
+          } catch {
+            return false;
+          }
+        });
+  if (!el) return { notFound: true };
+  el.scrollIntoView({ block: "center", inline: "center" });
+  try {
+    (el as HTMLElement).focus();
+  } catch {}
+  const r = el.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height };
+}
+
+// Put an image on the REAL OS clipboard as image/png (converting via canvas if needed). Async; the
+// executeScript caller awaits it. Requires the document focused + user activation (a trusted click).
+async function bbClipboardWriteImage(b64: string, mimeType: string) {
+  try {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    let blob: Blob = new Blob([bytes as BlobPart], { type: mimeType || "image/png" });
+    if (blob.type !== "image/png") {
+      const bmp = await createImageBitmap(blob);
+      const canvas = new OffscreenCanvas(bmp.width, bmp.height);
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return { error: "no 2d context for conversion" };
+      ctx.drawImage(bmp, 0, 0);
+      blob = await canvas.convertToBlob({ type: "image/png" });
+    }
+    await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+    return { ok: true, size: bytes.length };
+  } catch (e) {
+    return { error: String(e) };
+  }
 }
 
 function waitForComplete(tabId: number, timeoutMs = 20_000): Promise<void> {
@@ -842,6 +996,54 @@ async function cdpScreenshot(tab: chrome.tabs.Tab, params: any): Promise<any> {
   return { base64: data, format: outFormat, fellBackToJpeg: outFormat !== format || undefined };
 }
 
+// Trusted image paste (chrome.debugger): put the image on the real OS clipboard and send a TRUSTED
+// Cmd/Ctrl+V, so editors that check event.isTrusted (e.g. YesWeHack) accept it. Needs the tab focused.
+async function trustedPasteImage(tab: chrome.tabs.Tab, params: any): Promise<any> {
+  const tabId = tab.id!;
+  await chrome.tabs.update(tabId, { active: true });
+  await chrome.windows.update(tab.windowId!, { focused: true }).catch(() => {});
+  await ensureAttached(tabId);
+  await sleep(200);
+
+  // best-effort: grant clipboard permission for the origin (also relying on the trusted click's activation)
+  try {
+    const origin = new URL(tab.url!).origin;
+    await cmd(tabId, "Browser.grantPermissions", { origin, permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"] });
+  } catch {
+    /* not fatal — the trusted click below provides user activation */
+  }
+
+  // find the target element's on-screen center (CSP-safe function injection; handles plain refs + shadow)
+  const loc = await inject(tab, bbLocate, [params.selector ?? null, params.ref ?? null]);
+  if (!loc || loc.notFound) throw new Error("Target not found for trusted paste — take a fresh snapshot or check the selector.");
+  await sleep(150);
+
+  // trusted click → focuses the field + grants user activation for the clipboard write
+  await cmd(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: loc.x, y: loc.y });
+  await cmd(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x: loc.x, y: loc.y, button: "left", buttons: 1, clickCount: 1 });
+  await cmd(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: loc.x, y: loc.y, button: "left", buttons: 0, clickCount: 1 });
+  await sleep(120);
+
+  // write the image to the real clipboard (as PNG)
+  const w = await inject(tab, bbClipboardWriteImage, [params.base64, params.mimeType ?? "image/png"], "MAIN");
+  if (!w || w.error) {
+    throw new Error(
+      `Clipboard write failed: ${w?.error ?? "unknown"}. The browser window must be focused/frontmost — bring Chrome to the foreground and retry.`
+    );
+  }
+  await sleep(120);
+
+  // trusted Cmd/Ctrl+V → the "paste" editing command reads the real clipboard and dispatches a genuine
+  // (isTrusted) paste to the focused field. `commands:["paste"]` invokes it directly (a modifier+V key
+  // event alone does NOT reliably trigger paste via CDP).
+  const isMac = /Mac/i.test(navigator.userAgent);
+  const modifiers = isMac ? 4 : 2; // CDP bitmask: Meta=4, Ctrl=2
+  const key = { key: "v", code: "KeyV", windowsVirtualKeyCode: 86, nativeVirtualKeyCode: 86, modifiers };
+  await cmd(tabId, "Input.dispatchKeyEvent", { type: "rawKeyDown", ...key, commands: ["Paste"] });
+  await cmd(tabId, "Input.dispatchKeyEvent", { type: "keyUp", ...key });
+  return { pasted: true, trusted: true, method: "clipboard+trusted-paste", size: w.size };
+}
+
 async function trustedAction(tabId: number, action: string, ref: number | null, selector: string | null, text?: string): Promise<any> {
   await ensureAttached(tabId);
   const nodeId = await cdpResolve(tabId, ref, selector);
@@ -1048,6 +1250,18 @@ async function dispatch(method: string, params: any): Promise<any> {
         params.filename,
         params.mimeType,
         params.base64,
+      ]);
+    }
+
+    case "paste_image": {
+      const tab = await targetTab(params.tabId);
+      if (params.trusted) return trustedPasteImage(tab, params);
+      return injectAllAggregate(tab, bbPasteImage, [
+        params.selector ?? null,
+        params.ref ?? null,
+        params.base64,
+        params.mimeType ?? "image/png",
+        params.method ?? "paste",
       ]);
     }
 

@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { writeFileSync } from "fs";
+import { writeFileSync, readFileSync } from "fs";
 import type { ExtensionHub } from "./hub.js";
 
 const MAX_TEXT_CHARS = 60_000;
@@ -231,6 +231,43 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
       if (!base64 && !path) throw new Error("Provide either base64 (contents) or path (local file path)");
       return textResult(await hub.call("file_upload", { base64, filename, path, mimeType, ref, selector, tabId }));
+    }
+  );
+
+  tool(
+    "paste_image",
+    "Paste a LOCAL IMAGE into a rich-text / contenteditable field that accepts pasted images (comment " +
+      "boxes, compose editors, etc.). For an <input type=file> use file_upload instead. Target by ref or " +
+      "CSS selector; give the image as base64 or an absolute local path. Banner-free (synthetic events); " +
+      "method 'paste' (default), 'drop', or 'both' — some editors accept one but not the other. Set " +
+      "trusted:true for STRICT editors that ignore synthetic events (e.g. YesWeHack): puts the image on the " +
+      "real OS clipboard and sends a genuine Cmd/Ctrl+V via chrome.debugger (shows the banner; needs the " +
+      "Chrome window focused/frontmost).",
+    {
+      base64: z.string().optional().describe("Image contents, base64-encoded"),
+      path: z.string().optional().describe("Absolute local image path (read by the server)"),
+      mimeType: z.string().optional().describe("e.g. image/png (inferred from a path's extension if omitted)"),
+      method: z.enum(["paste", "drop", "both"]).optional().describe("Synthetic delivery: paste (default), drop, or both"),
+      trusted: z.boolean().optional().describe("Real clipboard + trusted Cmd/Ctrl+V via chrome.debugger (for strict editors; shows banner)"),
+      ref: z.number().optional().describe("Element ref from a prior snapshot call"),
+      selector: z.string().optional().describe("CSS selector (alternative to ref)"),
+      tabId: tabIdParam,
+    },
+    async ({ base64, path, mimeType, method, trusted, ref, selector, tabId }) => {
+      if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
+      let b64 = base64;
+      let mt = mimeType;
+      if (path) {
+        const buf = readFileSync(path);
+        if (buf.length > 10 * 1024 * 1024) throw new Error("Image too large (>10 MB)");
+        b64 = buf.toString("base64");
+        if (!mt) {
+          const ext = (path.toLowerCase().split(".").pop() || "");
+          mt = ({ png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml" } as Record<string, string>)[ext] || "application/octet-stream";
+        }
+      }
+      if (!b64) throw new Error("Provide either base64 (image contents) or path (local image file)");
+      return textResult(await hub.call("paste_image", { base64: b64, mimeType: mt ?? "image/png", method, trusted, ref, selector, tabId }, 45_000));
     }
   );
 
