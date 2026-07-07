@@ -1,6 +1,6 @@
 /// <reference types="chrome" />
 
-const VERSION = "0.4.5";
+const VERSION = "0.4.6";
 const PING_INTERVAL_MS = 20_000; // WS traffic resets the MV3 service-worker idle timer (Chrome 116+)
 const RECONNECT_MAX_MS = 30_000;
 
@@ -452,8 +452,16 @@ interface Session {
   extra: Map<string, ExtraInfo>; // requestId -> raw ExtraInfo headers (incl. Set-Cookie / sent Cookie)
   wsUrls: Map<string, string>; // ws requestId -> url
   wsFrames: WsFrame[];
-  refNodes: Map<number, number>; // snapshot ref -> CDP backendNodeId
+  refNodes: Map<number, number>; // deep-snapshot ref -> CDP backendNodeId
+  deepGen: number; // bumped on every deep snapshot; folded into ref numbers so stale/foreign refs can't collide
 }
+
+// Deep-snapshot refs are numbered in a range plain snapshot() refs (capped at 400, numbered from 1)
+// can never reach, and each deep-snapshot generation gets its own disjoint sub-range. Together this
+// means a ref from the wrong snapshot type, or from a since-replaced deep snapshot, can never
+// coincidentally match a live entry in s.refNodes and silently resolve to the wrong element.
+const DEEP_REF_BASE = 100_000;
+const DEEP_REF_GEN_WIDTH = 10_000;
 
 const sessions = new Map<number, Session>();
 
@@ -503,6 +511,7 @@ async function ensureAttached(tabId: number): Promise<Session> {
       wsUrls: new Map(),
       wsFrames: [],
       refNodes: new Map(),
+      deepGen: 0,
     };
     sessions.set(tabId, s);
   }
@@ -724,8 +733,13 @@ async function cdpResolveBySelector(tabId: number, selector: string): Promise<nu
 
 async function cdpResolveByRef(tabId: number, ref: number): Promise<number> {
   const s = sessions.get(tabId);
+  if (ref < DEEP_REF_BASE) {
+    throw new Error(
+      `ref ${ref} is from a plain snapshot() call, not snapshot({deep:true}) — trusted actions require a ref from a deep snapshot. Take a fresh snapshot with deep:true and use the ref it returns.`
+    );
+  }
   const backendNodeId = s?.refNodes.get(ref);
-  if (!backendNodeId) throw new Error(`ref ${ref} not in a deep snapshot for this tab — take a fresh snapshot with deep:true`);
+  if (!backendNodeId) throw new Error(`ref ${ref} is not in the current deep snapshot for this tab (it may be from an older, since-replaced snapshot) — take a fresh snapshot with deep:true`);
   const { nodeIds } = await cmd(tabId, "DOM.pushNodesByBackendIdsToFrontend", { backendNodeIds: [backendNodeId] });
   const nodeId = nodeIds?.[0];
   if (!nodeId) throw new Error(`ref ${ref} node is gone — take a fresh snapshot`);
@@ -859,6 +873,8 @@ async function cdpDeepSnapshot(tabId: number): Promise<any> {
   const INTERACTIVE = new Set(["A", "BUTTON", "INPUT", "SELECT", "TEXTAREA"]);
   const items: any[] = [];
   s.refNodes = new Map();
+  s.deepGen++;
+  const genBase = DEEP_REF_BASE + s.deepGen * DEEP_REF_GEN_WIDTH;
   let n = 0;
 
   const attrsOf = (node: any): Record<string, string> => {
@@ -885,15 +901,16 @@ async function cdpDeepSnapshot(tabId: number): Promise<any> {
       const attrs = attrsOf(node);
       if (isInteractive(node, attrs)) {
         n++;
+        const ref = genBase + n;
         const label = (textOf(node) || attrs["aria-label"] || attrs.placeholder || attrs.value || attrs.title || "")
           .trim()
           .replace(/\s+/g, " ")
           .slice(0, 80);
-        const entry: any = { ref: n, tag: node.nodeName.toLowerCase(), label };
+        const entry: any = { ref, tag: node.nodeName.toLowerCase(), label };
         if (node.nodeName === "A" && attrs.href) entry.href = attrs.href.slice(0, 120);
         if (node.nodeName === "INPUT" && attrs.type) entry.type = attrs.type;
         if (attrs.role) entry.role = attrs.role;
-        s.refNodes.set(n, node.backendNodeId);
+        s.refNodes.set(ref, node.backendNodeId);
         items.push(entry);
       }
     }

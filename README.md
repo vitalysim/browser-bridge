@@ -3,7 +3,7 @@
 > **Drive your real, logged-in Chrome from an AI agent** — over the Model Context Protocol. No headless browser, no fresh profile, no re-login. Your agent reads and acts inside the exact sessions you're already signed into.
 
 <p>
-  <img alt="version"  src="https://img.shields.io/badge/version-0.4.5-4f46e5">
+  <img alt="version"  src="https://img.shields.io/badge/version-0.4.6-4f46e5">
   <img alt="tools"    src="https://img.shields.io/badge/tools-32-7c3aed">
   <img alt="protocol" src="https://img.shields.io/badge/MCP-streamable_HTTP-7c3aed">
   <img alt="browser"  src="https://img.shields.io/badge/Chrome%2FEdge-Manifest_V3-2563eb">
@@ -89,7 +89,7 @@ It ships **32 tools** spanning everyday browsing, DevTools-grade network capture
 | Tool | Description |
 |---|---|
 | `get_page_text` | Rendered text of the page (and its iframes) |
-| `snapshot` | Interactive elements with refs; `deep:true` pierces **closed** shadow roots |
+| `snapshot` | Interactive elements with refs; `deep:true` pierces **closed** shadow roots. Deep-snapshot refs are numbered in their own range per snapshot generation, so they can never be confused with a plain-snapshot ref or a stale one from an earlier deep snapshot |
 | `screenshot` | Visible viewport (banner-free) by default; `fullPage` for the whole page, `scale` for retina, `format`/`quality`, `selector` to clip, `savePath` to write a file |
 | `eval_js` | Evaluate JavaScript in the page's main world |
 | `bridge_status` | Is the extension connected? |
