@@ -1,6 +1,6 @@
 /// <reference types="chrome" />
 
-const VERSION = "0.5.0";
+const VERSION = "0.5.1";
 const PING_INTERVAL_MS = 20_000; // WS traffic resets the MV3 service-worker idle timer (Chrome 116+)
 const RECONNECT_MAX_MS = 30_000;
 
@@ -1174,6 +1174,31 @@ async function doFuzz(_tab: chrome.tabs.Tab, params: any): Promise<any> {
   return { count: results.length, baseline: { status: statusMode, medianLength: medLen }, anomalies: results.filter((x) => x.anomaly).length, results };
 }
 
+// ---- CDP evaluate (page-context JS that is NOT subject to the page CSP's unsafe-eval) ----
+// DevTools-level evaluation runs in the page's main-world realm but bypasses `script-src`
+// 'unsafe-eval', so it works on strict-CSP pages where injected `(0,eval)(...)` is blocked.
+function cdpStringify(val: any): string {
+  if (!val || val.type === "undefined") return "undefined";
+  if ("value" in val) {
+    const v = val.value;
+    try {
+      return typeof v === "object" && v !== null ? JSON.stringify(v) : String(v);
+    } catch {
+      return String(v);
+    }
+  }
+  return String(val.description ?? val.type ?? "");
+}
+async function cdpEvaluate(tabId: number, code: string, awaitPromise = true): Promise<any> {
+  await ensureAttached(tabId);
+  const r = await cmd(tabId, "Runtime.evaluate", { expression: code, returnByValue: true, awaitPromise, userGesture: true });
+  if (r?.exceptionDetails) {
+    const ex = r.exceptionDetails;
+    throw new Error(ex.exception?.description || ex.text || "CDP evaluation error");
+  }
+  return { value: cdpStringify(r?.result).slice(0, 50_000), via: "cdp" };
+}
+
 // ---- CDP element resolution (for trusted input / closed shadow / file upload) ----
 
 async function cdpResolveBySelector(tabId: number, selector: string): Promise<number> {
@@ -1825,7 +1850,10 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "eval_js": {
       const tab = await targetTab(params.tabId);
-      const result = await inject(
+      // Force the CDP path (Runtime.evaluate) — bypasses CSP unsafe-eval; shows the debugger banner.
+      if (params.cdp) return cdpEvaluate(tab.id!, params.code, params.awaitPromise ?? true);
+      try {
+        return await inject(
         tab,
         (code: string) => {
           try {
@@ -1845,8 +1873,23 @@ async function dispatch(method: string, params: any): Promise<any> {
         [params.code],
         "MAIN"
       );
-      if (result && (result as any).error) throw new Error((result as any).error);
-      return result;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        // Auto-fallback: if the page CSP blocked in-page eval, evaluate via CDP instead (banner shown).
+        const cspBlocked = /unsafe-eval|content security policy|evalerror/i.test(msg);
+        if (cspBlocked && !params.noFallback) {
+          const r = await cdpEvaluate(tab.id!, params.code, params.awaitPromise ?? true);
+          r.via = "cdp-fallback";
+          r.note = "in-page eval was blocked by the page CSP; evaluated via CDP (debugger banner shown). Pass noFallback:true to disable, or use cdp:true to skip straight to this path.";
+          return r;
+        }
+        throw e;
+      }
+    }
+
+    case "cdp_eval": {
+      const tab = await targetTab(params.tabId);
+      return cdpEvaluate(tab.id!, params.code, params.awaitPromise ?? true);
     }
 
     case "wait_for": {

@@ -372,10 +372,36 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
 
   tool(
     "eval_js",
-    "Evaluate a JavaScript expression in the page's main world and return its JSON-serialized " +
-      "result. May fail on pages whose CSP forbids eval.",
-    { code: z.string().describe("JavaScript expression to evaluate"), tabId: tabIdParam },
-    async ({ code, tabId }) => textResult(await hub.call("eval_js", { code, tabId }))
+    "Evaluate JavaScript in the page's main world and return its JSON-serialized result. Banner-free by " +
+      "default (injected eval). On strict-CSP pages that forbid `unsafe-eval`, it **auto-falls back to CDP " +
+      "`Runtime.evaluate`** (see cdp_eval), which bypasses the CSP but shows the debugger banner — the result " +
+      "then includes `via:\"cdp-fallback\"`. Set `noFallback:true` to fail instead, or `cdp:true` to skip " +
+      "straight to the CDP path. Use `awaitPromise:false` if you don't want to await a returned Promise.",
+    {
+      code: z.string().describe("JavaScript to evaluate (expression or statements)"),
+      cdp: z.boolean().optional().describe("Force the CDP Runtime.evaluate path (bypasses CSP; shows the banner)"),
+      noFallback: z.boolean().optional().describe("Do not fall back to CDP if the page CSP blocks in-page eval"),
+      awaitPromise: z.boolean().optional().describe("Await a returned Promise (default true)"),
+      tabId: tabIdParam,
+    },
+    async (args) => textResult(await hub.call("eval_js", args))
+  );
+
+  tool(
+    "cdp_eval",
+    "Evaluate JavaScript in the page's real main-world context via CDP `Runtime.evaluate` — the DevTools-" +
+      "console path, which **is not subject to the page's CSP `unsafe-eval`**, so it runs arbitrary code on " +
+      "strict-CSP sites (Copilot, HackerOne, YesWeHack…) where `eval_js` is blocked. Unlike the isolated-world " +
+      "read/interact tools, this reaches the page's live JS: in-memory state, framework internals, closures, and " +
+      "the app's own functions. Uses `chrome.debugger`, so it **shows the debugging banner** (auto-detaches when " +
+      "idle). `eval_js` already auto-falls back to this on CSP-blocked pages; call `cdp_eval` directly when you " +
+      "want the CDP path unconditionally.",
+    {
+      code: z.string().describe("JavaScript to evaluate (expression or statements) in the page's main world"),
+      awaitPromise: z.boolean().optional().describe("Await a returned Promise (default true)"),
+      tabId: tabIdParam,
+    },
+    async (args) => textResult(await hub.call("cdp_eval", args))
   );
 
   tool(

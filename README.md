@@ -4,7 +4,7 @@
 
 <p>
   <img alt="version"  src="https://img.shields.io/badge/version-0.5.0-4f46e5">
-  <img alt="tools"    src="https://img.shields.io/badge/tools-50-7c3aed">
+  <img alt="tools"    src="https://img.shields.io/badge/tools-51-7c3aed">
   <img alt="protocol" src="https://img.shields.io/badge/MCP-streamable_HTTP-7c3aed">
   <img alt="browser"  src="https://img.shields.io/badge/Chrome%2FEdge-Manifest_V3-2563eb">
   <img alt="lang"     src="https://img.shields.io/badge/TypeScript-strict-3178c6">
@@ -13,7 +13,7 @@
 
 Browser Bridge is a local **MCP server + Manifest V3 Chrome extension** that lets AI coding agents — **Claude Code** and **OpenAI Codex CLI** — control the Chrome you use every day. Because it runs *inside* your real profile, the agent inherits your cookies, `HttpOnly` sessions, SSO, and 2FA state automatically. Ask it to *"read my feed and summarize it"* or *"capture the API traffic on this page and show me the responses"* — and it works against the live, authenticated app.
 
-It ships **50 tools** spanning everyday browsing, DevTools-grade network capture, and a web-security testing toolkit (in-session request replay, **live request/response interception**, an **intruder-style fuzzer**, access-control diffing, real-cookie-jar read/write, and MHTML evidence capture).
+It ships **51 tools** spanning everyday browsing, DevTools-grade network capture, and a web-security testing toolkit (in-session request replay, **live request/response interception**, an **intruder-style fuzzer**, access-control diffing, real-cookie-jar read/write, **CSP-bypassing page evaluation**, and MHTML evidence capture).
 
 ---
 
@@ -60,7 +60,7 @@ It ships **50 tools** spanning everyday browsing, DevTools-grade network capture
 
 **Browse & interact** — open/close/switch/list tabs, navigate, back/forward, click, fill, hover, type, press keys, scroll, upload files, and **paste images** into rich-text editors (with a trusted-clipboard mode for strict editors). Interaction reaches **into iframes** (including cross-origin) and **open shadow DOM** out of the box.
 
-**Read & inspect** — extract page text (the workhorse for summarizing), snapshot interactive elements with stable refs, screenshot (viewport by default, or **`fullPage`** for the entire scrollable page, **`scale:2`** for retina/high-DPI, `format`/`quality`, `selector` to clip an element, `savePath` to write a file), and evaluate JavaScript in the page.
+**Read & inspect** — extract page text (the workhorse for summarizing), snapshot interactive elements with stable refs, screenshot (viewport by default, or **`fullPage`** for the entire scrollable page, **`scale:2`** for retina/high-DPI, `format`/`quality`, `selector` to clip an element, `savePath` to write a file), and evaluate JavaScript in the page — with `eval_js` **auto-falling back to CSP-immune CDP evaluation** (`cdp_eval`) on strict-CSP sites where in-page `eval` is blocked.
 
 **Download resources** — `download_resource` saves a URL to disk via Chrome's own download engine (not the network-capture path), so it isn't bound by the 512 KB body cap: files up to 100MB by default, larger with `maxBytes`, streamed straight to disk with correct binary handling and the real session's cookies attached automatically. Banner-free.
 
@@ -74,7 +74,7 @@ It ships **50 tools** spanning everyday browsing, DevTools-grade network capture
 
 ---
 
-## 📇 Tool reference (50)
+## 📇 Tool reference (51)
 
 <details open>
 <summary><b>Browsing & interaction</b></summary>
@@ -97,7 +97,8 @@ It ships **50 tools** spanning everyday browsing, DevTools-grade network capture
 | `snapshot` | Interactive elements with refs; `deep:true` pierces **closed** shadow roots. Deep-snapshot refs are numbered in their own range per snapshot generation, so they can never be confused with a plain-snapshot ref or a stale one from an earlier deep snapshot |
 | `screenshot` | Visible viewport (banner-free) by default; `fullPage` for the whole page, `scale` for retina, `format`/`quality`, `selector` to clip, `savePath` to write a file |
 | `download_resource` | Download a URL to disk via Chrome's own download engine — up to 100MB by default (`maxBytes` to raise it), correct binary handling, real session cookies, banner-free; `savePath` to relocate it from the Downloads folder |
-| `eval_js` | Evaluate JavaScript in the page's main world |
+| `eval_js` | Evaluate JavaScript in the page's main world (banner-free). **Auto-falls back to `cdp_eval` on strict-CSP pages** where in-page `eval` is blocked (`via:"cdp-fallback"`); `cdp:true` forces it, `noFallback:true` disables it |
+| `cdp_eval` | Evaluate JS in the page's real main-world context via CDP `Runtime.evaluate` — **not subject to CSP `unsafe-eval`**, so it runs on strict-CSP sites, and reaches the page's live JS (in-memory state, framework internals, closures, the app's own functions). Uses `chrome.debugger` (shows the banner) |
 | `bridge_status` | Is the extension connected? |
 </details>
 
@@ -271,6 +272,7 @@ oversized PNG auto-falls back to JPEG.
 ## ⚠️ Limitations
 
 - Default interaction uses synthetic events (no banner); a few sites ignore untrusted input — use `trusted:true` for real events.
+- A strict page **CSP** (`script-src` without `'unsafe-eval'`) blocks the banner-free `eval_js`; it auto-falls back to `cdp_eval` (CDP `Runtime.evaluate`, banner shown), which CSP cannot block. The isolated-world read/interact tools and all CDP/background tools are unaffected by CSP either way.
 - `chrome.debugger` requires sole access to a tab — it **can't attach if DevTools is open** on that tab. `net_capture_start` only records traffic sent *after* it's called (navigate/reload to capture a page load).
 - The capture buffer is in-memory (last 500 requests/tab, ~512 KB/body); a long idle can drop it.
 - One extension connection at a time (last connect wins); multiple MCP clients can share it concurrently.
@@ -292,7 +294,7 @@ Ideas explored for future phases: HAR / curl / Burp export, passive header/CORS/
 server/                 MCP server (TypeScript · @modelcontextprotocol/sdk · ws · express)
   src/index.ts            HTTP MCP endpoint + auth + session management
   src/hub.ts              single extension socket, request/response correlation
-  src/tools.ts            the 50 MCP tools
+  src/tools.ts            the 51 MCP tools
 extension/              Manifest V3 extension (bundled with esbuild)
   manifest.json
   src/background.ts       service worker: WS client, injection, chrome.debugger (CDP) layer
