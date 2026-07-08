@@ -543,6 +543,221 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
     async ({ a, b }) => textResult(responseDiff(a as any, b as any)),
   );
 
+  // ---- intercept (live request/response tampering via CDP Fetch) ----
+  const interceptSet = z
+    .object({
+      url: z.string().optional(),
+      method: z.string().optional(),
+      headers: z.record(z.string()).optional(),
+      postData: z.string().optional(),
+      errorReason: z.string().optional(),
+    })
+    .optional();
+  const interceptResponse = z
+    .object({
+      status: z.number().optional(),
+      headers: z.record(z.string()).optional(),
+      body: z.string().optional(),
+      bodyIsBase64: z.boolean().optional(),
+    })
+    .optional();
+
+  tool(
+    "intercept_start",
+    "Begin live request/response interception on the tab (Burp-Proxy style, via CDP Fetch — shows the debugger " +
+      "banner). Matching requests pause; a paused request that matches a `rules` entry is auto-resolved, otherwise " +
+      "it queues for intercept_pending/intercept_resolve. WARNING: a paused request blocks the page until resolved.",
+    {
+      patterns: z
+        .array(z.any())
+        .optional()
+        .describe("CDP Fetch patterns, e.g. [{urlPattern:'*://api.example.com/*'}]; add {requestStage:'Response'} for responses. Defaults from `stage`."),
+      stage: z.enum(["Request", "Response", "both"]).optional().describe("Shortcut for default patterns (default Request)"),
+      rules: z
+        .array(
+          z.object({
+            match: z
+              .object({
+                urlContains: z.string().optional(),
+                method: z.string().optional(),
+                resourceType: z.string().optional(),
+                stage: z.enum(["Request", "Response"]).optional(),
+              })
+              .optional(),
+            action: z.enum(["continue", "fail", "fulfill", "modify"]).optional(),
+            set: interceptSet,
+            response: interceptResponse,
+          }),
+        )
+        .optional()
+        .describe("Auto-apply rules matched top-to-bottom against each paused request"),
+      tabId: tabIdParam,
+    },
+    async (args) => textResult(await hub.call("intercept_start", args)),
+  );
+
+  tool(
+    "intercept_pending",
+    "List requests/responses currently paused by interception, awaiting resolution. Set withBodies to also fetch " +
+      "Response-stage bodies.",
+    { withBodies: z.boolean().optional().describe("Fetch response bodies for Response-stage paused entries"), tabId: tabIdParam },
+    async (args) => textResult(await hub.call("intercept_pending", args)),
+  );
+
+  tool(
+    "intercept_resolve",
+    "Resolve a paused request: continue (optionally mutating via `set`: url/method/headers/postData), fail " +
+      "(block it), or fulfill/modify (synthesize/replace the response via `response`: status/headers/body). Pass a " +
+      "requestId (from intercept_pending) or all:true.",
+    {
+      requestId: z.string().optional().describe("Paused requestId from intercept_pending"),
+      all: z.boolean().optional().describe("Apply to every currently-paused entry"),
+      action: z.enum(["continue", "fail", "fulfill", "modify"]).optional().describe("Default continue"),
+      set: interceptSet,
+      response: interceptResponse,
+      tabId: tabIdParam,
+    },
+    async (args) => textResult(await hub.call("intercept_resolve", args)),
+  );
+
+  tool(
+    "intercept_stop",
+    "Stop interception, release any still-paused requests, and disable CDP Fetch (removes the banner after idle).",
+    { tabId: tabIdParam },
+    async (args) => textResult(await hub.call("intercept_stop", args)),
+  );
+
+  // ---- fuzz (intruder) ----
+  tool(
+    "fuzz",
+    "Intruder-style fuzzer: substitute each payload for the marker in a request template, fire them (concurrently) " +
+      "from the live session, and return per-payload {status,length,timeMs,contentType,snippet} with anomalies " +
+      "(deviating status/length or errors) flagged and sorted first. Banner-free (background fetch). Pairs with response_diff/authz_matrix.",
+    {
+      template: z
+        .union([
+          z.string(),
+          z.object({ url: z.string(), method: z.string().optional(), headers: z.record(z.string()).optional(), body: z.string().optional() }),
+        ])
+        .describe("URL string containing the marker, or {url,method,headers,body} with the marker in any field"),
+      payloads: z.array(z.string()).describe("Payloads substituted for the marker (one request each)"),
+      marker: z.string().optional().describe("Placeholder to replace (default §)"),
+      method: z.string().optional().describe("Default method when template is a bare URL"),
+      headers: z.record(z.string()).optional().describe("Extra/base request headers"),
+      body: z.string().optional().describe("Request body when template is a bare URL"),
+      concurrency: z.number().optional().describe("Parallel requests (default 10, max 30)"),
+      identity: z.string().optional().describe("'anon' strips cookies; default uses the live session"),
+      tabId: tabIdParam,
+    },
+    async (args) => textResult(await hub.call("fuzz", args, 120_000)),
+  );
+
+  // ---- cookies (chrome.cookies — real flags incl. HttpOnly) ----
+  tool(
+    "cookies_get",
+    "Read cookies from the real browser jar, including HttpOnly, with full flags (secure, sameSite, expirationDate, " +
+      "path, domain). Filter by url and/or domain and/or name.",
+    {
+      url: z.string().optional().describe("Cookies readable for this URL"),
+      domain: z.string().optional().describe("Cookies for this domain"),
+      name: z.string().optional().describe("Only cookies with this name"),
+    },
+    async (args) => textResult(await hub.call("cookies_get", args)),
+  );
+
+  tool(
+    "cookies_set",
+    "Create or overwrite a cookie in the real browser jar (set/tamper flags: httpOnly, secure, sameSite, expiry).",
+    {
+      url: z.string().describe("URL the cookie applies to (scheme+host+path)"),
+      name: z.string(),
+      value: z.string().optional(),
+      domain: z.string().optional(),
+      path: z.string().optional(),
+      secure: z.boolean().optional(),
+      httpOnly: z.boolean().optional(),
+      sameSite: z.enum(["no_restriction", "lax", "strict", "unspecified"]).optional(),
+      expirationDate: z.number().optional().describe("Unix seconds; omit for a session cookie"),
+    },
+    async (args) => textResult(await hub.call("cookies_set", args)),
+  );
+
+  tool(
+    "cookies_delete",
+    "Delete a cookie from the real browser jar.",
+    { url: z.string().describe("URL the cookie applies to"), name: z.string() },
+    async (args) => textResult(await hub.call("cookies_delete", args)),
+  );
+
+  // ---- web storage (localStorage / sessionStorage) ----
+  tool(
+    "storage_dump",
+    "Dump this tab's origin web storage (localStorage + sessionStorage) as key/value maps.",
+    { kinds: z.array(z.enum(["local", "session"])).optional().describe("Which stores (default both)"), tabId: tabIdParam },
+    async (args) => textResult(await hub.call("storage_dump", args)),
+  );
+
+  tool(
+    "storage_set",
+    "Set a key in this tab's localStorage or sessionStorage.",
+    { area: z.enum(["local", "session"]).optional().describe("Default local"), key: z.string(), value: z.string(), tabId: tabIdParam },
+    async (args) => textResult(await hub.call("storage_set", args)),
+  );
+
+  tool(
+    "storage_remove",
+    "Remove a key from this tab's localStorage or sessionStorage.",
+    { area: z.enum(["local", "session"]).optional().describe("Default local"), key: z.string(), tabId: tabIdParam },
+    async (args) => textResult(await hub.call("storage_remove", args)),
+  );
+
+  tool(
+    "storage_clear",
+    "Clear this tab's localStorage or sessionStorage.",
+    { area: z.enum(["local", "session"]).optional().describe("Default local"), tabId: tabIdParam },
+    async (args) => textResult(await hub.call("storage_clear", args)),
+  );
+
+  // ---- console/log capture ----
+  tool(
+    "console_start",
+    "Start buffering this tab's console output, uncaught exceptions, and CSP/log violations (via CDP; CSP-independent).",
+    { tabId: tabIdParam },
+    async (args) => textResult(await hub.call("console_start", args)),
+  );
+
+  tool(
+    "console_get",
+    "Return buffered console/log entries. Filter by `pattern` (regex on text) and/or `level`; `limit` caps the count (default 200).",
+    {
+      pattern: z.string().optional().describe("Case-insensitive regex over entry text"),
+      level: z.string().optional().describe("Filter by level (e.g. error, warning, info, log)"),
+      limit: z.number().optional().describe("Max entries to return (default 200)"),
+      tabId: tabIdParam,
+    },
+    async (args) => textResult(await hub.call("console_get", args)),
+  );
+
+  tool(
+    "console_stop",
+    "Stop console/log capture on this tab.",
+    { tabId: tabIdParam },
+    async (args) => textResult(await hub.call("console_stop", args)),
+  );
+
+  // ---- save_page (MHTML evidence snapshot) ----
+  tool(
+    "save_page",
+    "Save the tab as a single self-contained .mhtml file (evidence snapshot; opens in Chrome). Writes to savePath.",
+    { savePath: z.string().describe("Absolute path to write the .mhtml file"), tabId: tabIdParam },
+    async ({ savePath, tabId }) => {
+      const r = await hub.call("save_page", { tabId }, 60_000);
+      if (!r?.mhtml) throw new Error("Empty page snapshot");
+      writeFileSync(savePath, r.mhtml, "utf8");
+      return textResult({ saved: savePath, bytes: Buffer.byteLength(r.mhtml), url: r.url, title: r.title });
+    },
+  );
+
   tool(
     "bridge_status",
     "Check whether the Chrome extension is currently connected to the bridge.",

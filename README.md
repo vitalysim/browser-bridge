@@ -3,8 +3,8 @@
 > **Drive your real, logged-in Chrome from an AI agent** — over the Model Context Protocol. No headless browser, no fresh profile, no re-login. Your agent reads and acts inside the exact sessions you're already signed into.
 
 <p>
-  <img alt="version"  src="https://img.shields.io/badge/version-0.4.11-4f46e5">
-  <img alt="tools"    src="https://img.shields.io/badge/tools-34-7c3aed">
+  <img alt="version"  src="https://img.shields.io/badge/version-0.5.0-4f46e5">
+  <img alt="tools"    src="https://img.shields.io/badge/tools-50-7c3aed">
   <img alt="protocol" src="https://img.shields.io/badge/MCP-streamable_HTTP-7c3aed">
   <img alt="browser"  src="https://img.shields.io/badge/Chrome%2FEdge-Manifest_V3-2563eb">
   <img alt="lang"     src="https://img.shields.io/badge/TypeScript-strict-3178c6">
@@ -13,7 +13,7 @@
 
 Browser Bridge is a local **MCP server + Manifest V3 Chrome extension** that lets AI coding agents — **Claude Code** and **OpenAI Codex CLI** — control the Chrome you use every day. Because it runs *inside* your real profile, the agent inherits your cookies, `HttpOnly` sessions, SSO, and 2FA state automatically. Ask it to *"read my feed and summarize it"* or *"capture the API traffic on this page and show me the responses"* — and it works against the live, authenticated app.
 
-It ships **34 tools** spanning everyday browsing, DevTools-grade network capture, and a web-security testing toolkit (in-session request replay + access-control diffing).
+It ships **50 tools** spanning everyday browsing, DevTools-grade network capture, and a web-security testing toolkit (in-session request replay, **live request/response interception**, an **intruder-style fuzzer**, access-control diffing, real-cookie-jar read/write, and MHTML evidence capture).
 
 ---
 
@@ -68,11 +68,13 @@ It ships **34 tools** spanning everyday browsing, DevTools-grade network capture
 
 **Trusted mode (opt-in, `chrome.debugger`)** — real `isTrusted` mouse/keyboard input (fires pure-CSS `:hover`, real keystroke timing), **closed** shadow-root access via `snapshot(deep:true)`, and reliable uploads via `DOM.setFileInputFiles`.
 
-**Web-security testing** — snapshot named **identities** (cookies incl. `HttpOnly`, storage, bearer), an **in-session request replayer** (page-fetch or CDP-Fetch with full header/identity override), and an **`authz_matrix`** that replays a request set across identities and diffs the responses to surface **BOLA / IDOR / BFLA** access-control breaks.
+**Web-security testing** — snapshot named **identities** (cookies incl. `HttpOnly`, storage, bearer), an **in-session request replayer** (page-fetch or CDP-Fetch with full header/identity override), an **`authz_matrix`** that replays a request set across identities and diffs the responses to surface **BOLA / IDOR / BFLA** access-control breaks, **live request/response interception** (Burp-Proxy-style pause/modify/fulfill/block via CDP Fetch), and an **intruder-style `fuzz`** (payload iteration with anomaly flagging).
+
+**Session, storage & evidence** — read/write the **real cookie jar** (incl. `HttpOnly`, with full flags) via `chrome.cookies`, dump/set/clear **localStorage & sessionStorage**, capture **console + CSP + uncaught-exception** logs, and save a page as a single-file **`.mhtml`** evidence snapshot.
 
 ---
 
-## 📇 Tool reference (34)
+## 📇 Tool reference (50)
 
 <details open>
 <summary><b>Browsing & interaction</b></summary>
@@ -120,6 +122,19 @@ It ships **34 tools** spanning everyday browsing, DevTools-grade network capture
 | `replay_request` | In-session Repeater — replay a captured or ad-hoc request; override any header or swap identity (`anon` strips auth) |
 | `authz_matrix` | Replay a request set across identities and diff → flags access-control breaks |
 | `response_diff` | Structural diff of two responses (status, length, token-Jaccard, noise-suppressed) |
+| `intercept_start` · `intercept_pending` · `intercept_resolve` · `intercept_stop` | Burp-Proxy-style live interception (CDP Fetch): pause matching requests/responses, then **continue** (optionally mutating url/method/headers/body), **fail** (block), or **fulfill/modify** (synthesize a response). `rules` auto-apply; otherwise requests queue for resolution |
+| `fuzz` | Intruder-style fuzzer: substitute each payload for a marker in a request template, fire concurrently from the live session, and return per-payload `status`/`length`/`timeMs` with anomalies flagged first |
+</details>
+
+<details open>
+<summary><b>Session, storage & evidence</b></summary>
+
+| Tool | Description |
+|---|---|
+| `cookies_get` · `cookies_set` · `cookies_delete` | Read/write the real browser cookie jar via `chrome.cookies` — includes `HttpOnly`, with full flags (`secure`, `sameSite`, `expirationDate`) |
+| `storage_dump` · `storage_set` · `storage_remove` · `storage_clear` | Read/write this origin's `localStorage` / `sessionStorage` |
+| `console_start` · `console_get` · `console_stop` | Buffer console output, uncaught exceptions, and CSP/log violations (via CDP; CSP-independent). Filter `console_get` by regex `pattern` / `level` |
+| `save_page` | Save the tab as a single self-contained `.mhtml` evidence snapshot |
 </details>
 
 ---
@@ -265,7 +280,9 @@ oversized PNG auto-falls back to JPEG.
 
 ## 🗺️ Roadmap
 
-Ideas explored for future phases: HAR / curl / Burp export, passive header/CORS/CSP/secret scanners, CDP-Fetch live interception rules, parameter fuzzing, JWT/GraphQL/race-condition helpers, a client-side DOM-XSS / postMessage / prototype-pollution suite, and hunt-workflow playbooks with structured findings.
+Shipped in v0.5: **live request/response interception** (`intercept_*`), **parameter fuzzing** (`fuzz`), **cookie-jar & web-storage** read/write, **console/CSP capture**, and **MHTML** evidence snapshots.
+
+Ideas explored for future phases: HAR / curl / Burp export, passive header/CORS/CSP/secret scanners, source-map de-minification on downloads, JWT/GraphQL/race-condition helpers, a client-side DOM-XSS / postMessage / prototype-pollution suite, and hunt-workflow playbooks with structured findings.
 
 ---
 
@@ -275,7 +292,7 @@ Ideas explored for future phases: HAR / curl / Burp export, passive header/CORS/
 server/                 MCP server (TypeScript · @modelcontextprotocol/sdk · ws · express)
   src/index.ts            HTTP MCP endpoint + auth + session management
   src/hub.ts              single extension socket, request/response correlation
-  src/tools.ts            the 32 MCP tools
+  src/tools.ts            the 50 MCP tools
 extension/              Manifest V3 extension (bundled with esbuild)
   manifest.json
   src/background.ts       service worker: WS client, injection, chrome.debugger (CDP) layer

@@ -1,6 +1,6 @@
 /// <reference types="chrome" />
 
-const VERSION = "0.4.11";
+const VERSION = "0.5.0";
 const PING_INTERVAL_MS = 20_000; // WS traffic resets the MV3 service-worker idle timer (Chrome 116+)
 const RECONNECT_MAX_MS = 30_000;
 
@@ -155,6 +155,44 @@ async function injectAllAggregate(tab: chrome.tabs.Tab, func: (...args: any[]) =
 // no references to module-scope helpers (esbuild would leave dangling names). Shadow-DOM
 // support is via a local deep-walk that recurses into open shadowRoots (closed roots are
 // inaccessible by design). Failure is signalled by RETURNING { error } / { notFound }.
+
+// Read/write this origin's web storage. Runs in the page (localStorage/sessionStorage are origin-scoped).
+function bbStorage(op: string, area: string | null, key: string | null, value: string | null, kinds: string[] | null) {
+  try {
+    const readArea = (a: string) => {
+      const store = a === "session" ? sessionStorage : localStorage;
+      const out: Record<string, string | null> = {};
+      for (let i = 0; i < store.length; i++) {
+        const k = store.key(i);
+        if (k != null) out[k] = store.getItem(k);
+      }
+      return out;
+    };
+    if (op === "dump") {
+      const want = kinds && kinds.length ? kinds : ["local", "session"];
+      const res: any = { origin: location.origin };
+      if (want.includes("local")) res.local = readArea("local");
+      if (want.includes("session")) res.session = readArea("session");
+      return res;
+    }
+    const store = area === "session" ? sessionStorage : localStorage;
+    if (op === "set") {
+      store.setItem(key as string, value as string);
+      return { ok: true, area: area || "local", key };
+    }
+    if (op === "remove") {
+      store.removeItem(key as string);
+      return { ok: true, area: area || "local", key };
+    }
+    if (op === "clear") {
+      store.clear();
+      return { ok: true, area: area || "local", cleared: true };
+    }
+    return { error: `unknown storage op: ${op}` };
+  } catch (e) {
+    return { error: String(e) };
+  }
+}
 
 function bbPageText() {
   return {
@@ -596,6 +634,37 @@ interface WsFrame {
 }
 
 const WS_MAX_FRAMES = 1000;
+const LOG_MAX = 2000;
+
+// ---- intercept (CDP Fetch) ----
+interface InterceptRule {
+  match?: { urlContains?: string; method?: string; resourceType?: string; stage?: "Request" | "Response" };
+  action?: "continue" | "fail" | "fulfill" | "modify";
+  set?: { url?: string; method?: string; headers?: Record<string, string>; postData?: string; errorReason?: string };
+  response?: { status?: number; headers?: Record<string, string>; body?: string; bodyIsBase64?: boolean };
+}
+interface PausedEntry {
+  requestId: string;
+  url?: string;
+  method?: string;
+  headers?: Record<string, string>;
+  postData?: string;
+  resourceType?: string;
+  stage: "Request" | "Response";
+  responseStatusCode?: number;
+  responseHeaders?: any;
+  ts: number;
+}
+
+// ---- console/log capture ----
+interface LogEntry {
+  source: string;
+  level: string;
+  text: string;
+  url?: string;
+  line?: number;
+  ts: number;
+}
 
 interface Session {
   attachedAt: number;
@@ -608,6 +677,11 @@ interface Session {
   wsFrames: WsFrame[];
   refNodes: Map<number, number>; // deep-snapshot ref -> CDP backendNodeId
   deepGen: number; // bumped on every deep snapshot; folded into ref numbers so stale/foreign refs can't collide
+  interceptOn: boolean; // CDP Fetch interception active
+  interceptRules: InterceptRule[]; // auto-apply rules for paused requests
+  paused: Map<string, PausedEntry>; // requestId -> request/response held for the agent to resolve
+  logOn: boolean; // console/log capture active
+  logs: LogEntry[];
 }
 
 // Deep-snapshot refs are numbered in a range plain snapshot() refs (capped at 400, numbered from 1)
@@ -666,6 +740,11 @@ async function ensureAttached(tabId: number): Promise<Session> {
       wsFrames: [],
       refNodes: new Map(),
       deepGen: 0,
+      interceptOn: false,
+      interceptRules: [],
+      paused: new Map(),
+      logOn: false,
+      logs: [],
     };
     sessions.set(tabId, s);
   }
@@ -694,7 +773,12 @@ function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, param
   const tabId = source.tabId;
   if (tabId == null) return;
   const s = sessions.get(tabId);
-  if (!s || !s.netOn) return;
+  if (!s) return;
+  // Fetch interception + console/log capture run independently of Network capture (netOn).
+  if (method === "Fetch.requestPaused") return void onFetchPaused(s, tabId, params);
+  if (s.logOn && (method === "Runtime.consoleAPICalled" || method === "Runtime.exceptionThrown" || method === "Log.entryAdded"))
+    return onLogEvent(s, method, params);
+  if (!s.netOn) return;
   const find = (id: string) => s.net.find((e) => e.requestId === id);
   if (method === "Network.requestWillBeSent") {
     const url = params.request?.url ?? "";
@@ -874,6 +958,220 @@ async function doReplay(tab: chrome.tabs.Tab, params: any): Promise<any> {
   } catch (e) {
     return { error: String(e), via: "bg-fetch", url, method };
   }
+}
+
+// ---- intercept helpers (CDP Fetch) ----
+
+// UTF-8-safe base64 (btoa alone mangles multibyte chars); CDP wants base64 for postData/body.
+function b64EncodeUtf8(str: string): string {
+  const bytes = new TextEncoder().encode(str);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+function b64DecodeUtf8(b64: string): string {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+
+// CDP header params are [{name,value}]; accept either that or a plain object.
+function toHeaderArray(h: any): { name: string; value: string }[] | undefined {
+  if (!h) return undefined;
+  if (Array.isArray(h)) return h.map((x) => ({ name: String(x.name), value: String(x.value) }));
+  return Object.entries(h).map(([name, value]) => ({ name, value: String(value) }));
+}
+
+function defaultFetchPatterns(stage?: string): any[] {
+  if (stage === "Response") return [{ urlPattern: "*", requestStage: "Response" }];
+  if (stage === "both") return [{ urlPattern: "*" }, { urlPattern: "*", requestStage: "Response" }];
+  return [{ urlPattern: "*" }];
+}
+
+function matchRule(r: InterceptRule, e: PausedEntry): boolean {
+  const m = r.match || {};
+  if (m.urlContains && !(e.url || "").includes(m.urlContains)) return false;
+  if (m.method && (e.method || "").toUpperCase() !== m.method.toUpperCase()) return false;
+  if (m.resourceType && e.resourceType !== m.resourceType) return false;
+  if (m.stage && e.stage !== m.stage) return false;
+  return true;
+}
+
+// Apply a resolution to one paused request/response. Mutating a request uses continueRequest;
+// synthesizing/replacing a response uses fulfillRequest; blocking uses failRequest.
+async function resolvePaused(tabId: number, e: PausedEntry, action: string, set: any, response: any): Promise<any> {
+  const requestId = e.requestId;
+  if (action === "fail") {
+    await cmd(tabId, "Fetch.failRequest", { requestId, errorReason: set?.errorReason || "BlockedByClient" });
+    return { resolved: "fail", requestId };
+  }
+  if (action === "fulfill" || response || (action === "modify" && e.stage === "Response")) {
+    const resp = response || {};
+    const body = resp.body != null ? (resp.bodyIsBase64 ? resp.body : b64EncodeUtf8(String(resp.body))) : undefined;
+    await cmd(tabId, "Fetch.fulfillRequest", {
+      requestId,
+      responseCode: resp.status ?? e.responseStatusCode ?? 200,
+      responseHeaders: toHeaderArray(resp.headers),
+      body,
+    });
+    return { resolved: "fulfill", requestId };
+  }
+  // continue (optionally mutating the request)
+  const cont: any = { requestId };
+  if (set) {
+    if (set.url) cont.url = set.url;
+    if (set.method) cont.method = set.method;
+    if (set.headers) cont.headers = toHeaderArray(set.headers);
+    if (set.postData != null) cont.postData = b64EncodeUtf8(String(set.postData));
+  }
+  await cmd(tabId, e.stage === "Response" ? "Fetch.continueResponse" : "Fetch.continueRequest", cont);
+  return { resolved: "continue", requestId };
+}
+
+function onFetchPaused(s: Session, tabId: number, params: any) {
+  if (!s.interceptOn) {
+    void cmd(tabId, "Fetch.continueRequest", { requestId: params.requestId }).catch(() => {});
+    return;
+  }
+  const isResponse = params.responseStatusCode !== undefined || params.responseErrorReason !== undefined;
+  const entry: PausedEntry = {
+    requestId: params.requestId,
+    url: params.request?.url,
+    method: params.request?.method,
+    headers: params.request?.headers,
+    postData: params.request?.postData,
+    resourceType: params.resourceType,
+    stage: isResponse ? "Response" : "Request",
+    responseStatusCode: params.responseStatusCode,
+    responseHeaders: params.responseHeaders,
+    ts: Date.now(),
+  };
+  const rule = s.interceptRules.find((r) => matchRule(r, entry));
+  if (rule) {
+    void resolvePaused(tabId, entry, rule.action || "continue", rule.set, rule.response).catch(() => {
+      void cmd(tabId, entry.stage === "Response" ? "Fetch.continueResponse" : "Fetch.continueRequest", { requestId: entry.requestId }).catch(() => {});
+    });
+    return;
+  }
+  s.paused.set(params.requestId, entry);
+}
+
+// ---- console/log capture ----
+function remoteObjToStr(a: any): string {
+  if (a == null) return "";
+  if (a.type === "string") return a.value ?? "";
+  if ("value" in a) {
+    try {
+      return typeof a.value === "object" ? JSON.stringify(a.value) : String(a.value);
+    } catch {
+      return String(a.value);
+    }
+  }
+  if (a.unserializableValue) return String(a.unserializableValue);
+  return a.description ?? a.className ?? a.type ?? "";
+}
+function onLogEvent(s: Session, method: string, params: any) {
+  let entry: LogEntry;
+  if (method === "Runtime.consoleAPICalled") {
+    const frame = params.stackTrace?.callFrames?.[0];
+    entry = {
+      source: "console",
+      level: params.type || "log",
+      text: (params.args || []).map(remoteObjToStr).join(" "),
+      url: frame?.url,
+      line: frame?.lineNumber,
+      ts: Date.now(),
+    };
+  } else if (method === "Runtime.exceptionThrown") {
+    const d = params.exceptionDetails || {};
+    entry = {
+      source: "exception",
+      level: "error",
+      text: d.exception?.description || d.text || "uncaught exception",
+      url: d.url,
+      line: d.lineNumber,
+      ts: Date.now(),
+    };
+  } else {
+    const e = params.entry || {};
+    entry = { source: e.source || "log", level: e.level || "info", text: e.text || "", url: e.url, line: e.lineNumber, ts: Date.now() };
+  }
+  if (s.logs.length >= LOG_MAX) s.logs.shift();
+  s.logs.push(entry);
+}
+
+// ---- fuzz (intruder: payload iteration over a request template, via background fetch) ----
+function mode<T>(arr: T[]): T | undefined {
+  const m = new Map<T, number>();
+  let best: T | undefined = arr[0];
+  let bestN = 0;
+  for (const v of arr) {
+    const n = (m.get(v) || 0) + 1;
+    m.set(v, n);
+    if (n > bestN) {
+      bestN = n;
+      best = v;
+    }
+  }
+  return best;
+}
+async function doFuzz(_tab: chrome.tabs.Tab, params: any): Promise<any> {
+  const marker: string = params.marker || "§";
+  const payloads: any[] = params.payloads || [];
+  if (!payloads.length) throw new Error("Provide a non-empty payloads array");
+  const tmpl = params.template;
+  if (!tmpl) throw new Error("Provide a template (a URL string with the marker, or {url,method,headers,body})");
+  const method0 = (params.method || "GET").toUpperCase();
+  const concurrency = Math.max(1, Math.min(params.concurrency ?? 10, 30));
+  const sub = (str: any, p: string) => (typeof str === "string" ? str.split(marker).join(p) : str);
+  const buildReq = (p: string) => {
+    if (typeof tmpl === "string") {
+      return { url: sub(tmpl, p), method: method0, headers: params.headers || {}, body: params.body != null ? sub(params.body, p) : undefined };
+    }
+    const hdrs: Record<string, string> = {};
+    for (const [k, v] of Object.entries(tmpl.headers || params.headers || {})) hdrs[k] = sub(String(v), p);
+    return {
+      url: sub(tmpl.url, p),
+      method: (tmpl.method || method0).toUpperCase(),
+      headers: hdrs,
+      body: tmpl.body != null ? sub(tmpl.body, p) : params.body != null ? sub(params.body, p) : undefined,
+    };
+  };
+  const runOne = async (raw: any): Promise<any> => {
+    const p = typeof raw === "object" && raw !== null ? String(raw.value ?? raw) : String(raw);
+    const req = buildReq(p);
+    const headers: Record<string, string> = {};
+    for (const [k, v] of Object.entries(req.headers || {})) if (!/^(cookie|host|content-length)$/i.test(k)) headers[k] = String(v);
+    const t0 = Date.now();
+    try {
+      const r = await fetch(req.url, { method: req.method, headers, body: req.body ?? undefined, credentials: params.identity === "anon" ? "omit" : "include" });
+      let text = "";
+      try {
+        text = await r.text();
+      } catch {
+        /* opaque/binary */
+      }
+      return { payload: p, status: r.status, length: text.length, timeMs: Date.now() - t0, contentType: r.headers.get("content-type") || "", snippet: text.slice(0, 200) };
+    } catch (e) {
+      return { payload: p, error: String(e), timeMs: Date.now() - t0 };
+    }
+  };
+  const results: any[] = [];
+  for (let i = 0; i < payloads.length; i += concurrency) {
+    const batch = payloads.slice(i, i + concurrency);
+    results.push(...(await Promise.all(batch.map(runOne))));
+  }
+  // baseline (mode status / median length) → flag anomalies
+  const ok = results.filter((x) => x.status !== undefined);
+  const statusMode = mode(ok.map((x) => x.status));
+  const lengths = ok.map((x) => x.length).sort((a, b) => a - b);
+  const medLen = lengths.length ? lengths[Math.floor(lengths.length / 2)] : 0;
+  for (const x of results) {
+    x.anomaly = x.error !== undefined || x.status !== statusMode || (medLen > 0 && Math.abs((x.length ?? 0) - medLen) / medLen > 0.25);
+  }
+  results.sort((a, b) => (b.anomaly ? 1 : 0) - (a.anomaly ? 1 : 0));
+  return { count: results.length, baseline: { status: statusMode, medianLength: medLen }, anomalies: results.filter((x) => x.anomaly).length, results };
 }
 
 // ---- CDP element resolution (for trusted input / closed shadow / file upload) ----
@@ -1603,6 +1901,198 @@ async function dispatch(method: string, params: any): Promise<any> {
     case "download_cancel": {
       await chrome.downloads.cancel(params.downloadId);
       return { cancelled: true, downloadId: params.downloadId };
+    }
+
+    // ---- intercept (live request/response tampering via CDP Fetch) ----
+    case "intercept_start": {
+      const tab = await targetTab(params.tabId);
+      const s = await ensureAttached(tab.id!);
+      const patterns = params.patterns ?? defaultFetchPatterns(params.stage);
+      s.interceptRules = Array.isArray(params.rules) ? params.rules : [];
+      s.paused.clear();
+      await cmd(tab.id!, "Fetch.enable", { patterns });
+      s.interceptOn = true;
+      return { intercepting: true, tabId: tab.id!, patterns, rules: s.interceptRules.length };
+    }
+
+    case "intercept_pending": {
+      const tab = await targetTab(params.tabId);
+      const s = sessions.get(tab.id!);
+      if (!s || !s.interceptOn) return { intercepting: false, count: 0, pending: [] };
+      const pending: any[] = [];
+      for (const e of s.paused.values()) {
+        const row: any = {
+          requestId: e.requestId,
+          url: e.url,
+          method: e.method,
+          stage: e.stage,
+          resourceType: e.resourceType,
+          responseStatusCode: e.responseStatusCode,
+          headers: e.headers,
+          postData: e.postData != null ? String(e.postData).slice(0, BODY_CAP) : undefined,
+        };
+        if (params.withBodies && e.stage === "Response") {
+          try {
+            const r = await cmd(tab.id!, "Fetch.getResponseBody", { requestId: e.requestId });
+            row.body = r?.base64Encoded ? b64DecodeUtf8(r.body).slice(0, BODY_CAP) : String(r?.body ?? "").slice(0, BODY_CAP);
+          } catch (err) {
+            row.bodyError = err instanceof Error ? err.message : String(err);
+          }
+        }
+        pending.push(row);
+      }
+      return { intercepting: true, count: pending.length, pending };
+    }
+
+    case "intercept_resolve": {
+      const tab = await targetTab(params.tabId);
+      const s = sessions.get(tab.id!);
+      if (!s || !s.interceptOn) throw new Error("Interception is not active on this tab — call intercept_start first");
+      const ids: string[] = params.requestId ? [params.requestId] : params.all ? [...s.paused.keys()] : [];
+      if (!ids.length) throw new Error("Provide a requestId (from intercept_pending), or all:true to release everything");
+      const done: any[] = [];
+      for (const id of ids) {
+        const e = s.paused.get(id);
+        if (!e) {
+          done.push({ requestId: id, error: "not paused (already resolved?)" });
+          continue;
+        }
+        s.paused.delete(id);
+        try {
+          done.push(await resolvePaused(tab.id!, e, params.action || "continue", params.set, params.response));
+        } catch (err) {
+          done.push({ requestId: id, error: err instanceof Error ? err.message : String(err) });
+        }
+      }
+      return { resolved: done };
+    }
+
+    case "intercept_stop": {
+      const tab = await targetTab(params.tabId);
+      const s = sessions.get(tab.id!);
+      if (s) {
+        s.interceptOn = false;
+        s.interceptRules = [];
+        for (const e of s.paused.values()) {
+          try {
+            await cmd(tab.id!, e.stage === "Response" ? "Fetch.continueResponse" : "Fetch.continueRequest", { requestId: e.requestId });
+          } catch {
+            /* already gone */
+          }
+        }
+        s.paused.clear();
+        try {
+          await cmd(tab.id!, "Fetch.disable");
+        } catch {
+          /* not enabled */
+        }
+      }
+      return { intercepting: false, tabId: tab.id! };
+    }
+
+    // ---- fuzz (intruder) ----
+    case "fuzz": {
+      const tab = await targetTab(params.tabId);
+      return doFuzz(tab, params);
+    }
+
+    // ---- cookies (chrome.cookies — real flags incl. HttpOnly) ----
+    case "cookies_get": {
+      const query: chrome.cookies.GetAllDetails = {};
+      if (params.url) query.url = params.url;
+      if (params.domain) query.domain = params.domain;
+      if (params.name) query.name = params.name;
+      const cookies = await chrome.cookies.getAll(query);
+      return { count: cookies.length, cookies };
+    }
+
+    case "cookies_set": {
+      if (!params.url || !params.name) throw new Error("cookies_set requires url and name");
+      const details: chrome.cookies.SetDetails = { url: params.url, name: params.name, value: params.value ?? "" };
+      if (params.domain) details.domain = params.domain;
+      if (params.path) details.path = params.path;
+      if (params.secure !== undefined) details.secure = params.secure;
+      if (params.httpOnly !== undefined) details.httpOnly = params.httpOnly;
+      if (params.sameSite) details.sameSite = params.sameSite;
+      if (params.expirationDate !== undefined) details.expirationDate = params.expirationDate;
+      const cookie = await chrome.cookies.set(details);
+      return { set: !!cookie, cookie };
+    }
+
+    case "cookies_delete": {
+      if (!params.url || !params.name) throw new Error("cookies_delete requires url and name");
+      const r = await chrome.cookies.remove({ url: params.url, name: params.name });
+      return { deleted: !!r, details: r };
+    }
+
+    // ---- web storage (localStorage / sessionStorage) ----
+    case "storage_dump": {
+      const tab = await targetTab(params.tabId);
+      return inject(tab, bbStorage, ["dump", null, null, null, params.kinds ?? null]);
+    }
+
+    case "storage_set": {
+      const tab = await targetTab(params.tabId);
+      if (!params.key) throw new Error("storage_set requires key");
+      return inject(tab, bbStorage, ["set", params.area ?? "local", params.key, params.value ?? "", null]);
+    }
+
+    case "storage_remove": {
+      const tab = await targetTab(params.tabId);
+      if (!params.key) throw new Error("storage_remove requires key");
+      return inject(tab, bbStorage, ["remove", params.area ?? "local", params.key, null, null]);
+    }
+
+    case "storage_clear": {
+      const tab = await targetTab(params.tabId);
+      return inject(tab, bbStorage, ["clear", params.area ?? "local", null, null, null]);
+    }
+
+    // ---- console/log capture ----
+    case "console_start": {
+      const tab = await targetTab(params.tabId);
+      const s = await ensureAttached(tab.id!);
+      s.logs = [];
+      s.logOn = true;
+      await cmd(tab.id!, "Runtime.enable");
+      await cmd(tab.id!, "Log.enable");
+      return { capturing: true, tabId: tab.id! };
+    }
+
+    case "console_get": {
+      const tab = await targetTab(params.tabId);
+      const s = sessions.get(tab.id!);
+      if (!s) return { capturing: false, total: 0, logs: [] };
+      let logs = s.logs;
+      if (params.level) logs = logs.filter((l) => l.level === params.level);
+      if (params.pattern) {
+        const re = new RegExp(params.pattern, "i");
+        logs = logs.filter((l) => re.test(l.text));
+      }
+      const limit = params.limit ?? 200;
+      return { capturing: s.logOn, total: logs.length, logs: logs.slice(-limit) };
+    }
+
+    case "console_stop": {
+      const tab = await targetTab(params.tabId);
+      const s = sessions.get(tab.id!);
+      if (s) {
+        s.logOn = false;
+        try {
+          await cmd(tab.id!, "Log.disable");
+        } catch {
+          /* not enabled */
+        }
+      }
+      return { capturing: false, tabId: tab.id! };
+    }
+
+    // ---- save_page (MHTML single-file evidence snapshot) ----
+    case "save_page": {
+      const tab = await targetTab(params.tabId);
+      await ensureAttached(tab.id!);
+      const r = await cmd(tab.id!, "Page.captureSnapshot", { format: "mhtml" });
+      return { mhtml: r?.data ?? "", url: tab.url, title: tab.title };
     }
 
     default:
