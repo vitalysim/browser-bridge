@@ -1,9 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { writeFileSync, readFileSync } from "fs";
+import { writeFileSync, readFileSync, renameSync, copyFileSync, unlinkSync } from "fs";
 import type { ExtensionHub } from "./hub.js";
 
 const MAX_TEXT_CHARS = 60_000;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // Parse pixel dimensions from a PNG or JPEG buffer (header only).
 function imageDims(buf: Buffer): { width: number; height: number } | null {
@@ -312,6 +313,60 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
           { type: "text" as const, text: `${dims?.width ?? "?"}×${dims?.height ?? "?"} ${r.format}, ${buf.length} bytes` },
         ],
       };
+    }
+  );
+
+  tool(
+    "download_resource",
+    "Download a resource (URL) to disk using Chrome's own download engine — reliably handles files " +
+      "up to 100MB and well beyond (pass a larger maxBytes, or omit it, for bigger files), with correct " +
+      "binary handling and the real browser session's cookies sent automatically. Banner-free (no " +
+      "chrome.debugger involved). Cookie/Host/Origin/Referer/Content-Length headers are browser-forbidden " +
+      "and ignored; Authorization works for token-gated downloads. Always uses the live browser session — " +
+      "can't be pointed at a captured identity's snapshotted cookies.",
+    {
+      url: z.string().describe("URL of the resource to download"),
+      savePath: z.string().optional().describe("Absolute destination path; if omitted, the file stays wherever Chrome's Downloads folder puts it"),
+      filename: z.string().optional().describe("Initial relative filename/subpath within Chrome's Downloads directory"),
+      headers: z.record(z.string()).optional().describe("Extra request headers, e.g. Authorization"),
+      maxBytes: z.number().optional().describe("Cancel the download if size exceeds this (bytes). Default 100 MB; pass a bigger value or omit for unlimited."),
+      timeoutMs: z.number().optional().describe("Max time to wait for completion (default 600000 = 10 min; large/slow downloads may need more)"),
+    },
+    async ({ url, savePath, filename, headers, maxBytes, timeoutMs }) => {
+      const start = await hub.call("download_resource", { url, filename, headers }, 20_000);
+      const cap = maxBytes ?? 100 * 1024 * 1024;
+      const overallTimeout = timeoutMs ?? 600_000;
+      const deadline = Date.now() + overallTimeout;
+      let status: any;
+      while (true) {
+        status = await hub.call("download_status", { downloadId: start.downloadId }, 10_000);
+        if (status.state === "complete") break;
+        if (status.state === "interrupted") throw new Error(`Download interrupted: ${status.error ?? "unknown reason"}`);
+        const seen = status.totalBytes > 0 ? status.totalBytes : status.bytesReceived;
+        if (cap && seen > cap) {
+          await hub.call("download_cancel", { downloadId: start.downloadId }, 10_000).catch(() => {});
+          throw new Error(`Download exceeded maxBytes (${cap}); cancelled after ~${status.bytesReceived} bytes.`);
+        }
+        if (Date.now() > deadline) {
+          throw new Error(
+            `Timed out after ${overallTimeout}ms waiting for download to complete (downloadId ${start.downloadId} may still be running — check chrome://downloads or retry).`
+          );
+        }
+        await sleep(750);
+      }
+      let outPath = status.filename;
+      if (savePath && savePath !== status.filename) {
+        try {
+          renameSync(status.filename, savePath);
+        } catch (e) {
+          if ((e as NodeJS.ErrnoException).code === "EXDEV") {
+            copyFileSync(status.filename, savePath);
+            unlinkSync(status.filename);
+          } else throw e;
+        }
+        outPath = savePath;
+      }
+      return textResult({ path: outPath, bytes: status.fileSize ?? status.bytesReceived, mimeType: status.mime, url });
     }
   );
 

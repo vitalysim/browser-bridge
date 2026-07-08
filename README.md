@@ -3,8 +3,8 @@
 > **Drive your real, logged-in Chrome from an AI agent** — over the Model Context Protocol. No headless browser, no fresh profile, no re-login. Your agent reads and acts inside the exact sessions you're already signed into.
 
 <p>
-  <img alt="version"  src="https://img.shields.io/badge/version-0.4.10-4f46e5">
-  <img alt="tools"    src="https://img.shields.io/badge/tools-33-7c3aed">
+  <img alt="version"  src="https://img.shields.io/badge/version-0.4.11-4f46e5">
+  <img alt="tools"    src="https://img.shields.io/badge/tools-34-7c3aed">
   <img alt="protocol" src="https://img.shields.io/badge/MCP-streamable_HTTP-7c3aed">
   <img alt="browser"  src="https://img.shields.io/badge/Chrome%2FEdge-Manifest_V3-2563eb">
   <img alt="lang"     src="https://img.shields.io/badge/TypeScript-strict-3178c6">
@@ -13,7 +13,7 @@
 
 Browser Bridge is a local **MCP server + Manifest V3 Chrome extension** that lets AI coding agents — **Claude Code** and **OpenAI Codex CLI** — control the Chrome you use every day. Because it runs *inside* your real profile, the agent inherits your cookies, `HttpOnly` sessions, SSO, and 2FA state automatically. Ask it to *"read my feed and summarize it"* or *"capture the API traffic on this page and show me the responses"* — and it works against the live, authenticated app.
 
-It ships **33 tools** spanning everyday browsing, DevTools-grade network capture, and a web-security testing toolkit (in-session request replay + access-control diffing).
+It ships **34 tools** spanning everyday browsing, DevTools-grade network capture, and a web-security testing toolkit (in-session request replay + access-control diffing).
 
 ---
 
@@ -62,6 +62,8 @@ It ships **33 tools** spanning everyday browsing, DevTools-grade network capture
 
 **Read & inspect** — extract page text (the workhorse for summarizing), snapshot interactive elements with stable refs, screenshot (viewport by default, or **`fullPage`** for the entire scrollable page, **`scale:2`** for retina/high-DPI, `format`/`quality`, `selector` to clip an element, `savePath` to write a file), and evaluate JavaScript in the page.
 
+**Download resources** — `download_resource` saves a URL to disk via Chrome's own download engine (not the network-capture path), so it isn't bound by the 512 KB body cap: files up to 100MB by default, larger with `maxBytes`, streamed straight to disk with correct binary handling and the real session's cookies attached automatically. Banner-free.
+
 **DevTools-grade network capture** — record requests with **full request/response bodies**, response headers, `Set-Cookie` (via CDP ExtraInfo), timings, and **WebSocket/SSE frames** — the things a `webRequest`-based extension fundamentally can't read.
 
 **Trusted mode (opt-in, `chrome.debugger`)** — real `isTrusted` mouse/keyboard input (fires pure-CSS `:hover`, real keystroke timing), **closed** shadow-root access via `snapshot(deep:true)`, and reliable uploads via `DOM.setFileInputFiles`.
@@ -70,7 +72,7 @@ It ships **33 tools** spanning everyday browsing, DevTools-grade network capture
 
 ---
 
-## 📇 Tool reference (33)
+## 📇 Tool reference (34)
 
 <details open>
 <summary><b>Browsing & interaction</b></summary>
@@ -92,6 +94,7 @@ It ships **33 tools** spanning everyday browsing, DevTools-grade network capture
 | `get_page_text` | Rendered text of the page (and its iframes) |
 | `snapshot` | Interactive elements with refs; `deep:true` pierces **closed** shadow roots. Deep-snapshot refs are numbered in their own range per snapshot generation, so they can never be confused with a plain-snapshot ref or a stale one from an earlier deep snapshot |
 | `screenshot` | Visible viewport (banner-free) by default; `fullPage` for the whole page, `scale` for retina, `format`/`quality`, `selector` to clip, `savePath` to write a file |
+| `download_resource` | Download a URL to disk via Chrome's own download engine — up to 100MB by default (`maxBytes` to raise it), correct binary handling, real session cookies, banner-free; `savePath` to relocate it from the Downloads folder |
 | `eval_js` | Evaluate JavaScript in the page's main world |
 | `bridge_status` | Is the extension connected? |
 </details>
@@ -168,7 +171,7 @@ once the extension is loaded). Logs: Linux `journalctl --user -u browser-bridge 
 
 Verify: `curl -s http://127.0.0.1:8765/health` → `{"ok":true,"extensionConnected":true}`.
 
-> Reloading the extension after an update may prompt for new permissions (e.g. `webNavigation`, `debugger`) — re-enable it if Chrome disables it.
+> Reloading the extension after an update may prompt for new permissions (e.g. `webNavigation`, `debugger`, `downloads`) — re-enable it if Chrome disables it.
 
 ### 4 · Connect your agent
 
@@ -256,6 +259,7 @@ oversized PNG auto-falls back to JPEG.
 - `chrome.debugger` requires sole access to a tab — it **can't attach if DevTools is open** on that tab. `net_capture_start` only records traffic sent *after* it's called (navigate/reload to capture a page load).
 - The capture buffer is in-memory (last 500 requests/tab, ~512 KB/body); a long idle can drop it.
 - One extension connection at a time (last connect wins); multiple MCP clients can share it concurrently.
+- `download_resource` always uses the browser's live session — it can't download as a captured `identity`. `Cookie`/`Host`/`Origin`/`Referer`/`Content-Length` in its `headers` param are browser-forbidden and silently ignored. If Chrome's "Ask where to save each file" setting is enabled, downloads may prompt for a location instead of completing automatically.
 
 ---
 

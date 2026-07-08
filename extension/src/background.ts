@@ -1,6 +1,6 @@
 /// <reference types="chrome" />
 
-const VERSION = "0.4.10";
+const VERSION = "0.4.11";
 const PING_INTERVAL_MS = 20_000; // WS traffic resets the MV3 service-worker idle timer (Chrome 116+)
 const RECONNECT_MAX_MS = 30_000;
 
@@ -1567,6 +1567,44 @@ async function dispatch(method: string, params: any): Promise<any> {
       throw new Error(`Timed out after ${timeoutMs}ms waiting for selector: ${params.selector}`);
     }
 
+    case "download_resource": {
+      const opts: chrome.downloads.DownloadOptions = {
+        url: params.url,
+        conflictAction: "uniquify",
+        saveAs: false,
+      };
+      if (params.filename) opts.filename = params.filename;
+      if (params.headers) {
+        opts.headers = Object.entries(params.headers as Record<string, string>).map(([name, value]) => ({
+          name,
+          value: String(value),
+        }));
+      }
+      const downloadId = await chrome.downloads.download(opts);
+      return { downloadId };
+    }
+
+    case "download_status": {
+      const [item] = await chrome.downloads.search({ id: params.downloadId });
+      if (!item) throw new Error(`Unknown downloadId ${params.downloadId}`);
+      return {
+        downloadId: params.downloadId,
+        state: item.state,
+        bytesReceived: item.bytesReceived,
+        totalBytes: item.totalBytes,
+        fileSize: item.fileSize,
+        filename: item.filename,
+        mime: item.mime,
+        error: item.error,
+        exists: item.exists,
+      };
+    }
+
+    case "download_cancel": {
+      await chrome.downloads.cancel(params.downloadId);
+      return { cancelled: true, downloadId: params.downloadId };
+    }
+
     default:
       throw new Error(`Unknown method: ${method}`);
   }
@@ -1596,6 +1634,9 @@ chrome.debugger.onDetach.addListener((source) => {
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
   sessions.delete(tabId);
+});
+chrome.downloads.onDeterminingFilename.addListener((_item, suggest) => {
+  suggest(); // accept Chrome's tentative filename; avoids an interactive save-location prompt
 });
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && (changes.token || changes.port)) {
