@@ -4,7 +4,7 @@
 
 <p>
   <img alt="version"  src="https://img.shields.io/badge/version-0.6.0-4f46e5">
-  <img alt="tools"    src="https://img.shields.io/badge/tools-51-7c3aed">
+  <img alt="tools"    src="https://img.shields.io/badge/tools-54-7c3aed">
   <img alt="protocol" src="https://img.shields.io/badge/MCP-streamable_HTTP-7c3aed">
   <img alt="browser"  src="https://img.shields.io/badge/Chrome%2FEdge-Manifest_V3-2563eb">
   <img alt="lang"     src="https://img.shields.io/badge/TypeScript-strict-3178c6">
@@ -13,7 +13,7 @@
 
 Browser Bridge is a local **MCP server + Manifest V3 Chrome extension** that lets AI coding agents — **Claude Code** and **OpenAI Codex CLI** — control the Chrome you use every day. Because it runs *inside* your real profile, the agent inherits your cookies, `HttpOnly` sessions, SSO, and 2FA state automatically. Ask it to *"read my feed and summarize it"* or *"capture the API traffic on this page and show me the responses"* — and it works against the live, authenticated app.
 
-It ships **51 tools** spanning everyday browsing, DevTools-grade network capture, and a web-security testing toolkit (in-session request replay, **live request/response interception**, an **intruder-style fuzzer**, access-control diffing, real-cookie-jar read/write, **CSP-bypassing page evaluation**, and MHTML evidence capture).
+It ships **54 tools** spanning everyday browsing, DevTools-grade network capture, and a web-security testing toolkit (self-healing interaction, in-session request replay, **live request/response interception**, an **intruder-style fuzzer** (sniper/pitchfork/clusterbomb/race), access-control diffing, real-cookie-jar read/write, **CSP-bypassing page evaluation**, **passive header/CORS/secret analysis + JWT decode**, and HAR/MHTML evidence export).
 
 ---
 
@@ -74,7 +74,7 @@ It ships **51 tools** spanning everyday browsing, DevTools-grade network capture
 
 ---
 
-## 📇 Tool reference (51)
+## 📇 Tool reference (54)
 
 <details open>
 <summary><b>Browsing & interaction</b></summary>
@@ -83,7 +83,7 @@ It ships **51 tools** spanning everyday browsing, DevTools-grade network capture
 |---|---|
 | `tabs_list` · `tab_new` · `tab_activate` · `tab_close` | Manage tabs |
 | `navigate` · `go_back` · `go_forward` · `wait_for` | Navigation |
-| `click` · `fill` · `hover` · `type` · `press_key` · `scroll` | Interaction (iframe + open-shadow aware; `trusted:true` for real CDP input; `withSnapshot:true` to get a fresh `snapshot` back inline, skipping a separate follow-up call) |
+| `click` · `fill` · `hover` · `type` · `press_key` · `scroll` | Interaction (iframe + open-shadow aware). **Auto-waits** for the element to be actionable (found + visible + enabled, `timeoutMs`) and returns structured `{notActionable, reason}` on failure. `click` detects overlay-covered targets and **auto-escalates to a trusted CDP click** (`via:"trusted"`); `fill`/`type` register in React inputs (native setter) and rich editors (execCommand). `trusted:true` for real CDP input; `withSnapshot:true` to get a fresh `snapshot` back inline |
 | `file_upload` | Set a file input via base64 or a local `path` (`DOM.setFileInputFiles`) |
 | `paste_image` | Paste a local image into a rich-text / contenteditable field; `trusted:true` uses the real OS clipboard + a genuine Cmd/Ctrl+V for strict editors (e.g. YesWeHack) that ignore synthetic events |
 </details>
@@ -94,7 +94,7 @@ It ships **51 tools** spanning everyday browsing, DevTools-grade network capture
 | Tool | Description |
 |---|---|
 | `get_page_text` | Rendered text of the page (and its iframes) |
-| `snapshot` | Interactive elements with refs; `deep:true` pierces **closed** shadow roots. Deep-snapshot refs are numbered in their own range per snapshot generation, so they can never be confused with a plain-snapshot ref or a stale one from an earlier deep snapshot |
+| `snapshot` | Interactive elements with refs (+ `enabled`/`inViewport` hints); `deep:true` pierces **closed** shadow roots. Deep-snapshot refs are numbered in their own range per snapshot generation, so they can never be confused with a plain-snapshot ref or a stale one from an earlier deep snapshot |
 | `screenshot` | Visible viewport (banner-free) by default; `fullPage` for the whole page, `scale` for retina, `format`/`quality`, `selector` to clip, `savePath` to write a file |
 | `download_resource` | Download a URL to disk via Chrome's own download engine — up to 100MB by default (`maxBytes` to raise it), correct binary handling, real session cookies, banner-free; `savePath` to relocate it from the Downloads folder |
 | `eval_js` | Evaluate JavaScript in the page's main world (banner-free). **Auto-falls back to `cdp_eval` on strict-CSP pages** where in-page `eval` is blocked (`via:"cdp-fallback"`); `cdp:true` forces it, `noFallback:true` disables it |
@@ -111,6 +111,7 @@ It ships **51 tools** spanning everyday browsing, DevTools-grade network capture
 | `net_get_requests` | Requests with headers, `Set-Cookie`, timings, and (opt-in) response **bodies** |
 | `net_get_body` | Fetch one response body on demand |
 | `net_get_ws_frames` | Captured WebSocket / EventSource frames |
+| `export_har` | Write the tab's captured traffic to a **HAR 1.2** file (import into Burp / DevTools / Playwright); bodies included by default |
 | `debugger_detach` · `debugger_status` | End a session (banner off) / inspect sessions |
 </details>
 
@@ -120,11 +121,13 @@ It ships **51 tools** spanning everyday browsing, DevTools-grade network capture
 | Tool | Description |
 |---|---|
 | `identity_capture` · `identity_list` · `identity_purge` | Snapshot/manage named sessions (cookies incl. `HttpOnly`, storage, bearer) |
-| `replay_request` | In-session Repeater — replay a captured or ad-hoc request; override any header or swap identity (`anon` strips auth) |
+| `replay_request` | In-session Repeater — replay a captured or ad-hoc request; override any header or swap identity (`anon` strips auth). `viaAppClient:true` replays through the **page's own `fetch`** so app CSRF/auth interceptors apply |
 | `authz_matrix` | Replay a request set across identities and diff → flags access-control breaks |
 | `response_diff` | Structural diff of two responses (status, length, token-Jaccard, noise-suppressed) |
 | `intercept_start` · `intercept_pending` · `intercept_resolve` · `intercept_stop` | Burp-Proxy-style live interception (CDP Fetch): pause matching requests/responses, then **continue** (optionally mutating url/method/headers/body), **fail** (block), or **fulfill/modify** (synthesize a response). `rules` auto-apply; otherwise requests queue for resolution |
-| `fuzz` | Intruder-style fuzzer: substitute each payload for a marker in a request template, fire concurrently from the live session, and return per-payload `status`/`length`/`timeMs` with anomalies flagged first |
+| `fuzz` | Intruder-style fuzzer over a request template — modes **sniper** / **pitchfork** / **clusterbomb** (multi-marker `payloadSets`) / **race** (fire N together for race conditions). Per-request `status`/`length`/`timeMs` with anomalies flagged first |
+| `analyze` | One-call **passive recon**: grades response security headers (CSP/HSTS/CORS/X-Frame/nosniff/leaks), cookie flags, and sweeps the body for exposed secrets/API-keys/JWTs → findings ranked by severity |
+| `jwt_decode` | Decode a JWT (header/payload, no verify); flags `alg:none`, HS/RS confusion, expiry |
 </details>
 
 <details open>
@@ -271,7 +274,7 @@ oversized PNG auto-falls back to JPEG.
 
 ## ⚠️ Limitations
 
-- Default interaction uses synthetic events (no banner); a few sites ignore untrusted input — use `trusted:true` for real events.
+- Interaction auto-waits for actionability and, on `click`, auto-escalates to a trusted CDP click when the target is overlay-covered (`via:"trusted"`, shows the banner); force it anytime with `trusted:true`. A covered/hidden/disabled target returns a structured `{notActionable, reason}`.
 - A strict page **CSP** (`script-src` without `'unsafe-eval'`) blocks the banner-free `eval_js`; it auto-falls back to `cdp_eval` (CDP `Runtime.evaluate`, banner shown), which CSP cannot block. The isolated-world read/interact tools and all CDP/background tools are unaffected by CSP either way.
 - `chrome.debugger` requires sole access to a tab — it **can't attach if DevTools is open** on that tab. `net_capture_start` only records traffic sent *after* it's called (navigate/reload to capture a page load).
 - The capture buffer is in-memory (last 500 requests/tab, ~512 KB/body); a long idle can drop it.
@@ -282,9 +285,9 @@ oversized PNG auto-falls back to JPEG.
 
 ## 🗺️ Roadmap
 
-Shipped in v0.5: **live request/response interception** (`intercept_*`), **parameter fuzzing** (`fuzz`), **cookie-jar & web-storage** read/write, **console/CSP capture**, and **MHTML** evidence snapshots.
+Shipped in v0.6: **self-healing interaction** (auto-wait actionability + trusted escalation + rich-editor support), **passive recon** (`analyze`) + **`jwt_decode`**, **HAR export** (`export_har`), and **fuzz modes** (pitchfork/clusterbomb/race) + **`viaAppClient`** replay. v0.5 shipped interception, fuzzing, cookie/storage, console/CSP capture, and MHTML.
 
-Ideas explored for future phases: HAR / curl / Burp export, passive header/CORS/CSP/secret scanners, source-map de-minification on downloads, JWT/GraphQL/race-condition helpers, a client-side DOM-XSS / postMessage / prototype-pollution suite, and hunt-workflow playbooks with structured findings.
+Ideas explored for future phases: curl / Burp export, source-map de-minification on downloads, GraphQL introspection helpers, a client-side DOM-XSS / postMessage / prototype-pollution suite, streaming on-disk capture persistence, and hunt-workflow playbooks with structured findings.
 
 ---
 
@@ -294,7 +297,7 @@ Ideas explored for future phases: HAR / curl / Burp export, passive header/CORS/
 server/                 MCP server (TypeScript · @modelcontextprotocol/sdk · ws · express)
   src/index.ts            HTTP MCP endpoint + auth + session management
   src/hub.ts              single extension socket, request/response correlation
-  src/tools.ts            the 51 MCP tools
+  src/tools.ts            the 54 MCP tools
 extension/              Manifest V3 extension (bundled with esbuild)
   manifest.json
   src/background.ts       service worker: WS client, injection, chrome.debugger (CDP) layer

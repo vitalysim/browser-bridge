@@ -987,6 +987,39 @@ async function doReplay(tab: chrome.tabs.Tab, params: any): Promise<any> {
     }
   }
 
+  // viaAppClient: run through the PAGE'S OWN fetch (main world) so the app's CSRF tokens, auth
+  // interceptors, and service worker apply. Practically same-origin (page CSP connect-src / CORS).
+  if (params.viaAppClient) {
+    const ta = Date.now();
+    try {
+      const res: any = await inject(
+        tab,
+        async (u: string, m: string, hh: Record<string, string>, b: string | null) => {
+          try {
+            const r = await fetch(u, { method: m, headers: hh, body: b ?? undefined, credentials: "include" });
+            const oh: Record<string, string> = {};
+            r.headers.forEach((v, k) => (oh[k] = v));
+            let t = "";
+            try {
+              t = (await r.text()).slice(0, 512 * 1024);
+            } catch {
+              /* opaque/binary */
+            }
+            return { status: r.status, statusText: r.statusText, redirected: r.redirected, headers: oh, body: t };
+          } catch (e) {
+            return { __fetchError: String(e) };
+          }
+        },
+        [url, method, headers, body ?? null],
+        "MAIN"
+      );
+      if (res && res.__fetchError) return { error: res.__fetchError, via: "app-fetch", url, method };
+      return { ...res, ms: Date.now() - ta, via: "app-fetch", identity: params.identity ?? null, note };
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : String(e), via: "app-fetch", url, method };
+    }
+  }
+
   // Replay from the extension BACKGROUND context: <all_urls> host permission sends the session
   // cookies, and it is NOT subject to the page's CSP or CORS (unlike an injected fetch).
   const t0 = Date.now();
@@ -1163,30 +1196,75 @@ function mode<T>(arr: T[]): T | undefined {
   return best;
 }
 async function doFuzz(_tab: chrome.tabs.Tab, params: any): Promise<any> {
-  const marker: string = params.marker || "§";
-  const payloads: any[] = params.payloads || [];
-  if (!payloads.length) throw new Error("Provide a non-empty payloads array");
+  const fuzzMode: string = params.mode || "sniper";
   const tmpl = params.template;
-  if (!tmpl) throw new Error("Provide a template (a URL string with the marker, or {url,method,headers,body})");
+  if (!tmpl) throw new Error("Provide a template (a URL string with marker(s), or {url,method,headers,body})");
   const method0 = (params.method || "GET").toUpperCase();
   const concurrency = Math.max(1, Math.min(params.concurrency ?? 10, 30));
-  const sub = (str: any, p: string) => (typeof str === "string" ? str.split(marker).join(p) : str);
-  const buildReq = (p: string) => {
+  const applySubs = (str: any, subs: [string, string][]) => {
+    if (typeof str !== "string") return str;
+    let out = str;
+    for (const [m, v] of subs) out = out.split(m).join(v);
+    return out;
+  };
+  const buildReq = (subs: [string, string][]) => {
     if (typeof tmpl === "string") {
-      return { url: sub(tmpl, p), method: method0, headers: params.headers || {}, body: params.body != null ? sub(params.body, p) : undefined };
+      return { url: applySubs(tmpl, subs), method: method0, headers: params.headers || {}, body: params.body != null ? applySubs(params.body, subs) : undefined };
     }
     const hdrs: Record<string, string> = {};
-    for (const [k, v] of Object.entries(tmpl.headers || params.headers || {})) hdrs[k] = sub(String(v), p);
+    for (const [k, v] of Object.entries(tmpl.headers || params.headers || {})) hdrs[k] = applySubs(String(v), subs);
     return {
-      url: sub(tmpl.url, p),
+      url: applySubs(tmpl.url, subs),
       method: (tmpl.method || method0).toUpperCase(),
       headers: hdrs,
-      body: tmpl.body != null ? sub(tmpl.body, p) : params.body != null ? sub(params.body, p) : undefined,
+      body: tmpl.body != null ? applySubs(tmpl.body, subs) : params.body != null ? applySubs(params.body, subs) : undefined,
     };
   };
-  const runOne = async (raw: any): Promise<any> => {
-    const p = typeof raw === "object" && raw !== null ? String(raw.value ?? raw) : String(raw);
-    const req = buildReq(p);
+  // Build the job list — each job = a set of marker→value substitutions + a display label.
+  const jobs: { subs: [string, string][]; label: string }[] = [];
+  if (fuzzMode === "sniper") {
+    const marker = params.marker || "§";
+    const payloads: any[] = params.payloads || [];
+    if (!payloads.length) throw new Error("sniper: provide a non-empty payloads array");
+    for (const raw of payloads) {
+      const p = typeof raw === "object" && raw !== null ? String(raw.value ?? raw) : String(raw);
+      jobs.push({ subs: [[marker, p]], label: p });
+    }
+  } else if (fuzzMode === "pitchfork" || fuzzMode === "clusterbomb") {
+    const markers: string[] = params.markers || ["§1§", "§2§", "§3§", "§4§"];
+    const sets: any[][] = params.payloadSets || [];
+    if (!sets.length) throw new Error(`${fuzzMode}: provide payloadSets (array of payload arrays)`);
+    const mk = markers.slice(0, sets.length);
+    if (fuzzMode === "pitchfork") {
+      const len = Math.min(...sets.map((s) => s.length));
+      for (let i = 0; i < len; i++) {
+        const subs = mk.map((m, j) => [m, String(sets[j][i])] as [string, string]);
+        jobs.push({ subs, label: subs.map((s) => s[1]).join(" | ") });
+      }
+    } else {
+      let combos: string[][] = [[]];
+      for (let j = 0; j < sets.length; j++) {
+        const next: string[][] = [];
+        for (const c of combos) for (const v of sets[j]) next.push([...c, String(v)]);
+        combos = next;
+        if (combos.length > 4096) throw new Error("clusterbomb: >4096 combinations — reduce payload sets");
+      }
+      for (const c of combos) {
+        const subs = mk.map((m, j) => [m, c[j]] as [string, string]);
+        jobs.push({ subs, label: c.join(" | ") });
+      }
+    }
+  } else if (fuzzMode === "race") {
+    const count = Math.max(2, Math.min(params.raceCount ?? 20, 50));
+    const marker = params.marker || "§";
+    const p = params.payload != null ? String(params.payload) : "";
+    for (let i = 0; i < count; i++) jobs.push({ subs: [[marker, p]], label: `race#${i + 1}` });
+  } else {
+    throw new Error(`Unknown fuzz mode: ${fuzzMode} (sniper|pitchfork|clusterbomb|race)`);
+  }
+
+  const runOne = async (job: { subs: [string, string][]; label: string }): Promise<any> => {
+    const req = buildReq(job.subs);
     const headers: Record<string, string> = {};
     for (const [k, v] of Object.entries(req.headers || {})) if (!/^(cookie|host|content-length)$/i.test(k)) headers[k] = String(v);
     const t0 = Date.now();
@@ -1198,15 +1276,20 @@ async function doFuzz(_tab: chrome.tabs.Tab, params: any): Promise<any> {
       } catch {
         /* opaque/binary */
       }
-      return { payload: p, status: r.status, length: text.length, timeMs: Date.now() - t0, contentType: r.headers.get("content-type") || "", snippet: text.slice(0, 200) };
+      return { payload: job.label, status: r.status, length: text.length, timeMs: Date.now() - t0, contentType: r.headers.get("content-type") || "", snippet: text.slice(0, 200) };
     } catch (e) {
-      return { payload: p, error: String(e), timeMs: Date.now() - t0 };
+      return { payload: job.label, error: String(e), timeMs: Date.now() - t0 };
     }
   };
   const results: any[] = [];
-  for (let i = 0; i < payloads.length; i += concurrency) {
-    const batch = payloads.slice(i, i + concurrency);
-    results.push(...(await Promise.all(batch.map(runOne))));
+  if (fuzzMode === "race") {
+    // Prep all, then release together (best-effort single-packet: minimal skew via Promise.all).
+    results.push(...(await Promise.all(jobs.map(runOne))));
+  } else {
+    for (let i = 0; i < jobs.length; i += concurrency) {
+      const batch = jobs.slice(i, i + concurrency);
+      results.push(...(await Promise.all(batch.map(runOne))));
+    }
   }
   // baseline (mode status / median length) → flag anomalies
   const ok = results.filter((x) => x.status !== undefined);
@@ -1217,7 +1300,7 @@ async function doFuzz(_tab: chrome.tabs.Tab, params: any): Promise<any> {
     x.anomaly = x.error !== undefined || x.status !== statusMode || (medLen > 0 && Math.abs((x.length ?? 0) - medLen) / medLen > 0.25);
   }
   results.sort((a, b) => (b.anomaly ? 1 : 0) - (a.anomaly ? 1 : 0));
-  return { count: results.length, baseline: { status: statusMode, medianLength: medLen }, anomalies: results.filter((x) => x.anomaly).length, results };
+  return { mode: fuzzMode, count: results.length, baseline: { status: statusMode, medianLength: medLen }, anomalies: results.filter((x) => x.anomaly).length, results };
 }
 
 // ---- CDP evaluate (page-context JS that is NOT subject to the page CSP's unsafe-eval) ----

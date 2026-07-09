@@ -549,7 +549,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
         .optional()
         .describe("Fields to override on the base request"),
       identity: z.string().optional().describe("Send as this captured identity, or 'anon'"),
-      viaAppClient: z.boolean().optional().describe("Route through the page's own fetch (reserved)"),
+      viaAppClient: z.boolean().optional().describe("Replay through the PAGE'S OWN fetch (main world) so the app's CSRF tokens, auth interceptors, and service worker apply (practically same-origin; result via:'app-fetch'). Default uses the banner-free background fetch."),
       tabId: tabIdParam,
     },
     async (args) => textResult(await hub.call("replay_request", args, 45_000)),
@@ -681,22 +681,29 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
   // ---- fuzz (intruder) ----
   tool(
     "fuzz",
-    "Intruder-style fuzzer: substitute each payload for the marker in a request template, fire them (concurrently) " +
-      "from the live session, and return per-payload {status,length,timeMs,contentType,snippet} with anomalies " +
-      "(deviating status/length or errors) flagged and sorted first. Banner-free (background fetch). Pairs with response_diff/authz_matrix.",
+    "Intruder-style fuzzer over a request template, fired from the live session (banner-free). Returns per-request " +
+      "{status,length,timeMs,contentType,snippet} with anomalies (deviating status/length or errors) flagged first. " +
+      "Modes: 'sniper' (default; one marker, payloads[]), 'pitchfork' (multiple markers, i-th of each payloadSets[]), " +
+      "'clusterbomb' (all combinations of payloadSets[]), 'race' (fire raceCount identical requests together for " +
+      "race-condition testing — best-effort single-packet via concurrent release). Pairs with response_diff/authz_matrix.",
     {
       template: z
         .union([
           z.string(),
           z.object({ url: z.string(), method: z.string().optional(), headers: z.record(z.string()).optional(), body: z.string().optional() }),
         ])
-        .describe("URL string containing the marker, or {url,method,headers,body} with the marker in any field"),
-      payloads: z.array(z.string()).describe("Payloads substituted for the marker (one request each)"),
-      marker: z.string().optional().describe("Placeholder to replace (default §)"),
+        .describe("URL string containing the marker(s), or {url,method,headers,body} with the marker(s) in any field"),
+      mode: z.enum(["sniper", "pitchfork", "clusterbomb", "race"]).optional().describe("Attack type (default sniper)"),
+      payloads: z.array(z.string()).optional().describe("sniper: payloads substituted for `marker` (one request each)"),
+      payloadSets: z.array(z.array(z.string())).optional().describe("pitchfork/clusterbomb: one payload array per marker"),
+      markers: z.array(z.string()).optional().describe("pitchfork/clusterbomb marker strings (default ['§1§','§2§',…])"),
+      marker: z.string().optional().describe("sniper/race single marker (default §)"),
+      payload: z.string().optional().describe("race: the single payload substituted into every request"),
+      raceCount: z.number().optional().describe("race: number of simultaneous requests (default 20, max 50)"),
       method: z.string().optional().describe("Default method when template is a bare URL"),
       headers: z.record(z.string()).optional().describe("Extra/base request headers"),
       body: z.string().optional().describe("Request body when template is a bare URL"),
-      concurrency: z.number().optional().describe("Parallel requests (default 10, max 30)"),
+      concurrency: z.number().optional().describe("Parallel requests for non-race modes (default 10, max 30)"),
       identity: z.string().optional().describe("'anon' strips cookies; default uses the live session"),
       tabId: tabIdParam,
     },
