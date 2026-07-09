@@ -1,6 +1,6 @@
 /// <reference types="chrome" />
 
-const VERSION = "0.5.1";
+const VERSION = "0.5.2";
 const PING_INTERVAL_MS = 20_000; // WS traffic resets the MV3 service-worker idle timer (Chrome 116+)
 const RECONNECT_MAX_MS = 30_000;
 
@@ -728,8 +728,7 @@ async function ensureAttached(tabId: number): Promise<Session> {
   let s = sessions.get(tabId);
   if (!s) {
     await attach(tabId);
-    await cmd(tabId, "DOM.enable");
-    await cmd(tabId, "Page.enable");
+    await Promise.all([cmd(tabId, "DOM.enable"), cmd(tabId, "Page.enable")]);
     s = {
       attachedAt: Date.now(),
       lastUsedAt: Date.now(),
@@ -1447,6 +1446,55 @@ async function cdpDeepSnapshot(tabId: number): Promise<any> {
   return { url: root.documentURL, count: items.length, elements: items, deep: true };
 }
 
+// Banner-free shallow snapshot across all frames, injected concurrently. Each frame's ref offset
+// is derived from its index (not its neighbor's actual element count) so every frame's injection
+// can fire in parallel instead of waiting on the previous frame to resolve first; bbSnapshot caps
+// at 400 elements per frame, so a 500-wide stride can never let two frames' ref ranges collide.
+async function shallowSnapshot(tab: chrome.tabs.Tab): Promise<any> {
+  assertScriptable(tab);
+  let frames: { frameId: number }[];
+  try {
+    frames = (await chrome.webNavigation.getAllFrames({ tabId: tab.id! })) ?? [{ frameId: 0 }];
+  } catch {
+    frames = [{ frameId: 0 }];
+  }
+  const FRAME_REF_STRIDE = 500;
+  const results = await Promise.all(
+    frames.map(async (f, i) => {
+      try {
+        const res = await chrome.scripting.executeScript({
+          target: { tabId: tab.id!, frameIds: [f.frameId] },
+          func: bbSnapshot as any,
+          args: [i * FRAME_REF_STRIDE],
+        });
+        return { frameId: f.frameId, v: res?.[0]?.result as any };
+      } catch {
+        return null; // frame not injectable (about:blank, sandboxed, gone)
+      }
+    })
+  );
+  const all: any[] = [];
+  for (const r of results) {
+    if (!r || !r.v || !r.v.elements) continue;
+    for (const e of r.v.elements) all.push(r.frameId === 0 ? e : { ...e, frameId: r.frameId });
+  }
+  if (all.length > 400) all.length = 400;
+  return { url: tab.url, count: all.length, elements: all };
+}
+
+// Optionally attaches a fresh shallow snapshot to an interaction result (params.withSnapshot),
+// so a caller doing e.g. click-then-observe can skip a separate follow-up snapshot() call.
+// A snapshot failure is reported inline rather than masking the (already-succeeded) action result.
+async function withSnapshotIfRequested(tab: chrome.tabs.Tab, params: any, result: any): Promise<any> {
+  if (!params?.withSnapshot || !result || typeof result !== "object") return result;
+  try {
+    result.snapshot = await shallowSnapshot(tab);
+  } catch (e) {
+    result.snapshot = { error: e instanceof Error ? e.message : String(e) };
+  }
+  return result;
+}
+
 async function dispatch(method: string, params: any): Promise<any> {
   switch (method) {
     case "tabs_list": {
@@ -1509,54 +1557,37 @@ async function dispatch(method: string, params: any): Promise<any> {
     case "snapshot": {
       const tab = await targetTab(params.tabId);
       if (params.deep) return cdpDeepSnapshot(tab.id!);
-      assertScriptable(tab);
-      let frames: { frameId: number }[];
-      try {
-        frames = (await chrome.webNavigation.getAllFrames({ tabId: tab.id! })) ?? [{ frameId: 0 }];
-      } catch {
-        frames = [{ frameId: 0 }];
-      }
-      let offset = 0;
-      const all: any[] = [];
-      for (const f of frames) {
-        let res: chrome.scripting.InjectionResult[];
-        try {
-          res = await chrome.scripting.executeScript({
-            target: { tabId: tab.id!, frameIds: [f.frameId] },
-            func: bbSnapshot as any,
-            args: [offset],
-          });
-        } catch {
-          continue; // frame not injectable (about:blank, sandboxed, gone)
-        }
-        const v = res?.[0]?.result as any;
-        if (!v || !v.elements) continue;
-        for (const e of v.elements) all.push(f.frameId === 0 ? e : { ...e, frameId: f.frameId });
-        offset += v.count;
-        if (all.length >= 400) break;
-      }
-      return { url: tab.url, count: all.length, elements: all };
+      return shallowSnapshot(tab);
     }
 
     case "click": {
       const tab = await targetTab(params.tabId);
-      if (params.trusted) return trustedAction(tab.id!, "click", params.ref, params.selector);
-      return injectAllAggregate(tab, bbInteract, ["click", params.ref, params.selector, null]);
+      const result = params.trusted
+        ? await trustedAction(tab.id!, "click", params.ref, params.selector)
+        : await injectAllAggregate(tab, bbInteract, ["click", params.ref, params.selector, null]);
+      return withSnapshotIfRequested(tab, params, result);
     }
 
-    case "fill":
-      return injectAllAggregate(await targetTab(params.tabId), bbInteract, ["fill", params.ref, params.selector, params.value]);
+    case "fill": {
+      const tab = await targetTab(params.tabId);
+      const result = await injectAllAggregate(tab, bbInteract, ["fill", params.ref, params.selector, params.value]);
+      return withSnapshotIfRequested(tab, params, result);
+    }
 
     case "hover": {
       const tab = await targetTab(params.tabId);
-      if (params.trusted) return trustedAction(tab.id!, "hover", params.ref, params.selector);
-      return injectAllAggregate(tab, bbInteract, ["hover", params.ref, params.selector, null]);
+      const result = params.trusted
+        ? await trustedAction(tab.id!, "hover", params.ref, params.selector)
+        : await injectAllAggregate(tab, bbInteract, ["hover", params.ref, params.selector, null]);
+      return withSnapshotIfRequested(tab, params, result);
     }
 
     case "type": {
       const tab = await targetTab(params.tabId);
-      if (params.trusted) return trustedAction(tab.id!, "type", params.ref, params.selector, params.text);
-      return injectAllAggregate(tab, bbInteract, ["type", params.ref, params.selector, params.text]);
+      const result = params.trusted
+        ? await trustedAction(tab.id!, "type", params.ref, params.selector, params.text)
+        : await injectAllAggregate(tab, bbInteract, ["type", params.ref, params.selector, params.text]);
+      return withSnapshotIfRequested(tab, params, result);
     }
 
     case "file_upload": {
@@ -1801,7 +1832,7 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "press_key": {
       const tab = await targetTab(params.tabId);
-      return inject(
+      const result = await inject(
         tab,
         (key: string) => {
           const el = (document.activeElement as HTMLElement) ?? document.body;
@@ -1816,11 +1847,12 @@ async function dispatch(method: string, params: any): Promise<any> {
         },
         [params.key]
       );
+      return withSnapshotIfRequested(tab, params, result);
     }
 
     case "scroll": {
       const tab = await targetTab(params.tabId);
-      return inject(
+      const result = await inject(
         tab,
         (dy: number | undefined, sel: string | undefined) => {
           if (sel) {
@@ -1834,6 +1866,7 @@ async function dispatch(method: string, params: any): Promise<any> {
         },
         [params.dy, params.selector]
       );
+      return withSnapshotIfRequested(tab, params, result);
     }
 
     case "screenshot": {

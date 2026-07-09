@@ -3,7 +3,7 @@
 > **Drive your real, logged-in Chrome from an AI agent** — over the Model Context Protocol. No headless browser, no fresh profile, no re-login. Your agent reads and acts inside the exact sessions you're already signed into.
 
 <p>
-  <img alt="version"  src="https://img.shields.io/badge/version-0.5.0-4f46e5">
+  <img alt="version"  src="https://img.shields.io/badge/version-0.5.2-4f46e5">
   <img alt="tools"    src="https://img.shields.io/badge/tools-51-7c3aed">
   <img alt="protocol" src="https://img.shields.io/badge/MCP-streamable_HTTP-7c3aed">
   <img alt="browser"  src="https://img.shields.io/badge/Chrome%2FEdge-Manifest_V3-2563eb">
@@ -83,7 +83,7 @@ It ships **51 tools** spanning everyday browsing, DevTools-grade network capture
 |---|---|
 | `tabs_list` · `tab_new` · `tab_activate` · `tab_close` | Manage tabs |
 | `navigate` · `go_back` · `go_forward` · `wait_for` | Navigation |
-| `click` · `fill` · `hover` · `type` · `press_key` · `scroll` | Interaction (iframe + open-shadow aware; `trusted:true` for real CDP input) |
+| `click` · `fill` · `hover` · `type` · `press_key` · `scroll` | Interaction (iframe + open-shadow aware; `trusted:true` for real CDP input; `withSnapshot:true` to get a fresh `snapshot` back inline, skipping a separate follow-up call) |
 | `file_upload` | Set a file input via base64 or a local `path` (`DOM.setFileInputFiles`) |
 | `paste_image` | Paste a local image into a rich-text / contenteditable field; `trusted:true` uses the real OS clipboard + a genuine Cmd/Ctrl+V for strict editors (e.g. YesWeHack) that ignore synthetic events |
 </details>

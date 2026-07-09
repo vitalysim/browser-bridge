@@ -46,6 +46,11 @@ const tabIdParam = z
   .optional()
   .describe("Target tab id (from tabs_list). Defaults to the active tab.");
 
+const withSnapshotParam = z
+  .boolean()
+  .optional()
+  .describe("Also return a fresh shallow snapshot (as `snapshot`) after the action, to skip a separate follow-up snapshot call.");
+
 export function registerTools(server: McpServer, hub: ExtensionHub) {
   const tool = (
     name: string,
@@ -132,11 +137,12 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
       ref: z.number().optional().describe("Element ref from a prior snapshot call"),
       selector: z.string().optional().describe("CSS selector (alternative to ref)"),
       trusted: z.boolean().optional().describe("Use a real trusted click via chrome.debugger (shows banner)"),
+      withSnapshot: withSnapshotParam,
       tabId: tabIdParam,
     },
-    async ({ ref, selector, trusted, tabId }) => {
+    async ({ ref, selector, trusted, withSnapshot, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
-      return textResult(await hub.call("click", { ref, selector, trusted, tabId }));
+      return textResult(await hub.call("click", { ref, selector, trusted, withSnapshot, tabId }));
     }
   );
 
@@ -148,11 +154,12 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
       value: z.string().describe("Text value to set"),
       ref: z.number().optional().describe("Element ref from a prior snapshot call"),
       selector: z.string().optional().describe("CSS selector (alternative to ref)"),
+      withSnapshot: withSnapshotParam,
       tabId: tabIdParam,
     },
-    async ({ value, ref, selector, tabId }) => {
+    async ({ value, ref, selector, withSnapshot, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
-      return textResult(await hub.call("fill", { value, ref, selector, tabId }));
+      return textResult(await hub.call("fill", { value, ref, selector, withSnapshot, tabId }));
     }
   );
 
@@ -165,11 +172,12 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
       ref: z.number().optional().describe("Element ref from a prior snapshot call"),
       selector: z.string().optional().describe("CSS selector (alternative to ref)"),
       trusted: z.boolean().optional().describe("Use a real trusted mouse move via chrome.debugger (fires CSS :hover; shows banner)"),
+      withSnapshot: withSnapshotParam,
       tabId: tabIdParam,
     },
-    async ({ ref, selector, trusted, tabId }) => {
+    async ({ ref, selector, trusted, withSnapshot, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
-      return textResult(await hub.call("hover", { ref, selector, trusted, tabId }));
+      return textResult(await hub.call("hover", { ref, selector, trusted, withSnapshot, tabId }));
     }
   );
 
@@ -184,11 +192,12 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
       ref: z.number().optional().describe("Element ref from a prior snapshot call"),
       selector: z.string().optional().describe("CSS selector (alternative to ref)"),
       trusted: z.boolean().optional().describe("Use real trusted keystrokes via chrome.debugger (shows banner)"),
+      withSnapshot: withSnapshotParam,
       tabId: tabIdParam,
     },
-    async ({ text, ref, selector, trusted, tabId }) => {
+    async ({ text, ref, selector, trusted, withSnapshot, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
-      return textResult(await hub.call("type", { text, ref, selector, trusted, tabId }));
+      return textResult(await hub.call("type", { text, ref, selector, trusted, withSnapshot, tabId }));
     }
   );
 
@@ -196,8 +205,8 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
     "press_key",
     "Send a keyboard key (e.g. 'Enter', 'Escape', 'Tab', 'ArrowDown') to the focused element. " +
       "Note: events are synthetic; some sites ignore them.",
-    { key: z.string().describe("Key value, e.g. 'Enter'"), tabId: tabIdParam },
-    async ({ key, tabId }) => textResult(await hub.call("press_key", { key, tabId }))
+    { key: z.string().describe("Key value, e.g. 'Enter'"), withSnapshot: withSnapshotParam, tabId: tabIdParam },
+    async ({ key, withSnapshot, tabId }) => textResult(await hub.call("press_key", { key, withSnapshot, tabId }))
   );
 
   tool(
@@ -278,9 +287,10 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
     {
       dy: z.number().optional().describe("Vertical pixels to scroll (positive = down). Default 600."),
       selector: z.string().optional().describe("If set, scroll this element into view instead"),
+      withSnapshot: withSnapshotParam,
       tabId: tabIdParam,
     },
-    async ({ dy, selector, tabId }) => textResult(await hub.call("scroll", { dy, selector, tabId }))
+    async ({ dy, selector, withSnapshot, tabId }) => textResult(await hub.call("scroll", { dy, selector, withSnapshot, tabId }))
   );
 
   tool(
