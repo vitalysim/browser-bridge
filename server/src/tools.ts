@@ -51,6 +51,11 @@ const withSnapshotParam = z
   .optional()
   .describe("Also return a fresh shallow snapshot (as `snapshot`) after the action, to skip a separate follow-up snapshot call.");
 
+const timeoutMsParam = z
+  .number()
+  .optional()
+  .describe("Max ms to auto-wait for the element to become actionable (found + visible + enabled). Default 5000. On failure the result is {notActionable, reason: 'not-found-after…'|'hidden'|'disabled'|'covered'}.");
+
 export function registerTools(server: McpServer, hub: ExtensionHub) {
   const tool = (
     name: string,
@@ -130,36 +135,44 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
 
   tool(
     "click",
-    "Click an element, identified by a ref from snapshot or a CSS selector. Set trusted:true for a " +
-      "real (isTrusted) mouse click via the debugger (shows the debugging banner) — needed for a few " +
-      "sites that reject synthetic clicks, and required for refs from a deep snapshot.",
+    "Click an element, identified by a ref from snapshot or a CSS selector. Auto-waits for the element to be " +
+      "actionable (found + visible + enabled, default 5s). If the element is covered by an overlay it " +
+      "auto-escalates to a real trusted CDP click (via:'trusted', shows the banner) unless autoTrusted:false / " +
+      "noEscalate:true. Set trusted:true to force the trusted path (also required for deep-snapshot refs). " +
+      "Result reports via:'synthetic'|'trusted', or {notActionable, reason} on failure.",
     {
       ref: z.number().optional().describe("Element ref from a prior snapshot call"),
       selector: z.string().optional().describe("CSS selector (alternative to ref)"),
-      trusted: z.boolean().optional().describe("Use a real trusted click via chrome.debugger (shows banner)"),
+      trusted: z.boolean().optional().describe("Force a real trusted click via chrome.debugger (shows banner)"),
+      autoTrusted: z.boolean().optional().describe("Escalate to a trusted click when the target is covered (default true)"),
+      noEscalate: z.boolean().optional().describe("Never auto-escalate to trusted; report {notActionable} instead"),
+      timeoutMs: timeoutMsParam,
       withSnapshot: withSnapshotParam,
       tabId: tabIdParam,
     },
-    async ({ ref, selector, trusted, withSnapshot, tabId }) => {
+    async ({ ref, selector, trusted, autoTrusted, noEscalate, timeoutMs, withSnapshot, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
-      return textResult(await hub.call("click", { ref, selector, trusted, withSnapshot, tabId }));
+      return textResult(await hub.call("click", { ref, selector, trusted, autoTrusted, noEscalate, timeoutMs, withSnapshot, tabId }));
     }
   );
 
   tool(
     "fill",
-    "Fill a text input, textarea, select, or contenteditable element with a value " +
-      "(dispatches input/change events so frameworks like React notice).",
+    "Fill a text input, textarea, select, or contenteditable element with a value. Auto-waits for the element " +
+      "to be actionable (default 5s). Uses React's native value setter (+ input/change) for inputs, and " +
+      "execCommand('insertText') for contenteditable/rich editors (ProseMirror/Quill/CodeMirror) so the value " +
+      "registers. Returns {filled, via?} or {notActionable, reason}.",
     {
       value: z.string().describe("Text value to set"),
       ref: z.number().optional().describe("Element ref from a prior snapshot call"),
       selector: z.string().optional().describe("CSS selector (alternative to ref)"),
+      timeoutMs: timeoutMsParam,
       withSnapshot: withSnapshotParam,
       tabId: tabIdParam,
     },
-    async ({ value, ref, selector, withSnapshot, tabId }) => {
+    async ({ value, ref, selector, timeoutMs, withSnapshot, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
-      return textResult(await hub.call("fill", { value, ref, selector, withSnapshot, tabId }));
+      return textResult(await hub.call("fill", { value, ref, selector, timeoutMs, withSnapshot, tabId }));
     }
   );
 
@@ -172,12 +185,13 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
       ref: z.number().optional().describe("Element ref from a prior snapshot call"),
       selector: z.string().optional().describe("CSS selector (alternative to ref)"),
       trusted: z.boolean().optional().describe("Use a real trusted mouse move via chrome.debugger (fires CSS :hover; shows banner)"),
+      timeoutMs: timeoutMsParam,
       withSnapshot: withSnapshotParam,
       tabId: tabIdParam,
     },
-    async ({ ref, selector, trusted, withSnapshot, tabId }) => {
+    async ({ ref, selector, trusted, timeoutMs, withSnapshot, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
-      return textResult(await hub.call("hover", { ref, selector, trusted, withSnapshot, tabId }));
+      return textResult(await hub.call("hover", { ref, selector, trusted, timeoutMs, withSnapshot, tabId }));
     }
   );
 
@@ -192,12 +206,13 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
       ref: z.number().optional().describe("Element ref from a prior snapshot call"),
       selector: z.string().optional().describe("CSS selector (alternative to ref)"),
       trusted: z.boolean().optional().describe("Use real trusted keystrokes via chrome.debugger (shows banner)"),
+      timeoutMs: timeoutMsParam,
       withSnapshot: withSnapshotParam,
       tabId: tabIdParam,
     },
-    async ({ text, ref, selector, trusted, withSnapshot, tabId }) => {
+    async ({ text, ref, selector, trusted, timeoutMs, withSnapshot, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
-      return textResult(await hub.call("type", { text, ref, selector, trusted, withSnapshot, tabId }));
+      return textResult(await hub.call("type", { text, ref, selector, trusted, timeoutMs, withSnapshot, tabId }));
     }
   );
 

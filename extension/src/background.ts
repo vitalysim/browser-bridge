@@ -1,6 +1,6 @@
 /// <reference types="chrome" />
 
-const VERSION = "0.5.2";
+const VERSION = "0.6.0";
 const PING_INTERVAL_MS = 20_000; // WS traffic resets the MV3 service-worker idle timer (Chrome 116+)
 const RECONNECT_MAX_MS = 30_000;
 
@@ -249,6 +249,11 @@ function bbSnapshot(refOffset: number) {
     if (h.tagName === "INPUT") entry.type = (h as HTMLInputElement).type;
     const role = h.getAttribute("role");
     if (role) entry.role = role;
+    // actionability hints (elements listed are already visible; add enabled + viewport position)
+    const enabled = !(h as any).disabled && h.getAttribute("aria-disabled") !== "true";
+    if (!enabled) entry.enabled = false;
+    const r = h.getBoundingClientRect();
+    entry.inViewport = r.bottom > 0 && r.right > 0 && r.top < (window.innerHeight || 0) && r.left < (window.innerWidth || 0);
     items.push(entry);
     if (n >= 400) break;
   }
@@ -305,31 +310,73 @@ function bbInteract(action: string, ref: number | null, sel: string | null, valu
     return true;
   };
 
-  if (action === "click") {
-    el.scrollIntoView({ block: "center" });
-    el.click();
-    return { clicked: true, tag: el.tagName.toLowerCase(), label: (el.innerText || "").trim().slice(0, 80) };
-  }
-  if (action === "hover") {
-    el.scrollIntoView({ block: "center" });
+  const tag = el.tagName.toLowerCase();
+  // --- actionability preflight (returns {notActionable, reason} so the caller can retry/report) ---
+  const cs = getComputedStyle(el);
+  const rect0 = el.getBoundingClientRect();
+  const visible =
+    (!!rect0.width || !!rect0.height) &&
+    cs.visibility !== "hidden" &&
+    cs.display !== "none" &&
+    ((el as any).checkVisibility ? (el as any).checkVisibility() : true);
+  const disabled = !!(el as any).disabled || el.getAttribute("aria-disabled") === "true";
+  if (!visible) return { notActionable: true, reason: "hidden", tag };
+  if (disabled && action !== "hover") return { notActionable: true, reason: "disabled", tag };
+
+  if (action === "click" || action === "hover") {
+    el.scrollIntoView({ block: "center", inline: "center" });
     const r = el.getBoundingClientRect();
-    const base: any = { bubbles: true, cancelable: true, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2 };
+    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    if (action === "click") {
+      const top = document.elementFromPoint(cx, cy) as HTMLElement | null;
+      const covered = !!top && top !== el && !el.contains(top) && !top.contains(el);
+      if (covered) {
+        const by = top!.tagName.toLowerCase() + (top!.id ? "#" + top!.id : top!.className && typeof top!.className === "string" ? "." + top!.className.trim().split(/\s+/)[0] : "");
+        return { notActionable: true, reason: "covered", coveredBy: by, tag };
+      }
+      el.click();
+      return { clicked: true, via: "synthetic", tag, label: (el.innerText || "").trim().slice(0, 80) };
+    }
+    const base: any = { bubbles: true, cancelable: true, clientX: cx, clientY: cy };
     el.dispatchEvent(new PointerEvent("pointerover", base));
     el.dispatchEvent(new MouseEvent("mouseover", base));
     el.dispatchEvent(new MouseEvent("mouseenter", base));
     el.dispatchEvent(new MouseEvent("mousemove", base));
-    return { hovered: true, tag: el.tagName.toLowerCase() };
+    return { hovered: true, tag };
   }
   if (action === "fill") {
     el.focus();
-    if (!setNativeValue(el, value ?? "")) return { error: `Element <${el.tagName.toLowerCase()}> is not fillable` };
+    if (el.isContentEditable) {
+      // rich editors (ProseMirror/Quill/Lit/React) require beforeinput — execCommand fires it
+      try {
+        document.execCommand("selectAll", false);
+        document.execCommand("insertText", false, value ?? "");
+      } catch {
+        el.textContent = value ?? "";
+      }
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      return { filled: true, via: "execCommand", tag };
+    }
+    if (!setNativeValue(el, value ?? "")) return { error: `Element <${tag}> is not fillable` };
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
-    return { filled: true, tag: el.tagName.toLowerCase() };
+    return { filled: true, tag };
   }
   if (action === "type") {
     el.focus();
     const text = value ?? "";
+    if (el.isContentEditable) {
+      for (const ch of Array.from(text)) {
+        el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, bubbles: true, cancelable: true }));
+        try {
+          document.execCommand("insertText", false, ch);
+        } catch {
+          el.textContent = (el.textContent ?? "") + ch;
+        }
+        el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, bubbles: true, cancelable: true }));
+      }
+      return { typed: text.length, via: "execCommand", tag };
+    }
     let cur = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? el.value : el.textContent ?? "";
     for (const ch of Array.from(text)) {
       const opts: any = { key: ch, bubbles: true, cancelable: true };
@@ -341,7 +388,7 @@ function bbInteract(action: string, ref: number | null, sel: string | null, valu
       el.dispatchEvent(new KeyboardEvent("keyup", opts));
     }
     el.dispatchEvent(new Event("change", { bubbles: true }));
-    return { typed: text.length, tag: el.tagName.toLowerCase() };
+    return { typed: text.length, tag };
   }
   return { error: `Unknown action: ${action}` };
 }
@@ -1495,6 +1542,39 @@ async function withSnapshotIfRequested(tab: chrome.tabs.Tab, params: any, result
   return result;
 }
 
+// Run a synthetic interaction with auto-wait actionability retry + trusted escalation.
+// Retries while the element is missing or transiently not-actionable (hidden/disabled) up to
+// params.timeoutMs (default 5000). For click, if the target is COVERED by an overlay, it escalates
+// to a real trusted CDP click (unless noEscalate/autoTrusted:false), which scrolls it into view and
+// clicks the real coordinates — reporting via:"trusted". Structured {notActionable, reason} otherwise.
+async function interact(tab: chrome.tabs.Tab, action: string, ref: number | null, sel: string | null, value: string | null, params: any): Promise<any> {
+  const timeoutMs = params.timeoutMs ?? 5000;
+  const deadline = Date.now() + timeoutMs;
+  let last: any = null;
+  for (;;) {
+    try {
+      last = await injectAllAggregate(tab, bbInteract, [action, ref, sel, value]);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/not found in any frame/i.test(msg)) last = { notFound: true };
+      else throw e; // real error (e.g. "not fillable") — surface it
+    }
+    const retryable = last && (last.notFound || (last.notActionable && last.reason !== "covered"));
+    if (!retryable || Date.now() >= deadline) break;
+    await sleep(150);
+  }
+  if (action === "click" && last?.notActionable && last.reason === "covered" && params.autoTrusted !== false && !params.noEscalate) {
+    try {
+      const t = await trustedAction(tab.id!, "click", ref, sel);
+      return { ...t, via: "trusted", wasCovered: true, coveredBy: last.coveredBy };
+    } catch {
+      return last; // trusted also failed — report the covered state
+    }
+  }
+  if (last?.notFound) return { notActionable: true, reason: `not-found-after-${timeoutMs}ms`, ref, selector: sel };
+  return last;
+}
+
 async function dispatch(method: string, params: any): Promise<any> {
   switch (method) {
     case "tabs_list": {
@@ -1563,14 +1643,14 @@ async function dispatch(method: string, params: any): Promise<any> {
     case "click": {
       const tab = await targetTab(params.tabId);
       const result = params.trusted
-        ? await trustedAction(tab.id!, "click", params.ref, params.selector)
-        : await injectAllAggregate(tab, bbInteract, ["click", params.ref, params.selector, null]);
+        ? { ...(await trustedAction(tab.id!, "click", params.ref, params.selector)), via: "trusted" }
+        : await interact(tab, "click", params.ref, params.selector, null, params);
       return withSnapshotIfRequested(tab, params, result);
     }
 
     case "fill": {
       const tab = await targetTab(params.tabId);
-      const result = await injectAllAggregate(tab, bbInteract, ["fill", params.ref, params.selector, params.value]);
+      const result = await interact(tab, "fill", params.ref, params.selector, params.value ?? null, params);
       return withSnapshotIfRequested(tab, params, result);
     }
 
@@ -1578,7 +1658,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       const tab = await targetTab(params.tabId);
       const result = params.trusted
         ? await trustedAction(tab.id!, "hover", params.ref, params.selector)
-        : await injectAllAggregate(tab, bbInteract, ["hover", params.ref, params.selector, null]);
+        : await interact(tab, "hover", params.ref, params.selector, null, params);
       return withSnapshotIfRequested(tab, params, result);
     }
 
@@ -1586,7 +1666,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       const tab = await targetTab(params.tabId);
       const result = params.trusted
         ? await trustedAction(tab.id!, "type", params.ref, params.selector, params.text)
-        : await injectAllAggregate(tab, bbInteract, ["type", params.ref, params.selector, params.text]);
+        : await interact(tab, "type", params.ref, params.selector, params.text ?? null, params);
       return withSnapshotIfRequested(tab, params, result);
     }
 
