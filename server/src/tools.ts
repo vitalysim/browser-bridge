@@ -809,6 +809,80 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
     },
   );
 
+  // ---- passive recon + JWT ----
+  tool(
+    "analyze",
+    "One-call passive security analysis of a page: fetches the URL from the live session and grades its " +
+      "response security headers (CSP weaknesses, HSTS, X-Frame-Options/frame-ancestors, CORS, Referrer-Policy, " +
+      "X-Content-Type-Options, version leakage), the cookie flags (Secure/HttpOnly/SameSite), and sweeps the " +
+      "response body for exposed secrets/API-keys/JWTs. Returns findings ranked by severity. No banner.",
+    {
+      url: z.string().optional().describe("URL to analyze (defaults to the tab's current URL)"),
+      tabId: tabIdParam,
+    },
+    async ({ url, tabId }) => {
+      let target = url;
+      if (!target) {
+        const pt = await hub.call("get_page_text", { tabId });
+        target = pt?.url;
+      }
+      if (!target) throw new Error("No URL to analyze (provide url or a loaded tab)");
+      const resp = await hub.call("replay_request", { url: target, method: "GET", tabId }, 45_000);
+      if (resp?.error) throw new Error(`fetch failed: ${resp.error}`);
+      const headers = resp.headers || {};
+      let cookies: any[] = [];
+      try {
+        const cg = await hub.call("cookies_get", { url: target });
+        cookies = cg?.cookies || [];
+      } catch {
+        /* cookies optional */
+      }
+      const isHttps = target.startsWith("https:");
+      const findings = [
+        ...analyzeHeaders(headers, isHttps),
+        ...analyzeCookies(cookies, isHttps),
+        ...scanSecrets(resp.body || ""),
+      ].sort((a, b) => sevRank(b.severity) - sevRank(a.severity));
+      return textResult({
+        url: target,
+        status: resp.status,
+        findings,
+        summary: { total: findings.length, high: findings.filter((f) => f.severity === "high").length, medium: findings.filter((f) => f.severity === "medium").length },
+        cookies: cookies.map((c) => ({ name: c.name, secure: c.secure, httpOnly: c.httpOnly, sameSite: c.sameSite })),
+        note: "Body sweep covers the fetched response (inline HTML/JS). External bundles aren't fetched — use download_resource + a grep for a deep JS secret sweep.",
+      });
+    },
+  );
+
+  tool(
+    "jwt_decode",
+    "Decode a JWT (accepts a raw token or a 'Bearer …' string) into its header + payload without verifying " +
+      "the signature, and flag risks: alg:none, HS/RS alg-confusion exposure, and expiry (exp/nbf/iat).",
+    { token: z.string().describe("The JWT (or 'Bearer <jwt>')") },
+    async ({ token }) => textResult(decodeJwt(token)),
+  );
+
+  // ---- capture export ----
+  tool(
+    "export_har",
+    "Write the tab's captured network traffic to a HAR 1.2 file (importable into Burp, DevTools, or Playwright) " +
+      "for durable, portable captures. Requires an active net_capture_start on the tab; includes response bodies " +
+      "by default.",
+    {
+      savePath: z.string().describe("Absolute path to write the .har file"),
+      includeBodies: z.boolean().optional().describe("Include response bodies (default true)"),
+      tabId: tabIdParam,
+    },
+    async ({ savePath, includeBodies, tabId }) => {
+      const cap = await hub.call("net_get_requests", { tabId, includeBodies: includeBodies !== false, limit: 5000 }, 120_000);
+      const rows: any[] = cap?.requests || [];
+      const nowIso = new Date().toISOString();
+      const har = { log: { version: "1.2", creator: { name: "browser-bridge", version: "0.6.0" }, entries: rows.map((r) => harEntry(r, nowIso)) } };
+      writeFileSync(savePath, JSON.stringify(har, null, 2));
+      return textResult({ saved: savePath, entries: rows.length, note: cap?.totalBuffered ? `${cap.totalBuffered} buffered on tab` : undefined });
+    },
+  );
+
   tool(
     "bridge_status",
     "Check whether the Chrome extension is currently connected to the bridge.",
@@ -844,4 +918,160 @@ function responseDiff(a: { status?: number; body?: string; bytes?: number }, b: 
     lenDelta: bLen - aLen,
     similarity: Number(jaccard(a.body || "", b.body || "").toFixed(3)),
   };
+}
+
+// ---- passive analysis helpers (pure) ----
+type Finding = { severity: "high" | "medium" | "low" | "info"; id: string; detail: string; evidence?: string };
+const sevRank = (s: string) => ({ high: 3, medium: 2, low: 1, info: 0 } as any)[s] ?? 0;
+const hget = (h: Record<string, string>, k: string) => h[k] ?? h[k.toLowerCase()] ?? h[k.toUpperCase()];
+
+function analyzeHeaders(h: Record<string, string>, isHttps: boolean): Finding[] {
+  const f: Finding[] = [];
+  const csp = hget(h, "content-security-policy");
+  if (!csp) f.push({ severity: "medium", id: "csp-missing", detail: "No Content-Security-Policy header" });
+  else {
+    if (/'unsafe-inline'/.test(csp)) f.push({ severity: "medium", id: "csp-unsafe-inline", detail: "CSP allows 'unsafe-inline'" });
+    if (/'unsafe-eval'/.test(csp)) f.push({ severity: "low", id: "csp-unsafe-eval", detail: "CSP allows 'unsafe-eval'" });
+    if (/(?:script-src|default-src)[^;]*\s\*(?:\s|;|$)/.test(csp)) f.push({ severity: "medium", id: "csp-wildcard", detail: "Wildcard * source in script-src/default-src" });
+    if (!/object-src/.test(csp)) f.push({ severity: "low", id: "csp-no-object-src", detail: "No object-src (plugin/embed) restriction" });
+    if (!/base-uri/.test(csp)) f.push({ severity: "low", id: "csp-no-base-uri", detail: "No base-uri (base-tag injection risk)" });
+    if (!/frame-ancestors/.test(csp)) f.push({ severity: "info", id: "csp-no-frame-ancestors", detail: "No frame-ancestors (relies on X-Frame-Options)" });
+  }
+  if (isHttps && !hget(h, "strict-transport-security")) f.push({ severity: "low", id: "no-hsts", detail: "No Strict-Transport-Security (HSTS) header" });
+  const xfo = hget(h, "x-frame-options");
+  if (!xfo && !(csp && /frame-ancestors/.test(csp))) f.push({ severity: "medium", id: "clickjacking", detail: "No X-Frame-Options and no CSP frame-ancestors — page is framable (clickjacking)" });
+  const acao = hget(h, "access-control-allow-origin");
+  const acac = hget(h, "access-control-allow-credentials");
+  if (acao === "*" && String(acac).toLowerCase() === "true") f.push({ severity: "high", id: "cors-wildcard-creds", detail: "CORS ACAO:* with Allow-Credentials:true (invalid+dangerous combo)" });
+  else if (acao && acao !== "*" && !/^https?:\/\//.test(acao) === false && String(acac).toLowerCase() === "true") f.push({ severity: "medium", id: "cors-reflect-creds", detail: `CORS reflects an origin (${acao}) with credentials — verify allow-list`, evidence: acao });
+  if (!hget(h, "x-content-type-options")) f.push({ severity: "low", id: "no-nosniff", detail: "No X-Content-Type-Options: nosniff" });
+  if (!hget(h, "referrer-policy")) f.push({ severity: "info", id: "no-referrer-policy", detail: "No Referrer-Policy header" });
+  const server = hget(h, "server");
+  const xpb = hget(h, "x-powered-by");
+  if (server && /\d/.test(server)) f.push({ severity: "info", id: "server-version", detail: `Server header leaks version: ${server}`, evidence: server });
+  if (xpb) f.push({ severity: "info", id: "x-powered-by", detail: `X-Powered-By leaks stack: ${xpb}`, evidence: xpb });
+  return f;
+}
+
+function analyzeCookies(cookies: any[], isHttps: boolean): Finding[] {
+  const f: Finding[] = [];
+  for (const c of cookies) {
+    const name = c.name;
+    const sessiony = /sess|token|auth|sid|jwt|csrf/i.test(name);
+    if (isHttps && !c.secure) f.push({ severity: sessiony ? "medium" : "low", id: "cookie-not-secure", detail: `Cookie '${name}' missing Secure flag` });
+    if (sessiony && !c.httpOnly) f.push({ severity: "medium", id: "cookie-not-httponly", detail: `Session-like cookie '${name}' missing HttpOnly` });
+    const ss = String(c.sameSite || "").toLowerCase();
+    if ((ss === "none" || ss === "no_restriction") && !c.secure) f.push({ severity: "medium", id: "cookie-samesite-none-insecure", detail: `Cookie '${name}' SameSite=None without Secure` });
+    if (!c.sameSite || ss === "unspecified") f.push({ severity: "info", id: "cookie-no-samesite", detail: `Cookie '${name}' has no explicit SameSite` });
+  }
+  return f;
+}
+
+const SECRET_PATTERNS: { id: string; severity: Finding["severity"]; re: RegExp }[] = [
+  { id: "aws-akia", severity: "high", re: /AKIA[0-9A-Z]{16}/g },
+  { id: "google-api-key", severity: "high", re: /AIza[0-9A-Za-z_\-]{35}/g },
+  { id: "slack-token", severity: "high", re: /xox[baprs]-[0-9A-Za-z\-]{10,}/g },
+  { id: "github-token", severity: "high", re: /gh[pousr]_[0-9A-Za-z]{20,}/g },
+  { id: "private-key", severity: "high", re: /-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----/g },
+  { id: "jwt", severity: "medium", re: /eyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{6,}/g },
+  { id: "generic-secret", severity: "medium", re: /["']?(?:api[_-]?key|secret|client[_-]?secret|password|passwd|access[_-]?token)["']?\s*[:=]\s*["'][^"'\s]{8,}["']/gi },
+];
+function redact(s: string): string {
+  return s.length <= 12 ? s.slice(0, 3) + "…" : s.slice(0, 6) + "…" + s.slice(-4);
+}
+function scanSecrets(body: string): Finding[] {
+  const f: Finding[] = [];
+  const seen = new Set<string>();
+  for (const p of SECRET_PATTERNS) {
+    const m = body.match(p.re);
+    if (m) {
+      for (const hit of Array.from(new Set(m)).slice(0, 5)) {
+        const key = p.id + ":" + hit;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        f.push({ severity: p.severity, id: `secret-${p.id}`, detail: `Possible ${p.id} in response body`, evidence: redact(hit) });
+      }
+    }
+  }
+  return f;
+}
+
+// ---- JWT decode (pure) ----
+function b64urlToStr(s: string): string {
+  const b = s.replace(/-/g, "+").replace(/_/g, "/");
+  return Buffer.from(b.padEnd(Math.ceil(b.length / 4) * 4, "="), "base64").toString("utf8");
+}
+function decodeJwt(raw: string): any {
+  const token = raw.trim().replace(/^Bearer\s+/i, "");
+  const parts = token.split(".");
+  if (parts.length < 2) throw new Error("Not a JWT (expected header.payload[.signature])");
+  const parse = (s: string) => {
+    try {
+      return JSON.parse(b64urlToStr(s));
+    } catch {
+      return { __undecodable: s.slice(0, 24) + "…" };
+    }
+  };
+  const header = parse(parts[0]);
+  const payload = parse(parts[1]);
+  const now = Math.floor(Date.now() / 1000);
+  const findings: Finding[] = [];
+  const alg = header?.alg;
+  if (alg === "none" || alg === "None") findings.push({ severity: "high", id: "alg-none", detail: "alg:none — signature not verified; forgeable if the server accepts it" });
+  if (typeof alg === "string" && /^HS/.test(alg)) findings.push({ severity: "info", id: "hmac-alg", detail: `HMAC (${alg}) — check for RS↔HS alg-confusion if the server also accepts RS* verified with the public key as HMAC secret` });
+  if (payload?.exp && payload.exp < now) findings.push({ severity: "info", id: "expired", detail: `Token expired ${now - payload.exp}s ago` });
+  if (payload?.nbf && payload.nbf > now) findings.push({ severity: "info", id: "not-yet-valid", detail: "Token not valid yet (nbf in the future)" });
+  return {
+    header,
+    payload,
+    alg,
+    signaturePresent: parts.length === 3 && !!parts[2],
+    expiresInSec: payload?.exp ? payload.exp - now : null,
+    expired: payload?.exp ? payload.exp < now : null,
+    findings,
+  };
+}
+
+// ---- HAR export (pure) ----
+function harHeaders(obj: Record<string, string> | undefined): { name: string; value: string }[] {
+  return Object.entries(obj || {}).map(([name, value]) => ({ name, value: String(value) }));
+}
+function harEntry(r: any, nowIso: string): any {
+  let query: { name: string; value: string }[] = [];
+  try {
+    query = [...new URL(r.url).searchParams].map(([name, value]) => ({ name, value }));
+  } catch {
+    /* relative/invalid url */
+  }
+  const reqHeaders = r.requestHeaders || {};
+  const ct = hget(reqHeaders, "content-type") || "application/octet-stream";
+  const entry: any = {
+    startedDateTime: nowIso,
+    time: 0,
+    request: {
+      method: r.method || "GET",
+      url: r.url || "",
+      httpVersion: "HTTP/1.1",
+      headers: harHeaders(reqHeaders),
+      queryString: query,
+      cookies: [],
+      headersSize: -1,
+      bodySize: r.requestBody ? r.requestBody.length : 0,
+    },
+    response: {
+      status: r.status || 0,
+      statusText: "",
+      httpVersion: "HTTP/1.1",
+      headers: harHeaders(r.responseHeaders),
+      cookies: [],
+      content: { size: r.responseBody ? r.responseBody.length : 0, mimeType: r.mimeType || "", ...(r.responseBody ? { text: r.responseBody, encoding: r.responseBodyBase64 ? "base64" : undefined } : {}) },
+      redirectURL: hget(r.responseHeaders || {}, "location") || "",
+      headersSize: -1,
+      bodySize: r.responseBody ? r.responseBody.length : -1,
+    },
+    cache: {},
+    timings: { send: 0, wait: 0, receive: 0 },
+  };
+  if (r.requestBody) entry.request.postData = { mimeType: ct, text: r.requestBody };
+  return entry;
 }
