@@ -1,6 +1,6 @@
 /// <reference types="chrome" />
 
-const VERSION = "0.6.0";
+const VERSION = "0.6.1";
 const PING_INTERVAL_MS = 20_000; // WS traffic resets the MV3 service-worker idle timer (Chrome 116+)
 const RECONNECT_MAX_MS = 30_000;
 
@@ -916,6 +916,17 @@ function djb2(s: string): string {
   return (h >>> 0).toString(16);
 }
 
+// scheme + host only, no path/query/fragment — for compact tab listings where the path may carry
+// opaque ids (mail item ids, doc tokens) that shouldn't be echoed unnecessarily.
+function safeOrigin(url: string | undefined): string {
+  if (!url) return "";
+  try {
+    return new URL(url).origin;
+  } catch {
+    return url;
+  }
+}
+
 // Return the URL with its last integer (path segment or id-like query value) incremented, or null.
 function neighborUrl(url: string): string | null {
   const m = url.match(/(\d+)(?!.*\d)/);
@@ -1662,6 +1673,9 @@ async function dispatch(method: string, params: any): Promise<any> {
   switch (method) {
     case "tabs_list": {
       const tabs = await chrome.tabs.query({});
+      if (params?.short) {
+        return tabs.map((t) => ({ id: t.id, title: t.title, origin: safeOrigin(t.url), active: t.active }));
+      }
       return tabs.map((t) => ({ id: t.id, title: t.title, url: t.url, active: t.active, windowId: t.windowId }));
     }
 

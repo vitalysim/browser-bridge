@@ -74,9 +74,14 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
 
   tool(
     "tabs_list",
-    "List all open browser tabs with their id, title, url, and active state.",
-    {},
-    async () => textResult(await hub.call("tabs_list"))
+    "List all open browser tabs with their id, title, url, and active state. Use short:true for a compact form (id, title, origin, active — no path/query) when you only need to identify tabs, e.g. by site.",
+    {
+      short: z
+        .boolean()
+        .optional()
+        .describe("Return id, title, origin (scheme+host only), and active — omitting the full url's path/query, which can carry long opaque ids."),
+    },
+    async ({ short }) => textResult(await hub.call("tabs_list", { short }))
   );
 
   tool(
