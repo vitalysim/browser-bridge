@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { writeFileSync, readFileSync, renameSync, copyFileSync, unlinkSync } from "fs";
 import type { ExtensionHub } from "./hub.js";
+import { CaptureSink } from "./capture-sink.js";
 
 const MAX_TEXT_CHARS = 60_000;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -56,7 +57,7 @@ const timeoutMsParam = z
   .optional()
   .describe("Max ms to auto-wait for the element to become actionable (found + visible + enabled). Default 5000. On failure the result is {notActionable, reason: 'not-found-after…'|'hidden'|'disabled'|'covered'}.");
 
-export function registerTools(server: McpServer, hub: ExtensionHub) {
+export function registerTools(server: McpServer, hub: ExtensionHub, version = "0.0.0") {
   const tool = (
     name: string,
     description: string,
@@ -451,13 +452,38 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
 
   tool(
     "net_capture_start",
-    "Start capturing network traffic on a tab via chrome.debugger (shows the debugging banner). " +
-      "Then navigate/reload the tab to capture its load traffic, and read it with net_get_requests.",
+    "Start capturing network traffic on a tab via chrome.debugger (shows the debugging banner). Then " +
+      "navigate/reload the tab to capture its load traffic, and read it with net_get_requests. The in-memory " +
+      "buffer is a ring capped at maxEntries (default 500). Set persist:true + savePath to ALSO stream each " +
+      "finished request and WebSocket frame to a JSON-Lines file on disk — a DURABLE record that survives the " +
+      "ring cap and (up to the last ~300ms batch) a service-worker crash. NOTE: persistence is durability, NOT " +
+      "continuity — if the SW dies the debugger detaches and capture stops until you restart it; the file keeps " +
+      "what was captured before that. persistBodies:true also writes response bodies (heavier).",
     {
       urlFilter: z.string().optional().describe("Only buffer requests whose URL contains this substring"),
+      persist: z.boolean().optional().describe("Also stream finished requests/frames to savePath as JSON Lines (durable, survives ring cap + SW crash)"),
+      savePath: z.string().optional().describe("Absolute path for the persist JSONL file (required when persist:true)"),
+      persistBodies: z.boolean().optional().describe("Include response bodies in the persisted stream (heavier; fetched eagerly at load-finish)"),
+      maxEntries: z.number().optional().describe("In-memory ring cap for requests (default 500, max 5000)"),
       tabId: tabIdParam,
     },
-    async ({ urlFilter, tabId }) => textResult(await hub.call("net_capture_start", { urlFilter, tabId })),
+    async ({ urlFilter, persist, savePath, persistBodies, maxEntries, tabId }) => {
+      if (!persist) {
+        return textResult(await hub.call("net_capture_start", { urlFilter, maxEntries, tabId }));
+      }
+      if (!savePath) throw new Error("persist:true requires savePath");
+      if (hub.captureSinkPathInUse(savePath)) throw new Error(`another active capture is already writing ${savePath}`);
+      const sink = new CaptureSink(savePath); // opens the file now → a bad path fails THIS call, not mid-stream
+      try {
+        const r = await hub.call("net_capture_start", { urlFilter, persist: true, persistBodies: !!persistBodies, maxEntries, tabId });
+        if (r?.tabId == null) throw new Error("extension did not return the captured tabId");
+        hub.registerCaptureSink(r.tabId, sink);
+        return textResult({ ...r, persist: true, savePath });
+      } catch (e) {
+        sink.close();
+        throw e;
+      }
+    },
   );
 
   tool(
@@ -830,9 +856,10 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
       "response body for exposed secrets/API-keys/JWTs. Returns findings ranked by severity. No banner.",
     {
       url: z.string().optional().describe("URL to analyze (defaults to the tab's current URL)"),
+      deep: z.boolean().optional().describe("Also fetch same-origin external <script src> bundles and sweep them for secrets (bounded to ~15 scripts). Default off (single fast request)."),
       tabId: tabIdParam,
     },
-    async ({ url, tabId }) => {
+    async ({ url, deep, tabId }) => {
       let target = url;
       if (!target) {
         const pt = await hub.call("get_page_text", { tabId });
@@ -854,14 +881,32 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
         ...analyzeHeaders(headers, isHttps),
         ...analyzeCookies(cookies, isHttps),
         ...scanSecrets(resp.body || ""),
-      ].sort((a, b) => sevRank(b.severity) - sevRank(a.severity));
+      ];
+      let scannedScripts = 0;
+      if (deep && typeof resp.body === "string") {
+        const scripts = extractSameOriginScripts(resp.body, target).slice(0, 15);
+        for (const src of scripts) {
+          try {
+            const jr = await hub.call("replay_request", { url: src, method: "GET", tabId }, 30_000);
+            if (typeof jr?.body === "string") {
+              scannedScripts++;
+              for (const f of scanSecrets(jr.body)) findings.push({ ...f, detail: `${f.detail} — external script`, evidence: `${f.evidence ?? ""} @ ${src}` });
+            }
+          } catch {
+            /* unreachable/blocked script — skip */
+          }
+        }
+      }
+      findings.sort((a, b) => sevRank(b.severity) - sevRank(a.severity));
       return textResult({
         url: target,
         status: resp.status,
         findings,
         summary: { total: findings.length, high: findings.filter((f) => f.severity === "high").length, medium: findings.filter((f) => f.severity === "medium").length },
         cookies: cookies.map((c) => ({ name: c.name, secure: c.secure, httpOnly: c.httpOnly, sameSite: c.sameSite })),
-        note: "Body sweep covers the fetched response (inline HTML/JS). External bundles aren't fetched — use download_resource + a grep for a deep JS secret sweep.",
+        note: deep
+          ? `Swept the fetched response + ${scannedScripts} same-origin external script(s). Cross-origin bundles and lazy-loaded chunks aren't followed.`
+          : "Body sweep covers the fetched response (inline HTML/JS). Pass deep:true to also fetch same-origin external <script src> bundles.",
       });
     },
   );
@@ -889,9 +934,31 @@ export function registerTools(server: McpServer, hub: ExtensionHub) {
       const cap = await hub.call("net_get_requests", { tabId, includeBodies: includeBodies !== false, limit: 5000 }, 120_000);
       const rows: any[] = cap?.requests || [];
       const nowIso = new Date().toISOString();
-      const har = { log: { version: "1.2", creator: { name: "browser-bridge", version: "0.6.0" }, entries: rows.map((r) => harEntry(r, nowIso)) } };
+      const har = { log: { version: "1.2", creator: { name: "browser-bridge", version }, entries: rows.map((r) => harEntry(r, nowIso)) } };
       writeFileSync(savePath, JSON.stringify(har, null, 2));
       return textResult({ saved: savePath, entries: rows.length, note: cap?.totalBuffered ? `${cap.totalBuffered} buffered on tab` : undefined });
+    },
+  );
+
+  tool(
+    "request_to_curl",
+    "Emit a ready-to-run curl command that reproduces a request — from a captured requestId (reusing the REAL " +
+      "sent headers incl. Cookie, plus the POST body) or an ad-hoc {url,method,headers,body}. For copying a request " +
+      "out to a terminal / Burp workflow. Pure server-side assembly; values are shell-quoted; HTTP/2 pseudo-headers " +
+      "and Content-Length are dropped (curl recomputes).",
+    {
+      requestId: z.string().optional().describe("requestId from net_get_requests (reuses its real headers + body)"),
+      url: z.string().optional().describe("Ad-hoc request URL (if no requestId)"),
+      method: z.string().optional().describe("HTTP method (default GET)"),
+      headers: z.record(z.string()).optional().describe("Ad-hoc request headers"),
+      body: z.string().optional().describe("Request body"),
+      tabId: tabIdParam,
+    },
+    async (args) => {
+      if (!args.requestId && !args.url) throw new Error("Provide a requestId or a url");
+      const d = await hub.call("request_details", args);
+      if (d?.error) throw new Error(d.error);
+      return textResult({ curl: toCurl(d), url: d.url, method: (d.method || "GET").toUpperCase() });
     },
   );
 
@@ -954,8 +1021,10 @@ function analyzeHeaders(h: Record<string, string>, isHttps: boolean): Finding[] 
   if (!xfo && !(csp && /frame-ancestors/.test(csp))) f.push({ severity: "medium", id: "clickjacking", detail: "No X-Frame-Options and no CSP frame-ancestors — page is framable (clickjacking)" });
   const acao = hget(h, "access-control-allow-origin");
   const acac = hget(h, "access-control-allow-credentials");
-  if (acao === "*" && String(acac).toLowerCase() === "true") f.push({ severity: "high", id: "cors-wildcard-creds", detail: "CORS ACAO:* with Allow-Credentials:true (invalid+dangerous combo)" });
-  else if (acao && acao !== "*" && !/^https?:\/\//.test(acao) === false && String(acac).toLowerCase() === "true") f.push({ severity: "medium", id: "cors-reflect-creds", detail: `CORS reflects an origin (${acao}) with credentials — verify allow-list`, evidence: acao });
+  const corsCreds = String(acac).toLowerCase() === "true";
+  if (acao === "*" && corsCreds) f.push({ severity: "high", id: "cors-wildcard-creds", detail: "CORS ACAO:* with Allow-Credentials:true (invalid+dangerous combo)" });
+  else if ((acao || "").toLowerCase() === "null" && corsCreds) f.push({ severity: "high", id: "cors-null-creds", detail: "CORS ACAO:null with Allow-Credentials:true — any sandboxed/opaque origin (e.g. a data: or sandboxed iframe) can read credentialed responses", evidence: acao });
+  else if (acao && acao !== "*" && /^https?:\/\//.test(acao) && corsCreds) f.push({ severity: "medium", id: "cors-reflect-creds", detail: `CORS reflects an origin (${acao}) with credentials — verify allow-list`, evidence: acao });
   if (!hget(h, "x-content-type-options")) f.push({ severity: "low", id: "no-nosniff", detail: "No X-Content-Type-Options: nosniff" });
   if (!hget(h, "referrer-policy")) f.push({ severity: "info", id: "no-referrer-policy", detail: "No Referrer-Policy header" });
   const server = hget(h, "server");
@@ -1006,6 +1075,54 @@ function scanSecrets(body: string): Finding[] {
     }
   }
   return f;
+}
+
+// Extract absolute same-origin <script src> URLs from an HTML body (for analyze deep sweep).
+function extractSameOriginScripts(html: string, pageUrl: string): string[] {
+  let origin = "";
+  try {
+    origin = new URL(pageUrl).origin;
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const re = /<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html))) {
+    let abs: string;
+    try {
+      abs = new URL(m[1], pageUrl).href;
+    } catch {
+      continue;
+    }
+    try {
+      if (new URL(abs).origin !== origin) continue;
+    } catch {
+      continue;
+    }
+    if (!seen.has(abs)) {
+      seen.add(abs);
+      out.push(abs);
+    }
+  }
+  return out;
+}
+
+// ---- curl generation (pure) ----
+function shq(s: string): string {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+function toCurl(d: { url: string; method?: string; headers?: Record<string, string>; body?: string }): string {
+  const parts = ["curl", shq(d.url)];
+  const method = (d.method || "GET").toUpperCase();
+  if (method !== "GET") parts.push("-X", method);
+  for (const [k, v] of Object.entries(d.headers || {})) {
+    if (k.startsWith(":") || /^content-length$/i.test(k)) continue; // HTTP/2 pseudo-headers / auto-computed
+    parts.push("-H", shq(`${k}: ${v}`));
+  }
+  if (d.body != null && d.body !== "") parts.push("--data-raw", shq(d.body));
+  return parts.join(" ");
 }
 
 // ---- JWT decode (pure) ----

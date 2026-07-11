@@ -1,9 +1,9 @@
 {
   "name": "browser-bridge-extension",
-  "version": "0.1.0",
+  "version": "0.7.0",
   "private": true,
   "scripts": {
-    "build": "esbuild src/background.ts src/options.ts --bundle --format=iife --outdir=. --target=chrome116",
+    "build": "node build.mjs",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

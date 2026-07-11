@@ -1,6 +1,7 @@
 import { WebSocketServer, WebSocket } from "ws";
 import type { Server as HttpServer, IncomingMessage } from "http";
 import { randomUUID } from "crypto";
+import { CaptureSink } from "./capture-sink.js";
 
 const CALL_TIMEOUT_MS = 30_000;
 
@@ -8,6 +9,7 @@ interface Pending {
   resolve: (v: unknown) => void;
   reject: (e: Error) => void;
   timer: NodeJS.Timeout;
+  socket: WebSocket; // the connection this call was sent on; used to reject it if that socket closes
 }
 
 /**
@@ -17,6 +19,8 @@ interface Pending {
 export class ExtensionHub {
   private ws: WebSocket | null = null;
   private pending = new Map<string, Pending>();
+  // Active on-disk capture sinks (persist:true captures), keyed by the tab being captured.
+  private captureSinks = new Map<number, CaptureSink>();
 
   constructor(httpServer: HttpServer, token: string) {
     const wss = new WebSocketServer({ noServer: true });
@@ -65,6 +69,12 @@ export class ExtensionHub {
         console.error(`[hub] extension hello: v${msg.version}`);
         return;
       }
+      // Unsolicited streamed capture entries (persist captures) — routed to the tab's on-disk sink.
+      // Handled before the id-correlation path; capture messages carry no `id`.
+      if (msg.type === "capture") {
+        this.onCapture(msg);
+        return;
+      }
       const p = this.pending.get(msg.id);
       if (!p) return;
       this.pending.delete(msg.id);
@@ -78,12 +88,59 @@ export class ExtensionHub {
         this.ws = null;
         console.error("[hub] extension disconnected");
       }
+      // Reject calls still in flight on THIS socket so they fail fast instead of
+      // waiting out the full timeout. Only this socket's pending are rejected, so a
+      // call issued on a freshly-replaced connection isn't killed by the old one's close.
+      for (const [id, p] of this.pending) {
+        if (p.socket !== ws) continue;
+        this.pending.delete(id);
+        clearTimeout(p.timer);
+        p.reject(new Error("Browser extension disconnected before responding"));
+      }
+      // The extension streaming these captures is gone — close every sink so no handle leaks.
+      for (const sink of this.captureSinks.values()) sink.close();
+      this.captureSinks.clear();
     });
     ws.on("error", (err) => console.error(`[hub] ws error: ${err.message}`));
   }
 
   get connected(): boolean {
     return this.ws?.readyState === WebSocket.OPEN;
+  }
+
+  // ---- on-disk capture sinks (persist:true captures) ----
+
+  // True if some active capture is already writing this exact path (reject a second one).
+  captureSinkPathInUse(path: string): boolean {
+    for (const s of this.captureSinks.values()) if (s.path === path) return true;
+    return false;
+  }
+
+  // Register a sink (already opened by the tool so a bad path fails synchronously) for a tab.
+  // Replaces/closes any prior sink on that tab.
+  registerCaptureSink(tabId: number, sink: CaptureSink): void {
+    this.captureSinks.get(tabId)?.close();
+    this.captureSinks.set(tabId, sink);
+  }
+
+  closeCaptureSink(tabId: number): number | undefined {
+    const s = this.captureSinks.get(tabId);
+    if (!s) return undefined;
+    s.close();
+    this.captureSinks.delete(tabId);
+    return s.written;
+  }
+
+  // Route a streamed {type:"capture", tabId, entries, done} message to the tab's sink.
+  private onCapture(msg: any): void {
+    const tabId = msg.tabId;
+    const sink = this.captureSinks.get(tabId);
+    if (!sink) return; // no sink (already closed, or capture wasn't started with persist)
+    if (Array.isArray(msg.entries) && msg.entries.length) sink.append(msg.entries);
+    if (msg.done) {
+      sink.close();
+      this.captureSinks.delete(tabId);
+    }
   }
 
   call(method: string, params: Record<string, unknown> = {}, timeoutMs = CALL_TIMEOUT_MS): Promise<any> {
@@ -94,13 +151,14 @@ export class ExtensionHub {
       );
     }
     const id = randomUUID();
-    this.ws!.send(JSON.stringify({ id, method, params }));
+    const socket = this.ws!;
+    socket.send(JSON.stringify({ id, method, params }));
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`Extension call '${method}' timed out after ${timeoutMs}ms`));
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { resolve, reject, timer, socket });
     });
   }
 }

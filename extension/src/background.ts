@@ -1,6 +1,9 @@
 /// <reference types="chrome" />
 
-const VERSION = "0.6.1";
+// Injected at build time by build.mjs (esbuild define) from extension/package.json — single
+// source of truth shared with manifest.json, so the version can't drift.
+declare const __BB_VERSION__: string;
+const VERSION = __BB_VERSION__;
 const PING_INTERVAL_MS = 20_000; // WS traffic resets the MV3 service-worker idle timer (Chrome 116+)
 const RECONNECT_MAX_MS = 30_000;
 
@@ -139,15 +142,17 @@ async function injectAllFrames(
 async function injectAllAggregate(tab: chrome.tabs.Tab, func: (...args: any[]) => any, args: any[] = []): Promise<any> {
   const results = await injectAllFrames(tab, func, args);
   let acted: any = null;
+  let stale = false;
   for (const r of results) {
     const v: any = r?.result;
     if (!v || typeof v !== "object") continue;
     if (typeof v.error === "string") throw new Error(v.error);
+    if (v.staleRef) { stale = true; continue; } // ref hit, but the element was removed/re-rendered
     if (v.notFound) continue;
     acted = v;
   }
   if (acted) return acted;
-  throw new Error("Element not found in any frame — take a fresh snapshot");
+  throw new Error(stale ? "Ref matched an element that was since removed/re-rendered — take a fresh snapshot" : "Element not found in any frame — take a fresh snapshot");
 }
 
 // ---------- injected page functions ----------
@@ -221,6 +226,12 @@ function bbSnapshot(refOffset: number) {
   };
   walk(document);
   const items: any[] = [];
+  // Fresh ref registry each snapshot: ref (number) -> Element, kept on the frame's ISOLATED-world
+  // global so a later click/fill/hover/type injection (same world) resolves the ref WITHOUT mutating
+  // the page DOM. Reassign a new Map (never merge) so detached nodes from prior snapshots don't leak.
+  // INVARIANT: every ref locator must inject in the ISOLATED world — a MAIN-world locator sees a
+  // different `window` and would miss this registry.
+  const bbRefs: Map<number, Element> = ((window as any).__bbRefs = new Map());
   let n = 0;
   for (const el of all) {
     const h = el as HTMLElement;
@@ -234,7 +245,7 @@ function bbSnapshot(refOffset: number) {
     if ((h as any).checkVisibility && !(h as any).checkVisibility()) continue;
     n++;
     const ref = refOffset + n;
-    h.setAttribute("data-bb-ref", String(ref));
+    bbRefs.set(ref, h);
     const label = ((h.innerText ||
       (h as HTMLInputElement).value ||
       (h as HTMLInputElement).placeholder ||
@@ -282,17 +293,26 @@ function bbInteract(action: string, ref: number | null, sel: string | null, valu
     }
     return null;
   };
-  const el =
-    ref != null
-      ? deepFind((e) => e.getAttribute("data-bb-ref") === String(ref))
-      : deepFind((e) => {
-          try {
-            return (e as HTMLElement).matches(sel!);
-          } catch {
-            return false;
-          }
-        });
-  if (!el) return { notFound: true };
+  // Resolve a ref via the ISOLATED-world registry (window.__bbRefs) that bbSnapshot builds —
+  // no data-bb-ref DOM mutation. A ref that matched but whose element was since removed/re-rendered
+  // returns {staleRef} so the caller retries with a fresh snapshot. CSS selectors still deep-find.
+  let el: HTMLElement | null = null;
+  if (ref != null) {
+    const reg = (window as any).__bbRefs as Map<number, Element> | undefined;
+    const hit = reg && reg.get(ref);
+    if (!hit) return { notFound: true };
+    if (!(hit as Element).isConnected) return { staleRef: true };
+    el = hit as HTMLElement;
+  } else {
+    el = deepFind((e) => {
+      try {
+        return (e as HTMLElement).matches(sel!);
+      } catch {
+        return false;
+      }
+    });
+    if (!el) return { notFound: true };
+  }
 
   const setNativeValue = (target: HTMLElement, v: string): boolean => {
     if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
@@ -414,17 +434,26 @@ function bbFileUpload(sel: string | null, ref: number | null, filename: string, 
     }
     return null;
   };
-  const el =
-    ref != null
-      ? deepFind((e) => e.getAttribute("data-bb-ref") === String(ref))
-      : deepFind((e) => {
-          try {
-            return (e as HTMLElement).matches(sel!);
-          } catch {
-            return false;
-          }
-        });
-  if (!el) return { notFound: true };
+  // Resolve a ref via the ISOLATED-world registry (window.__bbRefs) that bbSnapshot builds —
+  // no data-bb-ref DOM mutation. A ref that matched but whose element was since removed/re-rendered
+  // returns {staleRef} so the caller retries with a fresh snapshot. CSS selectors still deep-find.
+  let el: HTMLElement | null = null;
+  if (ref != null) {
+    const reg = (window as any).__bbRefs as Map<number, Element> | undefined;
+    const hit = reg && reg.get(ref);
+    if (!hit) return { notFound: true };
+    if (!(hit as Element).isConnected) return { staleRef: true };
+    el = hit as HTMLElement;
+  } else {
+    el = deepFind((e) => {
+      try {
+        return (e as HTMLElement).matches(sel!);
+      } catch {
+        return false;
+      }
+    });
+    if (!el) return { notFound: true };
+  }
   if (!(el instanceof HTMLInputElement) || el.type !== "file") return { error: "Target is not an <input type=file>" };
   let bytes: Uint8Array;
   try {
@@ -465,17 +494,26 @@ function bbPasteImage(sel: string | null, ref: number | null, b64: string, mimeT
     }
     return null;
   };
-  const el =
-    ref != null
-      ? deepFind((e) => e.getAttribute("data-bb-ref") === String(ref))
-      : deepFind((e) => {
-          try {
-            return (e as HTMLElement).matches(sel!);
-          } catch {
-            return false;
-          }
-        });
-  if (!el) return { notFound: true };
+  // Resolve a ref via the ISOLATED-world registry (window.__bbRefs) that bbSnapshot builds —
+  // no data-bb-ref DOM mutation. A ref that matched but whose element was since removed/re-rendered
+  // returns {staleRef} so the caller retries with a fresh snapshot. CSS selectors still deep-find.
+  let el: HTMLElement | null = null;
+  if (ref != null) {
+    const reg = (window as any).__bbRefs as Map<number, Element> | undefined;
+    const hit = reg && reg.get(ref);
+    if (!hit) return { notFound: true };
+    if (!(hit as Element).isConnected) return { staleRef: true };
+    el = hit as HTMLElement;
+  } else {
+    el = deepFind((e) => {
+      try {
+        return (e as HTMLElement).matches(sel!);
+      } catch {
+        return false;
+      }
+    });
+    if (!el) return { notFound: true };
+  }
   let bytes: Uint8Array;
   try {
     const bin = atob(b64);
@@ -555,17 +593,26 @@ function bbLocate(sel: string | null, ref: number | null) {
     }
     return null;
   };
-  const el =
-    ref != null
-      ? deepFind((e) => e.getAttribute("data-bb-ref") === String(ref))
-      : deepFind((e) => {
-          try {
-            return (e as HTMLElement).matches(sel!);
-          } catch {
-            return false;
-          }
-        });
-  if (!el) return { notFound: true };
+  // Resolve a ref via the ISOLATED-world registry (window.__bbRefs) that bbSnapshot builds —
+  // no data-bb-ref DOM mutation. A ref that matched but whose element was since removed/re-rendered
+  // returns {staleRef} so the caller retries with a fresh snapshot. CSS selectors still deep-find.
+  let el: HTMLElement | null = null;
+  if (ref != null) {
+    const reg = (window as any).__bbRefs as Map<number, Element> | undefined;
+    const hit = reg && reg.get(ref);
+    if (!hit) return { notFound: true };
+    if (!(hit as Element).isConnected) return { staleRef: true };
+    el = hit as HTMLElement;
+  } else {
+    el = deepFind((e) => {
+      try {
+        return (e as HTMLElement).matches(sel!);
+      } catch {
+        return false;
+      }
+    });
+    if (!el) return { notFound: true };
+  }
   el.scrollIntoView({ block: "center", inline: "center" });
   try {
     (el as HTMLElement).focus();
@@ -597,20 +644,40 @@ async function bbClipboardWriteImage(b64: string, mimeType: string) {
   }
 }
 
+// Resolve when the tab finishes loading. The primary signal is the onUpdated 'complete' event, but we
+// also poll tab.status so navigations that DON'T fire a fresh 'complete' resolve quickly instead of
+// blocking the full timeout: a same-document/hash nav, a no-op (same URL), a bfcache restore, or a load
+// whose event fired before we attached. A 250ms grace lets a real cross-document nav flip to 'loading'
+// first, so we don't resolve on the previous page's lingering 'complete'. The listener still wins for
+// normal loads (no added latency); the poll only becomes the resolver in the fast/no-op cases.
 function waitForComplete(tabId: number, timeoutMs = 20_000): Promise<void> {
   return new Promise((resolve) => {
-    const listener = (id: number, info: chrome.tabs.TabChangeInfo) => {
-      if (id === tabId && info.status === "complete") {
-        chrome.tabs.onUpdated.removeListener(listener);
-        clearTimeout(timer);
-        resolve();
-      }
-    };
-    const timer = setTimeout(() => {
+    const deadline = Date.now() + timeoutMs;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
       chrome.tabs.onUpdated.removeListener(listener);
-      resolve(); // resolve anyway; caller can still read partial page
-    }, timeoutMs);
+      resolve();
+    };
+    const listener = (id: number, info: chrome.tabs.TabChangeInfo) => {
+      if (id === tabId && info.status === "complete") finish();
+    };
     chrome.tabs.onUpdated.addListener(listener);
+    void (async () => {
+      await sleep(250); // grace: let a real cross-document nav flip to 'loading' before we poll
+      while (!done && Date.now() < deadline) {
+        let status: string | undefined;
+        try {
+          status = (await chrome.tabs.get(tabId)).status;
+        } catch {
+          return finish(); // tab closed/gone
+        }
+        if (status === "complete") return finish();
+        await sleep(150);
+      }
+      finish(); // timeout ceiling — resolve anyway; caller can read a partial page
+    })();
   });
 }
 
@@ -719,6 +786,11 @@ interface Session {
   net: NetEntry[];
   netOn: boolean;
   netFilter?: string; // if set, only buffer requests whose URL contains this
+  netMax: number; // in-memory ring cap for `net` (overridable via net_capture_start maxEntries)
+  persist: boolean; // stream finished entries to the server's on-disk sink
+  persistBodies: boolean; // include response bodies in the persisted stream
+  flushQueue: any[]; // capture entries awaiting a batched flush to the server
+  flushTimer: ReturnType<typeof setTimeout> | null; // pending batch-flush timer
   extra: Map<string, ExtraInfo>; // requestId -> raw ExtraInfo headers (incl. Set-Cookie / sent Cookie)
   wsUrls: Map<string, string>; // ws requestId -> url
   wsFrames: WsFrame[];
@@ -781,6 +853,11 @@ async function ensureAttached(tabId: number): Promise<Session> {
       lastUsedAt: Date.now(),
       net: [],
       netOn: false,
+      netMax: NET_MAX_ENTRIES,
+      persist: false,
+      persistBodies: false,
+      flushQueue: [],
+      flushTimer: null,
       extra: new Map(),
       wsUrls: new Map(),
       wsFrames: [],
@@ -799,6 +876,7 @@ async function ensureAttached(tabId: number): Promise<Session> {
 }
 
 async function detachSession(tabId: number): Promise<void> {
+  finalizeCapture(tabId); // flush + close the on-disk sink before the session goes away
   sessions.delete(tabId);
   try {
     await new Promise<void>((resolve) => chrome.debugger.detach({ tabId }, () => resolve()));
@@ -810,6 +888,11 @@ async function detachSession(tabId: number): Promise<void> {
 function idleSweep() {
   const now = Date.now();
   for (const [tabId, s] of sessions) {
+    // Never idle-detach a tab that's actively doing work — a passive capture/intercept/log
+    // session bumps lastUsedAt only on tool calls, so it would otherwise be torn down (banner
+    // gone, buffer lost) after 5 min of no calls. One-shot debugger use (trusted click, deep
+    // snapshot, screenshot) leaves these flags off, so its banner still auto-cleans.
+    if (s.netOn || s.interceptOn || s.logOn || s.paused.size > 0) continue;
     if (now - s.lastUsedAt > IDLE_DETACH_MS) void detachSession(tabId);
   }
 }
@@ -829,7 +912,7 @@ function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, param
   if (method === "Network.requestWillBeSent") {
     const url = params.request?.url ?? "";
     if (s.netFilter && !url.includes(s.netFilter)) return;
-    if (s.net.length >= NET_MAX_ENTRIES) s.net.shift();
+    if (s.net.length >= s.netMax) s.net.shift();
     s.net.push({
       requestId: params.requestId,
       method: params.request?.method,
@@ -862,27 +945,57 @@ function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, param
     s.extra.set(params.requestId, x);
   } else if (method === "Network.loadingFinished") {
     const e = find(params.requestId);
-    if (e) e.finished = true;
+    if (e) {
+      e.finished = true;
+      if (s.persist) {
+        if (s.persistBodies) {
+          // fetch the body eagerly while the session is still live (a deferred fetch fails after
+          // the ring evicts the entry or the SW dies); never let a body failure drop the entry.
+          void (async () => {
+            const row = captureNetRow(s, e);
+            try {
+              const b = await getResponseBody(tabId, e.requestId);
+              row.responseBody = b.body;
+              row.responseBodyBase64 = b.base64;
+            } catch (err) {
+              row.bodyError = err instanceof Error ? err.message : String(err);
+            }
+            queueCapture(s, tabId, row);
+          })();
+        } else {
+          queueCapture(s, tabId, captureNetRow(s, e));
+        }
+      }
+    }
   } else if (method === "Network.loadingFailed") {
     const e = find(params.requestId);
-    if (e) e.failed = params.errorText || "failed";
+    if (e) {
+      e.failed = params.errorText || "failed";
+      if (s.persist) queueCapture(s, tabId, captureNetRow(s, e));
+    }
   } else if (method === "Network.webSocketCreated") {
     s.wsUrls.set(params.requestId, params.url);
     pushWs(s, { requestId: params.requestId, url: params.url, dir: "create", ts: Date.now() });
   } else if (method === "Network.webSocketFrameSent") {
-    pushWs(s, wsFrame(s, params, "sent"));
+    const f = wsFrame(s, params, "sent");
+    pushWs(s, f);
+    if (s.persist) queueCapture(s, tabId, { kind: "ws", ...f });
   } else if (method === "Network.webSocketFrameReceived") {
-    pushWs(s, wsFrame(s, params, "received"));
+    const f = wsFrame(s, params, "received");
+    pushWs(s, f);
+    if (s.persist) queueCapture(s, tabId, { kind: "ws", ...f });
   } else if (method === "Network.webSocketClosed") {
     pushWs(s, { requestId: params.requestId, url: s.wsUrls.get(params.requestId), dir: "close", ts: Date.now() });
   } else if (method === "Network.eventSourceMessageReceived") {
-    pushWs(s, {
+    const f: WsFrame = {
       requestId: params.requestId,
       url: s.wsUrls.get(params.requestId),
       dir: "sse",
       payload: String(params.data ?? "").slice(0, BODY_CAP),
       ts: Date.now(),
-    });
+    };
+    pushWs(s, f);
+    if (s.persist) queueCapture(s, tabId, { kind: "ws", ...f });
   }
 }
 
@@ -914,6 +1027,56 @@ function djb2(s: string): string {
   let h = 5381;
   for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
   return (h >>> 0).toString(16);
+}
+
+// ---- persist streaming: batch finished capture entries and flush to the server's on-disk sink ----
+// Row shape mirrors net_get_requests so the persisted JSONL converts to HAR/curl trivially.
+function captureNetRow(s: Session, e: NetEntry): any {
+  const x = s.extra.get(e.requestId);
+  const row: any = {
+    kind: "net",
+    requestId: e.requestId,
+    method: e.method,
+    url: e.url,
+    type: e.type,
+    status: e.status,
+    mimeType: e.mimeType,
+    failed: e.failed,
+    timing: e.timing,
+    requestHeaders: x?.reqHeaders ?? e.requestHeaders,
+    responseHeaders: x?.respHeaders ?? e.responseHeaders,
+  };
+  if (x?.setCookie) row.setCookie = x.setCookie;
+  if (e.requestBody) row.requestBody = e.requestBody;
+  return row;
+}
+function queueCapture(s: Session, tabId: number, item: any) {
+  s.flushQueue.push(item);
+  if (s.flushQueue.length >= 50) return void flushCapture(s, tabId); // cap batch size (bound socket pressure)
+  if (!s.flushTimer) s.flushTimer = setTimeout(() => flushCapture(s, tabId), 300);
+}
+function flushCapture(s: Session, tabId: number, done = false) {
+  if (s.flushTimer) {
+    clearTimeout(s.flushTimer);
+    s.flushTimer = null;
+  }
+  const entries = s.flushQueue;
+  s.flushQueue = [];
+  if ((entries.length || done) && ws && ws.readyState === WebSocket.OPEN) {
+    try {
+      ws.send(JSON.stringify({ type: "capture", tabId, entries, done }));
+    } catch {
+      /* socket write failed — entries dropped (best-effort durability) */
+    }
+  }
+}
+// Flush the remaining queue and tell the server to close the sink; call before a persist session
+// is torn down (detach / tab removed). Idempotent: no-op once persist is cleared.
+function finalizeCapture(tabId: number) {
+  const s = sessions.get(tabId);
+  if (!s || !s.persist) return;
+  s.persist = false;
+  flushCapture(s, tabId, true);
 }
 
 // scheme + host only, no path/query/fragment — for compact tab listings where the path may carry
@@ -1478,7 +1641,7 @@ async function trustedPasteImage(tab: chrome.tabs.Tab, params: any): Promise<any
 
   // find the target element's on-screen center (CSP-safe function injection; handles plain refs + shadow)
   const loc = await inject(tab, bbLocate, [params.selector ?? null, params.ref ?? null]);
-  if (!loc || loc.notFound) throw new Error("Target not found for trusted paste — take a fresh snapshot or check the selector.");
+  if (!loc || loc.notFound || loc.staleRef) throw new Error("Target not found (or since re-rendered) for trusted paste — take a fresh snapshot or check the selector.");
   await sleep(150);
 
   // trusted click → focuses the field + grants user activation for the clipboard write
@@ -1650,7 +1813,7 @@ async function interact(tab: chrome.tabs.Tab, action: string, ref: number | null
       last = await injectAllAggregate(tab, bbInteract, [action, ref, sel, value]);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      if (/not found in any frame/i.test(msg)) last = { notFound: true };
+      if (/not found in any frame|removed\/re-rendered/i.test(msg)) last = { notFound: true };
       else throw e; // real error (e.g. "not fillable") — surface it
     }
     const retryable = last && (last.notFound || (last.notActionable && last.reason !== "covered"));
@@ -1807,6 +1970,7 @@ async function dispatch(method: string, params: any): Promise<any> {
     case "net_capture_start": {
       const tab = await targetTab(params.tabId);
       const s = await ensureAttached(tab.id!);
+      finalizeCapture(tab.id!); // close any prior persist sink on this tab before (re)starting
       await cmd(tab.id!, "Network.enable");
       s.net = [];
       s.extra = new Map();
@@ -1814,7 +1978,15 @@ async function dispatch(method: string, params: any): Promise<any> {
       s.wsFrames = [];
       s.netOn = true;
       s.netFilter = params.urlFilter || undefined;
-      return { capturing: true, tabId: tab.id!, note: "Now navigate/reload the tab to capture its load traffic (incl. Set-Cookie and WebSocket frames). Banner is showing while attached." };
+      s.netMax = Math.max(1, Math.min(params.maxEntries ?? NET_MAX_ENTRIES, 5000));
+      if (s.flushTimer) {
+        clearTimeout(s.flushTimer);
+        s.flushTimer = null;
+      }
+      s.flushQueue = [];
+      s.persist = !!params.persist;
+      s.persistBodies = !!params.persistBodies;
+      return { capturing: true, tabId: tab.id!, persist: s.persist, maxEntries: s.netMax, note: "Now navigate/reload the tab to capture its load traffic (incl. Set-Cookie and WebSocket frames). Banner is showing while attached." };
     }
 
     case "net_get_requests": {
@@ -1940,6 +2112,27 @@ async function dispatch(method: string, params: any): Promise<any> {
     case "replay_request": {
       const tab = await targetTab(params.tabId);
       return doReplay(tab, params);
+    }
+
+    case "request_details": {
+      const tab = await targetTab(params.tabId);
+      const s = sessions.get(tab.id!);
+      if (params.requestId) {
+        const e = s?.net.find((x) => x.requestId === params.requestId);
+        if (!e) throw new Error("requestId not found in this tab's capture buffer");
+        const method = (e.method || "GET").toUpperCase();
+        let body = e.requestBody;
+        if (body == null && ["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
+          try {
+            const pd = await cmd(tab.id!, "Network.getRequestPostData", { requestId: params.requestId });
+            body = pd?.postData;
+          } catch {
+            /* body unavailable */
+          }
+        }
+        return { url: e.url, method, headers: s!.extra.get(e.requestId)?.reqHeaders ?? e.requestHeaders ?? {}, body };
+      }
+      return { url: params.url, method: (params.method || "GET").toUpperCase(), headers: params.headers || {}, body: params.body };
     }
 
     case "authz_matrix": {
@@ -2373,9 +2566,13 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 // Debugger listeners must be registered synchronously at top level (MV3).
 chrome.debugger.onEvent.addListener(onDebuggerEvent);
 chrome.debugger.onDetach.addListener((source) => {
-  if (source.tabId != null) sessions.delete(source.tabId); // user closed banner / DevTools opened / tab gone
+  if (source.tabId != null) {
+    finalizeCapture(source.tabId); // flush + close the sink (user closed banner / DevTools opened / tab gone)
+    sessions.delete(source.tabId);
+  }
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
+  finalizeCapture(tabId);
   sessions.delete(tabId);
 });
 chrome.downloads.onDeterminingFilename.addListener((_item, suggest) => {

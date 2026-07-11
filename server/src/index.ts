@@ -3,7 +3,8 @@ import { createServer } from "http";
 import { randomUUID, randomBytes } from "crypto";
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { homedir } from "os";
-import { join } from "path";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
@@ -12,6 +13,17 @@ import { registerTools } from "./tools.js";
 
 const PORT = Number(process.env.BRIDGE_PORT ?? 8765);
 const HOST = "127.0.0.1";
+
+// Single source of truth for the server version — read from package.json (../package.json
+// relative to the compiled dist/index.js) so it can't drift from the release number.
+const VERSION = (() => {
+  try {
+    const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+    return String(JSON.parse(readFileSync(pkgPath, "utf8")).version || "0.0.0");
+  } catch {
+    return "0.0.0";
+  }
+})();
 
 function loadToken(): string {
   if (process.env.BRIDGE_TOKEN) return process.env.BRIDGE_TOKEN;
@@ -35,8 +47,8 @@ const httpServer = createServer(app);
 const hub = new ExtensionHub(httpServer, token);
 
 function buildMcpServer(): McpServer {
-  const server = new McpServer({ name: "browser-bridge", version: "0.1.0" });
-  registerTools(server, hub);
+  const server = new McpServer({ name: "browser-bridge", version: VERSION });
+  registerTools(server, hub, VERSION);
   return server;
 }
 
