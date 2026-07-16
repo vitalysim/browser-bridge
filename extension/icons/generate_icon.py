@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """Generate the Browser Bridge extension icons.
 
-A suspension bridge (on-theme with the name) in white on a blue->violet gradient
-squircle, with an amber node marking the live connection. Rendered at 4x and
-downscaled with LANCZOS for crisp small sizes.
+A suspension bridge (on-theme with the name) in white on a graphite squircle —
+matching the hero banner (docs/banner.svg): monochrome, near-black gradient, a
+soft white "live connection" node. Rendered at 4x and downscaled with LANCZOS
+for crisp small sizes.
 """
 from PIL import Image, ImageDraw, ImageFilter
 import os
 
 S = 512
-TOP = (37, 99, 235)     # #2563eb blue
-BOT = (124, 58, 237)    # #7c3aed violet
+TOP = (22, 22, 25)      # #161619 zinc-900 (banner card top)
+BOT = (11, 11, 13)      # #0b0b0d near-black (banner card bottom)
+BORDER = (42, 42, 49)   # #2a2a31 subtle edge (banner border) for dark-toolbar definition
 WHITE = (255, 255, 255, 255)
-AMBER = (251, 191, 36)  # #fbbf24
+NODE = (228, 228, 231)  # #e4e4e7 zinc-200 — light, monochrome connection node
 
 
 def quad(p0, p1, p2, n=48):
@@ -53,6 +55,9 @@ def build():
     icon.paste(bg, (0, 0), mask)
     d = ImageDraw.Draw(icon)
 
+    # subtle edge for definition on dark toolbars (matches the banner's border)
+    d.rounded_rectangle([3, 3, S - 4, S - 4], radius=116, outline=BORDER + (255,), width=4)
+
     deck_y = 340
     tower_top = 150
     L = (66, 300)
@@ -87,15 +92,15 @@ def build():
     for tx in (T1[0], T2[0]):
         d.rounded_rectangle([tx - 9, deck_y + 12, tx + 9, 396], radius=6, fill=(255, 255, 255, 220))
 
-    # amber "live connection" node at the mid-span dip
+    # soft white "live connection" node at the mid-span dip (monochrome, matches banner)
     cx, cy = 256, 300
     glow = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    ImageDraw.Draw(glow).ellipse([cx - 46, cy - 46, cx + 46, cy + 46], fill=AMBER + (170,))
-    glow = glow.filter(ImageFilter.GaussianBlur(18))
+    ImageDraw.Draw(glow).ellipse([cx - 42, cy - 42, cx + 42, cy + 42], fill=(255, 255, 255, 120))
+    glow = glow.filter(ImageFilter.GaussianBlur(20))
     icon = Image.alpha_composite(icon, glow)
     d = ImageDraw.Draw(icon)
-    d.ellipse([cx - 17, cy - 17, cx + 17, cy + 17], fill=AMBER + (255,))
-    d.ellipse([cx - 7, cy - 7, cx + 7, cy + 7], fill=WHITE)
+    d.ellipse([cx - 16, cy - 16, cx + 16, cy + 16], fill=NODE + (255,))
+    d.ellipse([cx - 6, cy - 6, cx + 6, cy + 6], fill=WHITE)
 
     icon = icon.resize((S, S), Image.LANCZOS)
     return icon

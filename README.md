@@ -103,23 +103,9 @@ Both Claude Code and Codex drive the same live browser through the same endpoint
 
 ## Architecture
 
-```
-   Claude Code ─┐                                   ┌───────────────────────────────┐
-                │  streamable-HTTP MCP  ┌──────────► │  Bridge server (Node/TS)      │
-                ├──────────────────────►│  :8765/mcp │  • MCP tools + auth           │
-   Codex CLI  ──┘                       └──────────► │  • WS hub (req/resp correlate)│
-                                                     └───────────────┬───────────────┘
-                                    outbound WebSocket, token-authed  │  ws://127.0.0.1:8765/ws
-                                                     ┌───────────────▼───────────────┐
-                                                     │  Chrome extension (MV3)        │
-                                                     │  default: chrome.tabs /        │
-                                                     │           scripting / capture  │
-                                                     │  opt-in:  chrome.debugger (CDP)│
-                                                     │           Network · Fetch · DOM│
-                                                     └───────────────┬───────────────┘
-                                                                     ▼
-                                              Your real, logged-in tabs (Gmail, GitHub, …)
-```
+<p align="center">
+  <img src="docs/architecture.svg" alt="Architecture — Claude Code and Codex CLI connect over streamable-HTTP MCP to the bridge server, which relays over an outbound token-authed WebSocket to the Chrome MV3 extension, which drives your real logged-in tabs" width="560">
+</p>
 
 ## Features & tools
 
@@ -323,7 +309,7 @@ extension/              Manifest V3 extension (bundled with esbuild via build.mj
   src/options.ts          token + connection UI
   icons/                  generated app icons
 scripts/                install-service.mjs / uninstall-service.mjs (systemd or launchd)
-docs/banner.svg         README hero art
+docs/                   README art (banner.svg hero · architecture.svg diagram)
 ```
 
 ## Contributing
