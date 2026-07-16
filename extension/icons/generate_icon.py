@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate the Browser Bridge extension icons.
 
-A suspension bridge (on-theme with the name) in white on a graphite squircle —
+A suspension bridge (on-theme with the name) in white on a graphite squircle -
 matching the hero banner (docs/banner.svg): monochrome, near-black gradient, a
 soft white "live connection" node. Rendered at 4x and downscaled with LANCZOS
 for crisp small sizes.
@@ -14,7 +14,7 @@ TOP = (22, 22, 25)      # #161619 zinc-900 (banner card top)
 BOT = (11, 11, 13)      # #0b0b0d near-black (banner card bottom)
 BORDER = (42, 42, 49)   # #2a2a31 subtle edge (banner border) for dark-toolbar definition
 WHITE = (255, 255, 255, 255)
-NODE = (228, 228, 231)  # #e4e4e7 zinc-200 — light, monochrome connection node
+NODE = (228, 228, 231)  # #e4e4e7 zinc-200 - light, monochrome connection node
 
 
 def quad(p0, p1, p2, n=48):

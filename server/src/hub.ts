@@ -69,7 +69,7 @@ export class ExtensionHub {
         console.error(`[hub] extension hello: v${msg.version}`);
         return;
       }
-      // Unsolicited streamed capture entries (persist captures) — routed to the tab's on-disk sink.
+      // Unsolicited streamed capture entries (persist captures) - routed to the tab's on-disk sink.
       // Handled before the id-correlation path; capture messages carry no `id`.
       if (msg.type === "capture") {
         this.onCapture(msg);
@@ -97,7 +97,7 @@ export class ExtensionHub {
         clearTimeout(p.timer);
         p.reject(new Error("Browser extension disconnected before responding"));
       }
-      // The extension streaming these captures is gone — close every sink so no handle leaks.
+      // The extension streaming these captures is gone - close every sink so no handle leaks.
       for (const sink of this.captureSinks.values()) sink.close();
       this.captureSinks.clear();
     });

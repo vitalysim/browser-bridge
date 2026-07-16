@@ -1,7 +1,7 @@
 # Contributing to Browser Bridge
 
-Thanks for your interest! Browser Bridge is two packages — a Node/TypeScript **MCP server** (`server/`) and a
-**Manifest V3 Chrome extension** (`extension/`) — bridged by a single WebSocket. This guide gets you building and
+Thanks for your interest! Browser Bridge is two packages - a Node/TypeScript **MCP server** (`server/`) and a
+**Manifest V3 Chrome extension** (`extension/`) - bridged by a single WebSocket. This guide gets you building and
 testing changes.
 
 ## Prerequisites
@@ -12,7 +12,7 @@ testing changes.
 
 ## Build
 
-There is no root package — build each package in its own directory:
+There is no root package - build each package in its own directory:
 
 ```bash
 # MCP server (TypeScript → dist/, via tsc)
@@ -28,7 +28,7 @@ npm run typecheck                                     # tsc --noEmit
 
 ## The dev loop (important MV3 gotcha)
 
-After you rebuild the extension, reload it in `chrome://extensions`. **Toggle the extension Off then On** —
+After you rebuild the extension, reload it in `chrome://extensions`. **Toggle the extension Off then On** -
 the ↻ reload button often keeps a *cached service worker*, so your new `background.js` may not actually run.
 Confirm the new worker is live: the extension logs its version on connect, visible in the server log
 (`~/.browser-bridge/server.log` → `[hub] extension hello: vX.Y.Z`).
@@ -45,25 +45,25 @@ its own `package.json` at startup; the extension build stamps `manifest.json` an
 
 Each MCP tool is a thin server-side registration that calls into the extension:
 
-1. **Server** — register it in `server/src/tools.ts` with a Zod input schema (`tool(name, desc, schema, handler)`),
+1. **Server** - register it in `server/src/tools.ts` with a Zod input schema (`tool(name, desc, schema, handler)`),
    forwarding to `hub.call("<method>", params)`.
-2. **Extension** — handle `<method>` in the `dispatch()` switch in `extension/src/background.ts`, doing the actual
+2. **Extension** - handle `<method>` in the `dispatch()` switch in `extension/src/background.ts`, doing the actual
    browser work (via `chrome.scripting` injection, `chrome.debugger`/CDP, or a `chrome.*` API).
 3. Update the **tool reference** table and the tool count in `README.md`.
 
 Injected page functions must be **self-contained** (they're serialized into the page) and must signal failure by
-**returning `{ error }`**, never by throwing — Chrome swallows exceptions inside `executeScript`.
+**returning `{ error }`**, never by throwing - Chrome swallows exceptions inside `executeScript`.
 
 ## Style & testing
 
 - TypeScript stays **strict**; keep `npm run typecheck` clean before you push.
 - Match the surrounding code's style and comment density.
 - Test live where you can: drive a real tab through the MCP tools and confirm the behavior end-to-end. Use a
-  throwaway tab / neutral site — not your personal logged-in tabs.
+  throwaway tab / neutral site - not your personal logged-in tabs.
 
 ## Pull requests
 
 Open a PR against `main` with a clear description of what changed and why, and how you verified it. For anything
 touching the auth/token model, the extension permission surface, or the debugger layer, call that out explicitly.
 
-Security issues: please **don't** open a public PR/issue — see [SECURITY.md](SECURITY.md).
+Security issues: please **don't** open a public PR/issue - see [SECURITY.md](SECURITY.md).

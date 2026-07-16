@@ -75,12 +75,12 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
 
   tool(
     "tabs_list",
-    "List all open browser tabs with their id, title, url, and active state. Use short:true for a compact form (id, title, origin, active — no path/query) when you only need to identify tabs, e.g. by site.",
+    "List all open browser tabs with their id, title, url, and active state. Use short:true for a compact form (id, title, origin, active - no path/query) when you only need to identify tabs, e.g. by site.",
     {
       short: z
         .boolean()
         .optional()
-        .describe("Return id, title, origin (scheme+host only), and active — omitting the full url's path/query, which can carry long opaque ids."),
+        .describe("Return id, title, origin (scheme+host only), and active - omitting the full url's path/query, which can carry long opaque ids."),
     },
     async ({ short }) => textResult(await hub.call("tabs_list", { short }))
   );
@@ -248,7 +248,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     "file_upload",
     "Set a file on an <input type=file> element, identified by ref or CSS selector. Provide EITHER " +
       "base64 (contents, keep under ~5 MB; banner-free) OR path (an absolute local file path Chrome " +
-      "can read; uses the debugger's DOM.setFileInputFiles — most reliable, no size limit, shows banner).",
+      "can read; uses the debugger's DOM.setFileInputFiles - most reliable, no size limit, shows banner).",
     {
       base64: z.string().optional().describe("File contents, base64-encoded (banner-free path)"),
       filename: z.string().optional().describe("File name to present to the page (with base64)"),
@@ -270,7 +270,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     "Paste a LOCAL IMAGE into a rich-text / contenteditable field that accepts pasted images (comment " +
       "boxes, compose editors, etc.). For an <input type=file> use file_upload instead. Target by ref or " +
       "CSS selector; give the image as base64 or an absolute local path. Banner-free (synthetic events); " +
-      "method 'paste' (default), 'drop', or 'both' — some editors accept one but not the other. Set " +
+      "method 'paste' (default), 'drop', or 'both' - some editors accept one but not the other. Set " +
       "trusted:true for STRICT editors that ignore synthetic events (e.g. YesWeHack): puts the image on the " +
       "real OS clipboard and sends a genuine Cmd/Ctrl+V via chrome.debugger (shows the banner; needs the " +
       "Chrome window focused/frontmost).",
@@ -325,7 +325,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       fullPage: z.boolean().optional().describe("Capture the entire scrollable page (chrome.debugger)"),
       scale: z.number().optional().describe("Device scale factor, e.g. 2 for retina-crisp output"),
       format: z.enum(["png", "jpeg"]).optional().describe("Image format (default png)"),
-      quality: z.number().optional().describe("JPEG quality 0–100 (default 90)"),
+      quality: z.number().optional().describe("JPEG quality 0-100 (default 90)"),
       selector: z.string().optional().describe("Clip to this CSS element instead of the page/viewport"),
       savePath: z.string().optional().describe("Absolute path to write the image to (returns metadata, not the image)"),
     },
@@ -349,11 +349,11 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
 
   tool(
     "download_resource",
-    "Download a resource (URL) to disk using Chrome's own download engine — reliably handles files " +
+    "Download a resource (URL) to disk using Chrome's own download engine - reliably handles files " +
       "up to 100MB and well beyond (pass a larger maxBytes, or omit it, for bigger files), with correct " +
       "binary handling and the real browser session's cookies sent automatically. Banner-free (no " +
       "chrome.debugger involved). Cookie/Host/Origin/Referer/Content-Length headers are browser-forbidden " +
-      "and ignored; Authorization works for token-gated downloads. Always uses the live browser session — " +
+      "and ignored; Authorization works for token-gated downloads. Always uses the live browser session - " +
       "can't be pointed at a captured identity's snapshotted cookies.",
     {
       url: z.string().describe("URL of the resource to download"),
@@ -380,7 +380,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         }
         if (Date.now() > deadline) {
           throw new Error(
-            `Timed out after ${overallTimeout}ms waiting for download to complete (downloadId ${start.downloadId} may still be running — check chrome://downloads or retry).`
+            `Timed out after ${overallTimeout}ms waiting for download to complete (downloadId ${start.downloadId} may still be running - check chrome://downloads or retry).`
           );
         }
         await sleep(750);
@@ -405,7 +405,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     "eval_js",
     "Evaluate JavaScript in the page's main world and return its JSON-serialized result. Banner-free by " +
       "default (injected eval). On strict-CSP pages that forbid `unsafe-eval`, it **auto-falls back to CDP " +
-      "`Runtime.evaluate`** (see cdp_eval), which bypasses the CSP but shows the debugger banner — the result " +
+      "`Runtime.evaluate`** (see cdp_eval), which bypasses the CSP but shows the debugger banner - the result " +
       "then includes `via:\"cdp-fallback\"`. Set `noFallback:true` to fail instead, or `cdp:true` to skip " +
       "straight to the CDP path. Use `awaitPromise:false` if you don't want to await a returned Promise.",
     {
@@ -420,7 +420,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
 
   tool(
     "cdp_eval",
-    "Evaluate JavaScript in the page's real main-world context via CDP `Runtime.evaluate` — the DevTools-" +
+    "Evaluate JavaScript in the page's real main-world context via CDP `Runtime.evaluate` - the DevTools-" +
       "console path, which **is not subject to the page's CSP `unsafe-eval`**, so it runs arbitrary code on " +
       "strict-CSP sites (Copilot, HackerOne, YesWeHack…) where `eval_js` is blocked. Unlike the isolated-world " +
       "read/interact tools, this reaches the page's live JS: in-memory state, framework internals, closures, and " +
@@ -455,9 +455,9 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     "Start capturing network traffic on a tab via chrome.debugger (shows the debugging banner). Then " +
       "navigate/reload the tab to capture its load traffic, and read it with net_get_requests. The in-memory " +
       "buffer is a ring capped at maxEntries (default 500). Set persist:true + savePath to ALSO stream each " +
-      "finished request and WebSocket frame to a JSON-Lines file on disk — a DURABLE record that survives the " +
+      "finished request and WebSocket frame to a JSON-Lines file on disk - a DURABLE record that survives the " +
       "ring cap and (up to the last ~300ms batch) a service-worker crash. NOTE: persistence is durability, NOT " +
-      "continuity — if the SW dies the debugger detaches and capture stops until you restart it; the file keeps " +
+      "continuity - if the SW dies the debugger detaches and capture stops until you restart it; the file keeps " +
       "what was captured before that. persistBodies:true also writes response bodies (heavier).",
     {
       urlFilter: z.string().optional().describe("Only buffer requests whose URL contains this substring"),
@@ -567,7 +567,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     "replay_request",
     "Re-issue a request from the tab's live session (an in-session Repeater). Give a requestId (from " +
       "net_get_requests) or an ad-hoc {url,method,headers,body}; optional overrides {url,method,headers,body}. " +
-      "Set identity to send as a captured identity or 'anon' (strips cookies/bearer) — this uses the CDP Fetch " +
+      "Set identity to send as a captured identity or 'anon' (strips cookies/bearer) - this uses the CDP Fetch " +
       "path to override forbidden headers like Cookie. Returns {status,headers,body}. Shows the banner when identity/forbidden headers are used.",
     {
       requestId: z.string().optional().describe("requestId from net_get_requests to replay"),
@@ -646,7 +646,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
 
   tool(
     "intercept_start",
-    "Begin live request/response interception on the tab (Burp-Proxy style, via CDP Fetch — shows the debugger " +
+    "Begin live request/response interception on the tab (Burp-Proxy style, via CDP Fetch - shows the debugger " +
       "banner). Matching requests pause; a paused request that matches a `rules` entry is auto-resolved, otherwise " +
       "it queues for intercept_pending/intercept_resolve. WARNING: a paused request blocks the page until resolved.",
     {
@@ -716,7 +716,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       "{status,length,timeMs,contentType,snippet} with anomalies (deviating status/length or errors) flagged first. " +
       "Modes: 'sniper' (default; one marker, payloads[]), 'pitchfork' (multiple markers, i-th of each payloadSets[]), " +
       "'clusterbomb' (all combinations of payloadSets[]), 'race' (fire raceCount identical requests together for " +
-      "race-condition testing — best-effort single-packet via concurrent release). Pairs with response_diff/authz_matrix.",
+      "race-condition testing - best-effort single-packet via concurrent release). Pairs with response_diff/authz_matrix.",
     {
       template: z
         .union([
@@ -741,7 +741,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     async (args) => textResult(await hub.call("fuzz", args, 120_000)),
   );
 
-  // ---- cookies (chrome.cookies — real flags incl. HttpOnly) ----
+  // ---- cookies (chrome.cookies - real flags incl. HttpOnly) ----
   tool(
     "cookies_get",
     "Read cookies from the real browser jar, including HttpOnly, with full flags (secure, sameSite, expirationDate, " +
@@ -890,10 +890,10 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
             const jr = await hub.call("replay_request", { url: src, method: "GET", tabId }, 30_000);
             if (typeof jr?.body === "string") {
               scannedScripts++;
-              for (const f of scanSecrets(jr.body)) findings.push({ ...f, detail: `${f.detail} — external script`, evidence: `${f.evidence ?? ""} @ ${src}` });
+              for (const f of scanSecrets(jr.body)) findings.push({ ...f, detail: `${f.detail} - external script`, evidence: `${f.evidence ?? ""} @ ${src}` });
             }
           } catch {
-            /* unreachable/blocked script — skip */
+            /* unreachable/blocked script - skip */
           }
         }
       }
@@ -942,7 +942,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
 
   tool(
     "request_to_curl",
-    "Emit a ready-to-run curl command that reproduces a request — from a captured requestId (reusing the REAL " +
+    "Emit a ready-to-run curl command that reproduces a request - from a captured requestId (reusing the REAL " +
       "sent headers incl. Cookie, plus the POST body) or an ad-hoc {url,method,headers,body}. For copying a request " +
       "out to a terminal / Burp workflow. Pure server-side assembly; values are shell-quoted; HTTP/2 pseudo-headers " +
       "and Content-Length are dropped (curl recomputes).",
@@ -1018,13 +1018,13 @@ function analyzeHeaders(h: Record<string, string>, isHttps: boolean): Finding[] 
   }
   if (isHttps && !hget(h, "strict-transport-security")) f.push({ severity: "low", id: "no-hsts", detail: "No Strict-Transport-Security (HSTS) header" });
   const xfo = hget(h, "x-frame-options");
-  if (!xfo && !(csp && /frame-ancestors/.test(csp))) f.push({ severity: "medium", id: "clickjacking", detail: "No X-Frame-Options and no CSP frame-ancestors — page is framable (clickjacking)" });
+  if (!xfo && !(csp && /frame-ancestors/.test(csp))) f.push({ severity: "medium", id: "clickjacking", detail: "No X-Frame-Options and no CSP frame-ancestors - page is framable (clickjacking)" });
   const acao = hget(h, "access-control-allow-origin");
   const acac = hget(h, "access-control-allow-credentials");
   const corsCreds = String(acac).toLowerCase() === "true";
   if (acao === "*" && corsCreds) f.push({ severity: "high", id: "cors-wildcard-creds", detail: "CORS ACAO:* with Allow-Credentials:true (invalid+dangerous combo)" });
-  else if ((acao || "").toLowerCase() === "null" && corsCreds) f.push({ severity: "high", id: "cors-null-creds", detail: "CORS ACAO:null with Allow-Credentials:true — any sandboxed/opaque origin (e.g. a data: or sandboxed iframe) can read credentialed responses", evidence: acao });
-  else if (acao && acao !== "*" && /^https?:\/\//.test(acao) && corsCreds) f.push({ severity: "medium", id: "cors-reflect-creds", detail: `CORS reflects an origin (${acao}) with credentials — verify allow-list`, evidence: acao });
+  else if ((acao || "").toLowerCase() === "null" && corsCreds) f.push({ severity: "high", id: "cors-null-creds", detail: "CORS ACAO:null with Allow-Credentials:true - any sandboxed/opaque origin (e.g. a data: or sandboxed iframe) can read credentialed responses", evidence: acao });
+  else if (acao && acao !== "*" && /^https?:\/\//.test(acao) && corsCreds) f.push({ severity: "medium", id: "cors-reflect-creds", detail: `CORS reflects an origin (${acao}) with credentials - verify allow-list`, evidence: acao });
   if (!hget(h, "x-content-type-options")) f.push({ severity: "low", id: "no-nosniff", detail: "No X-Content-Type-Options: nosniff" });
   if (!hget(h, "referrer-policy")) f.push({ severity: "info", id: "no-referrer-policy", detail: "No Referrer-Policy header" });
   const server = hget(h, "server");
@@ -1146,8 +1146,8 @@ function decodeJwt(raw: string): any {
   const now = Math.floor(Date.now() / 1000);
   const findings: Finding[] = [];
   const alg = header?.alg;
-  if (alg === "none" || alg === "None") findings.push({ severity: "high", id: "alg-none", detail: "alg:none — signature not verified; forgeable if the server accepts it" });
-  if (typeof alg === "string" && /^HS/.test(alg)) findings.push({ severity: "info", id: "hmac-alg", detail: `HMAC (${alg}) — check for RS↔HS alg-confusion if the server also accepts RS* verified with the public key as HMAC secret` });
+  if (alg === "none" || alg === "None") findings.push({ severity: "high", id: "alg-none", detail: "alg:none - signature not verified; forgeable if the server accepts it" });
+  if (typeof alg === "string" && /^HS/.test(alg)) findings.push({ severity: "info", id: "hmac-alg", detail: `HMAC (${alg}) - check for RS↔HS alg-confusion if the server also accepts RS* verified with the public key as HMAC secret` });
   if (payload?.exp && payload.exp < now) findings.push({ severity: "info", id: "expired", detail: `Token expired ${now - payload.exp}s ago` });
   if (payload?.nbf && payload.nbf > now) findings.push({ severity: "info", id: "not-yet-valid", detail: "Token not valid yet (nbf in the future)" });
   return {

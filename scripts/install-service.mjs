@@ -64,7 +64,7 @@ WantedBy=default.target
   console.log(`✓ wrote ${path}`);
   run("systemctl", ["--user", "daemon-reload"]);
   const ok = run("systemctl", ["--user", "enable", "--now", `${LABEL}.service`]);
-  console.log(ok ? `✓ enabled & started (systemctl --user)` : `! could not start via systemctl — is a user systemd session available?`);
+  console.log(ok ? `✓ enabled & started (systemctl --user)` : `! could not start via systemctl - is a user systemd session available?`);
   console.log(`\nNext:`);
   console.log(`  • start at boot without login:  loginctl enable-linger ${userInfo().username}`);
   console.log(`  • logs:                          journalctl --user -u ${LABEL} -f`);
@@ -114,7 +114,7 @@ function installDarwin() {
   writeFileSync(path, plist);
   console.log(`✓ wrote ${path}`);
   const ok = run("launchctl", ["bootstrap", gui, path]);
-  console.log(ok ? `✓ loaded (launchctl)` : `! could not bootstrap — try: launchctl bootstrap ${gui} ${path}`);
+  console.log(ok ? `✓ loaded (launchctl)` : `! could not bootstrap - try: launchctl bootstrap ${gui} ${path}`);
   console.log(`\nNext:  logs -> ${join(homedir(), ".browser-bridge", "server.log")}   |   curl -s http://127.0.0.1:8765/health`);
 }
 

@@ -14,7 +14,7 @@ import { registerTools } from "./tools.js";
 const PORT = Number(process.env.BRIDGE_PORT ?? 8765);
 const HOST = "127.0.0.1";
 
-// Single source of truth for the server version — read from package.json (../package.json
+// Single source of truth for the server version - read from package.json (../package.json
 // relative to the compiled dist/index.js) so it can't drift from the release number.
 const VERSION = (() => {
   try {

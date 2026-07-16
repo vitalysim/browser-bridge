@@ -7,15 +7,15 @@ const statusEl = document.getElementById("status") as HTMLDivElement;
 const STATUS_TEXT: Record<string, string> = {
   connected: "Connected to bridge server",
   connecting: "Connecting…",
-  disconnected: "Disconnected — is the server running?",
-  "no-token": "No token set — paste the server token below",
+  disconnected: "Disconnected - is the server running?",
+  "no-token": "No token set - paste the server token below",
 };
 
 async function refresh() {
   const { bbStatus, bbDetail } = await chrome.storage.local.get(["bbStatus", "bbDetail"]);
   const status = bbStatus ?? "unknown";
   statusEl.className = status;
-  statusEl.textContent = (STATUS_TEXT[status] ?? `status: ${status}`) + (bbDetail ? ` — ${bbDetail}` : "");
+  statusEl.textContent = (STATUS_TEXT[status] ?? `status: ${status}`) + (bbDetail ? ` - ${bbDetail}` : "");
 }
 
 async function load() {

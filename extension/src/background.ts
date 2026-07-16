@@ -1,6 +1,6 @@
 /// <reference types="chrome" />
 
-// Injected at build time by build.mjs (esbuild define) from extension/package.json — single
+// Injected at build time by build.mjs (esbuild define) from extension/package.json - single
 // source of truth shared with manifest.json, so the version can't drift.
 declare const __BB_VERSION__: string;
 const VERSION = __BB_VERSION__;
@@ -112,7 +112,7 @@ async function inject<T>(tab: chrome.tabs.Tab, func: (...args: any[]) => T, args
     args: clean(args),
   });
   const value = result?.result as any;
-  // Injected functions signal failure by RETURNING { error } — never by throwing, because
+  // Injected functions signal failure by RETURNING { error } - never by throwing, because
   // Chrome swallows exceptions thrown inside executeScript and resolves with null instead.
   if (value && typeof value === "object" && typeof value.error === "string") {
     throw new Error(value.error);
@@ -152,7 +152,7 @@ async function injectAllAggregate(tab: chrome.tabs.Tab, func: (...args: any[]) =
     acted = v;
   }
   if (acted) return acted;
-  throw new Error(stale ? "Ref matched an element that was since removed/re-rendered — take a fresh snapshot" : "Element not found in any frame — take a fresh snapshot");
+  throw new Error(stale ? "Ref matched an element that was since removed/re-rendered - take a fresh snapshot" : "Element not found in any frame - take a fresh snapshot");
 }
 
 // ---------- injected page functions ----------
@@ -229,7 +229,7 @@ function bbSnapshot(refOffset: number) {
   // Fresh ref registry each snapshot: ref (number) -> Element, kept on the frame's ISOLATED-world
   // global so a later click/fill/hover/type injection (same world) resolves the ref WITHOUT mutating
   // the page DOM. Reassign a new Map (never merge) so detached nodes from prior snapshots don't leak.
-  // INVARIANT: every ref locator must inject in the ISOLATED world — a MAIN-world locator sees a
+  // INVARIANT: every ref locator must inject in the ISOLATED world - a MAIN-world locator sees a
   // different `window` and would miss this registry.
   const bbRefs: Map<number, Element> = ((window as any).__bbRefs = new Map());
   let n = 0;
@@ -293,7 +293,7 @@ function bbInteract(action: string, ref: number | null, sel: string | null, valu
     }
     return null;
   };
-  // Resolve a ref via the ISOLATED-world registry (window.__bbRefs) that bbSnapshot builds —
+  // Resolve a ref via the ISOLATED-world registry (window.__bbRefs) that bbSnapshot builds -
   // no data-bb-ref DOM mutation. A ref that matched but whose element was since removed/re-rendered
   // returns {staleRef} so the caller retries with a fresh snapshot. CSS selectors still deep-find.
   let el: HTMLElement | null = null;
@@ -367,7 +367,7 @@ function bbInteract(action: string, ref: number | null, sel: string | null, valu
   if (action === "fill") {
     el.focus();
     if (el.isContentEditable) {
-      // rich editors (ProseMirror/Quill/Lit/React) require beforeinput — execCommand fires it
+      // rich editors (ProseMirror/Quill/Lit/React) require beforeinput - execCommand fires it
       try {
         document.execCommand("selectAll", false);
         document.execCommand("insertText", false, value ?? "");
@@ -434,7 +434,7 @@ function bbFileUpload(sel: string | null, ref: number | null, filename: string, 
     }
     return null;
   };
-  // Resolve a ref via the ISOLATED-world registry (window.__bbRefs) that bbSnapshot builds —
+  // Resolve a ref via the ISOLATED-world registry (window.__bbRefs) that bbSnapshot builds -
   // no data-bb-ref DOM mutation. A ref that matched but whose element was since removed/re-rendered
   // returns {staleRef} so the caller retries with a fresh snapshot. CSS selectors still deep-find.
   let el: HTMLElement | null = null;
@@ -494,7 +494,7 @@ function bbPasteImage(sel: string | null, ref: number | null, b64: string, mimeT
     }
     return null;
   };
-  // Resolve a ref via the ISOLATED-world registry (window.__bbRefs) that bbSnapshot builds —
+  // Resolve a ref via the ISOLATED-world registry (window.__bbRefs) that bbSnapshot builds -
   // no data-bb-ref DOM mutation. A ref that matched but whose element was since removed/re-rendered
   // returns {staleRef} so the caller retries with a fresh snapshot. CSS selectors still deep-find.
   let el: HTMLElement | null = null;
@@ -571,7 +571,7 @@ function bbPasteImage(sel: string | null, ref: number | null, b64: string, mimeT
 }
 
 // Locate an element (by data-bb-ref or CSS selector, piercing open shadow roots), scroll it into view,
-// and return its viewport-center coordinates — for the trusted (CDP Input) paste path.
+// and return its viewport-center coordinates - for the trusted (CDP Input) paste path.
 function bbLocate(sel: string | null, ref: number | null) {
   const deepFind = (pred: (e: Element) => boolean): HTMLElement | null => {
     const stack: (Document | ShadowRoot)[] = [document];
@@ -593,7 +593,7 @@ function bbLocate(sel: string | null, ref: number | null) {
     }
     return null;
   };
-  // Resolve a ref via the ISOLATED-world registry (window.__bbRefs) that bbSnapshot builds —
+  // Resolve a ref via the ISOLATED-world registry (window.__bbRefs) that bbSnapshot builds -
   // no data-bb-ref DOM mutation. A ref that matched but whose element was since removed/re-rendered
   // returns {staleRef} so the caller retries with a fresh snapshot. CSS selectors still deep-find.
   let el: HTMLElement | null = null;
@@ -676,14 +676,14 @@ function waitForComplete(tabId: number, timeoutMs = 20_000): Promise<void> {
         if (status === "complete") return finish();
         await sleep(150);
       }
-      finish(); // timeout ceiling — resolve anyway; caller can read a partial page
+      finish(); // timeout ceiling - resolve anyway; caller can read a partial page
     })();
   });
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-// Back/forward via the page's own history — chrome.tabs.goBack/goForward fail spuriously
+// Back/forward via the page's own history - chrome.tabs.goBack/goForward fail spuriously
 // ("Cannot find a next page in history") even when history exists. Polls for the URL change
 // so bfcache (instant) restores don't wait on a load-complete event that never fires.
 async function navByHistory(tab: chrome.tabs.Tab, direction: "back" | "forward"): Promise<any> {
@@ -888,7 +888,7 @@ async function detachSession(tabId: number): Promise<void> {
 function idleSweep() {
   const now = Date.now();
   for (const [tabId, s] of sessions) {
-    // Never idle-detach a tab that's actively doing work — a passive capture/intercept/log
+    // Never idle-detach a tab that's actively doing work - a passive capture/intercept/log
     // session bumps lastUsedAt only on tool calls, so it would otherwise be torn down (banner
     // gone, buffer lost) after 5 min of no calls. One-shot debugger use (trusted click, deep
     // snapshot, screenshot) leaves these flags off, so its banner still auto-cleans.
@@ -1066,7 +1066,7 @@ function flushCapture(s: Session, tabId: number, done = false) {
     try {
       ws.send(JSON.stringify({ type: "capture", tabId, entries, done }));
     } catch {
-      /* socket write failed — entries dropped (best-effort durability) */
+      /* socket write failed - entries dropped (best-effort durability) */
     }
   }
 }
@@ -1079,7 +1079,7 @@ function finalizeCapture(tabId: number) {
   flushCapture(s, tabId, true);
 }
 
-// scheme + host only, no path/query/fragment — for compact tab listings where the path may carry
+// scheme + host only, no path/query/fragment - for compact tab listings where the path may carry
 // opaque ids (mail item ids, doc tokens) that shouldn't be echoed unnecessarily.
 function safeOrigin(url: string | undefined): string {
   if (!url) return "";
@@ -1152,7 +1152,7 @@ async function doReplay(tab: chrome.tabs.Tab, params: any): Promise<any> {
     credentials = "omit";
   } else if (params.identity) {
     const id = identities.get(params.identity);
-    if (!id) throw new Error(`identity '${params.identity}' not captured — call identity_capture first`);
+    if (!id) throw new Error(`identity '${params.identity}' not captured - call identity_capture first`);
     if (id.bearer) {
       headers["authorization"] = id.bearer;
       credentials = "omit";
@@ -1394,7 +1394,7 @@ async function doFuzz(_tab: chrome.tabs.Tab, params: any): Promise<any> {
       body: tmpl.body != null ? applySubs(tmpl.body, subs) : params.body != null ? applySubs(params.body, subs) : undefined,
     };
   };
-  // Build the job list — each job = a set of marker→value substitutions + a display label.
+  // Build the job list - each job = a set of marker→value substitutions + a display label.
   const jobs: { subs: [string, string][]; label: string }[] = [];
   if (fuzzMode === "sniper") {
     const marker = params.marker || "§";
@@ -1421,7 +1421,7 @@ async function doFuzz(_tab: chrome.tabs.Tab, params: any): Promise<any> {
         const next: string[][] = [];
         for (const c of combos) for (const v of sets[j]) next.push([...c, String(v)]);
         combos = next;
-        if (combos.length > 4096) throw new Error("clusterbomb: >4096 combinations — reduce payload sets");
+        if (combos.length > 4096) throw new Error("clusterbomb: >4096 combinations - reduce payload sets");
       }
       for (const c of combos) {
         const subs = mk.map((m, j) => [m, c[j]] as [string, string]);
@@ -1515,14 +1515,14 @@ async function cdpResolveByRef(tabId: number, ref: number): Promise<number> {
   const s = sessions.get(tabId);
   if (ref < DEEP_REF_BASE) {
     throw new Error(
-      `ref ${ref} is from a plain snapshot() call, not snapshot({deep:true}) — trusted actions require a ref from a deep snapshot. Take a fresh snapshot with deep:true and use the ref it returns.`
+      `ref ${ref} is from a plain snapshot() call, not snapshot({deep:true}) - trusted actions require a ref from a deep snapshot. Take a fresh snapshot with deep:true and use the ref it returns.`
     );
   }
   const backendNodeId = s?.refNodes.get(ref);
-  if (!backendNodeId) throw new Error(`ref ${ref} is not in the current deep snapshot for this tab (it may be from an older, since-replaced snapshot) — take a fresh snapshot with deep:true`);
+  if (!backendNodeId) throw new Error(`ref ${ref} is not in the current deep snapshot for this tab (it may be from an older, since-replaced snapshot) - take a fresh snapshot with deep:true`);
   const { nodeIds } = await cmd(tabId, "DOM.pushNodesByBackendIdsToFrontend", { backendNodeIds: [backendNodeId] });
   const nodeId = nodeIds?.[0];
-  if (!nodeId) throw new Error(`ref ${ref} node is gone — take a fresh snapshot`);
+  if (!nodeId) throw new Error(`ref ${ref} node is gone - take a fresh snapshot`);
   return nodeId;
 }
 
@@ -1613,12 +1613,12 @@ async function cdpScreenshot(tab: chrome.tabs.Tab, params: any): Promise<any> {
 
   let data = await capture(format, quality);
   let outFormat = format;
-  // Large PNGs can exceed chrome.debugger's result-size limit and come back empty — fall back to JPEG.
+  // Large PNGs can exceed chrome.debugger's result-size limit and come back empty - fall back to JPEG.
   if (!data && format === "png") {
     data = await capture("jpeg", 92);
     outFormat = "jpeg";
   }
-  if (!data) throw new Error("Screenshot returned empty — the page may be too large; try a smaller scale, a selector, or format:'jpeg'.");
+  if (!data) throw new Error("Screenshot returned empty - the page may be too large; try a smaller scale, a selector, or format:'jpeg'.");
   return { base64: data, format: outFormat, fellBackToJpeg: outFormat !== format || undefined };
 }
 
@@ -1636,12 +1636,12 @@ async function trustedPasteImage(tab: chrome.tabs.Tab, params: any): Promise<any
     const origin = new URL(tab.url!).origin;
     await cmd(tabId, "Browser.grantPermissions", { origin, permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"] });
   } catch {
-    /* not fatal — the trusted click below provides user activation */
+    /* not fatal - the trusted click below provides user activation */
   }
 
   // find the target element's on-screen center (CSP-safe function injection; handles plain refs + shadow)
   const loc = await inject(tab, bbLocate, [params.selector ?? null, params.ref ?? null]);
-  if (!loc || loc.notFound || loc.staleRef) throw new Error("Target not found (or since re-rendered) for trusted paste — take a fresh snapshot or check the selector.");
+  if (!loc || loc.notFound || loc.staleRef) throw new Error("Target not found (or since re-rendered) for trusted paste - take a fresh snapshot or check the selector.");
   await sleep(150);
 
   // trusted click → focuses the field + grants user activation for the clipboard write
@@ -1654,7 +1654,7 @@ async function trustedPasteImage(tab: chrome.tabs.Tab, params: any): Promise<any
   const w = await inject(tab, bbClipboardWriteImage, [params.base64, params.mimeType ?? "image/png"], "MAIN");
   if (!w || w.error) {
     throw new Error(
-      `Clipboard write failed: ${w?.error ?? "unknown"}. The browser window must be focused/frontmost — bring Chrome to the foreground and retry.`
+      `Clipboard write failed: ${w?.error ?? "unknown"}. The browser window must be focused/frontmost - bring Chrome to the foreground and retry.`
     );
   }
   await sleep(120);
@@ -1803,7 +1803,7 @@ async function withSnapshotIfRequested(tab: chrome.tabs.Tab, params: any, result
 // Retries while the element is missing or transiently not-actionable (hidden/disabled) up to
 // params.timeoutMs (default 5000). For click, if the target is COVERED by an overlay, it escalates
 // to a real trusted CDP click (unless noEscalate/autoTrusted:false), which scrolls it into view and
-// clicks the real coordinates — reporting via:"trusted". Structured {notActionable, reason} otherwise.
+// clicks the real coordinates - reporting via:"trusted". Structured {notActionable, reason} otherwise.
 async function interact(tab: chrome.tabs.Tab, action: string, ref: number | null, sel: string | null, value: string | null, params: any): Promise<any> {
   const timeoutMs = params.timeoutMs ?? 5000;
   const deadline = Date.now() + timeoutMs;
@@ -1814,7 +1814,7 @@ async function interact(tab: chrome.tabs.Tab, action: string, ref: number | null
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (/not found in any frame|removed\/re-rendered/i.test(msg)) last = { notFound: true };
-      else throw e; // real error (e.g. "not fillable") — surface it
+      else throw e; // real error (e.g. "not fillable") - surface it
     }
     const retryable = last && (last.notFound || (last.notActionable && last.reason !== "covered"));
     if (!retryable || Date.now() >= deadline) break;
@@ -1825,7 +1825,7 @@ async function interact(tab: chrome.tabs.Tab, action: string, ref: number | null
       const t = await trustedAction(tab.id!, "click", ref, sel);
       return { ...t, via: "trusted", wasCovered: true, coveredBy: last.coveredBy };
     } catch {
-      return last; // trusted also failed — report the covered state
+      return last; // trusted also failed - report the covered state
     }
   }
   if (last?.notFound) return { notActionable: true, reason: `not-found-after-${timeoutMs}ms`, ref, selector: sel };
@@ -1992,7 +1992,7 @@ async function dispatch(method: string, params: any): Promise<any> {
     case "net_get_requests": {
       const tab = await targetTab(params.tabId);
       const s = sessions.get(tab.id!);
-      if (!s) throw new Error("Not capturing on this tab — call net_capture_start first.");
+      if (!s) throw new Error("Not capturing on this tab - call net_capture_start first.");
       s.lastUsedAt = Date.now();
       const filter: string | undefined = params.urlFilter;
       let entries = s.net.filter((e) => !filter || (e.url ?? "").includes(filter));
@@ -2033,7 +2033,7 @@ async function dispatch(method: string, params: any): Promise<any> {
     case "net_get_body": {
       const tab = await targetTab(params.tabId);
       const s = sessions.get(tab.id!);
-      if (!s) throw new Error("Not capturing on this tab — call net_capture_start first.");
+      if (!s) throw new Error("Not capturing on this tab - call net_capture_start first.");
       s.lastUsedAt = Date.now();
       const b = await getResponseBody(tab.id!, params.requestId);
       return { requestId: params.requestId, base64: b.base64, body: b.body };
@@ -2042,7 +2042,7 @@ async function dispatch(method: string, params: any): Promise<any> {
     case "net_get_ws_frames": {
       const tab = await targetTab(params.tabId);
       const s = sessions.get(tab.id!);
-      if (!s) throw new Error("Not capturing on this tab — call net_capture_start first.");
+      if (!s) throw new Error("Not capturing on this tab - call net_capture_start first.");
       s.lastUsedAt = Date.now();
       const filter: string | undefined = params.urlFilter;
       let frames = s.wsFrames.filter((f) => !filter || (f.url ?? "").includes(filter));
@@ -2253,7 +2253,7 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "eval_js": {
       const tab = await targetTab(params.tabId);
-      // Force the CDP path (Runtime.evaluate) — bypasses CSP unsafe-eval; shows the debugger banner.
+      // Force the CDP path (Runtime.evaluate) - bypasses CSP unsafe-eval; shows the debugger banner.
       if (params.cdp) return cdpEvaluate(tab.id!, params.code, params.awaitPromise ?? true);
       try {
         return await inject(
@@ -2393,7 +2393,7 @@ async function dispatch(method: string, params: any): Promise<any> {
     case "intercept_resolve": {
       const tab = await targetTab(params.tabId);
       const s = sessions.get(tab.id!);
-      if (!s || !s.interceptOn) throw new Error("Interception is not active on this tab — call intercept_start first");
+      if (!s || !s.interceptOn) throw new Error("Interception is not active on this tab - call intercept_start first");
       const ids: string[] = params.requestId ? [params.requestId] : params.all ? [...s.paused.keys()] : [];
       if (!ids.length) throw new Error("Provide a requestId (from intercept_pending), or all:true to release everything");
       const done: any[] = [];
@@ -2442,7 +2442,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       return doFuzz(tab, params);
     }
 
-    // ---- cookies (chrome.cookies — real flags incl. HttpOnly) ----
+    // ---- cookies (chrome.cookies - real flags incl. HttpOnly) ----
     case "cookies_get": {
       const query: chrome.cookies.GetAllDetails = {};
       if (params.url) query.url = params.url;
