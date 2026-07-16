@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 340" width="1200" height="340" role="img" aria-label="Browser Bridge — drive your real, logged-in Chrome from an AI agent">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b0b0d"/>
+      <stop offset="0.55" stop-color="#161619"/>
+      <stop offset="1" stop-color="#0d0d10"/>
+    </linearGradient>
+    <linearGradient id="wm" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#c7c7d0"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.26" cy="0.34" r="0.72">
+      <stop offset="0" stop-color="#3c3c45" stop-opacity="0.5"/>
+      <stop offset="1" stop-color="#3c3c45" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- card -->
+  <rect x="0" y="0" width="1200" height="340" rx="18" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1200" height="340" rx="18" fill="url(#glow)"/>
+  <rect x="0.75" y="0.75" width="1198.5" height="338.5" rx="17.25" fill="none" stroke="#2a2a31" stroke-width="1.5"/>
+
+  <!-- suspension-bridge motif (subtle, right side; its own space, no text overlap) -->
+  <g stroke="#52525b" stroke-width="2" fill="none" opacity="0.5" stroke-linecap="round">
+    <path d="M 838 250 L 1138 250"/>
+    <path d="M 918 250 L 918 100"/>
+    <path d="M 1058 250 L 1058 100"/>
+    <path d="M 838 206 Q 878 100 918 100 Q 968 100 988 178 Q 1008 100 1058 100 Q 1098 100 1138 206"/>
+    <g stroke-width="1.4" opacity="0.85">
+      <path d="M 868 150 L 868 250"/>
+      <path d="M 918 100 L 918 250"/>
+      <path d="M 953 128 L 953 250"/>
+      <path d="M 988 178 L 988 250"/>
+      <path d="M 1023 128 L 1023 250"/>
+      <path d="M 1058 100 L 1058 250"/>
+      <path d="M 1108 150 L 1108 250"/>
+    </g>
+  </g>
+
+  <!-- eyebrow -->
+  <text x="78" y="86" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" letter-spacing="4" font-weight="600" fill="#8a8a93">MODEL CONTEXT PROTOCOL &#160;·&#160; CHROME MV3 EXTENSION</text>
+
+  <!-- wordmark -->
+  <text x="76" y="188" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="82" font-weight="800" letter-spacing="-2" fill="url(#wm)">Browser Bridge</text>
+
+  <!-- tagline -->
+  <text x="80" y="236" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="25" font-weight="400" fill="#a8a8b2">Drive your real, logged-in Chrome from an AI agent.</text>
+
+  <!-- connective line -->
+  <text x="80" y="280" font-family="ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace" font-size="17" letter-spacing="0.3" fill="#6b6b75">Claude Code · Codex &#160;&#8596;&#160; your real browser &#160;·&#160; 55 tools</text>
+</svg>
