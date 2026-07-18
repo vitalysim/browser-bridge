@@ -199,12 +199,23 @@ function bbStorage(op: string, area: string | null, key: string | null, value: s
   }
 }
 
-function bbPageText() {
-  return {
-    title: document.title,
-    url: location.href,
-    text: (document.body?.innerText ?? "").replace(/\n{3,}/g, "\n\n"),
-  };
+function bbPageText(includeHidden: boolean) {
+  let text: string;
+  if (includeHidden && document.body) {
+    // textContent (on a script/style-stripped clone) includes display:none / collapsed content that
+    // innerText drops — e.g. un-expanded accordion bodies. Loses block-level line breaks; that's fine,
+    // the point is to surface hidden-but-present DOM text.
+    const clone = document.body.cloneNode(true) as HTMLElement;
+    clone.querySelectorAll("script,style,noscript,template").forEach((e) => e.remove());
+    text = (clone.textContent ?? "")
+      .replace(/[ \t]+/g, " ")
+      .replace(/[ \t]*\n[ \t]*/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  } else {
+    text = (document.body?.innerText ?? "").replace(/\n{3,}/g, "\n\n");
+  }
+  return { title: document.title, url: location.href, text };
 }
 
 function bbSnapshot(refOffset: number) {
@@ -1546,6 +1557,30 @@ async function cdpResolve(tabId: number, ref: number | null, selector: string | 
 
 const SHOT_MAX_PX = 16384; // Chrome's per-dimension surface limit
 
+// Viewport + visibility metadata for a screenshot: the dpr (to map screenshot device-pixels → CSS
+// input coords), the CSS viewport size (the input coordinate bounds), and whether the tab is actually
+// visible — a hidden tab has its compositor throttled, so captures look stale (mistaken for dropped input).
+async function viewportMeta(tab: chrome.tabs.Tab): Promise<any> {
+  try {
+    const v: any = await inject(tab, () => ({
+      dpr: window.devicePixelRatio || 1,
+      cssWidth: window.innerWidth,
+      cssHeight: window.innerHeight,
+      visibilityState: document.visibilityState,
+      hidden: document.hidden,
+      hasFocus: document.hasFocus(),
+    }), []);
+    if (v && v.hidden) {
+      v.warning =
+        "Tab is hidden/occluded - the compositor may be throttling its frames, so this capture can be stale " +
+        "(looks like dropped input). Input still lands; activate the tab (tab_activate) for a live frame.";
+    }
+    return v ?? {};
+  } catch {
+    return {};
+  }
+}
+
 // Full-page / high-DPI / element screenshot via CDP Page.captureScreenshot (shows the debugger banner).
 // `scale` is the FINAL output multiplier over CSS pixels (default 1 = CSS-resolution; 2 = retina).
 // CDP's clip.scale multiplies on top of the display's device pixel ratio, so we divide the DPR out to
@@ -1573,6 +1608,9 @@ async function cdpScreenshot(tab: chrome.tabs.Tab, params: any): Promise<any> {
       sx: window.scrollX,
       sy: window.scrollY,
       dpr: window.devicePixelRatio || 1,
+      vis: document.visibilityState,
+      hidden: document.hidden,
+      focus: document.hasFocus(),
     }),
     [],
     "MAIN"
@@ -1619,7 +1657,18 @@ async function cdpScreenshot(tab: chrome.tabs.Tab, params: any): Promise<any> {
     outFormat = "jpeg";
   }
   if (!data) throw new Error("Screenshot returned empty - the page may be too large; try a smaller scale, a selector, or format:'jpeg'.");
-  return { base64: data, format: outFormat, fellBackToJpeg: outFormat !== format || undefined };
+  return {
+    base64: data,
+    format: outFormat,
+    fellBackToJpeg: outFormat !== format || undefined,
+    dpr: pd.dpr,
+    cssWidth: pd.iw,
+    cssHeight: pd.ih,
+    visibilityState: pd.vis,
+    hidden: pd.hidden,
+    hasFocus: pd.focus,
+    ...(pd.hidden ? { warning: "Tab is hidden/occluded - frames may be throttled; this capture can be stale." } : {}),
+  };
 }
 
 // Trusted image paste (chrome.debugger): put the image on the real OS clipboard and send a TRUSTED
@@ -1691,6 +1740,135 @@ async function trustedAction(tabId: number, action: string, ref: number | null, 
     return { clicked: true, trusted: true, x, y };
   }
   throw new Error(`Unknown trusted action: ${action}`);
+}
+
+// ---- coordinate-level trusted input (CDP Input) — for canvas / remote-desktop / game targets ----
+// Coords are CSS VIEWPORT pixels (top-left origin). Screenshots are device pixels, so map with the
+// dpr the screenshot tool returns: inputCoord = screenshotPixel / dpr.
+const CDP_MODS: Record<string, number> = { alt: 1, option: 1, ctrl: 2, control: 2, meta: 4, cmd: 4, command: 4, super: 4, win: 4, shift: 8 };
+
+// Resolve a key name ("Enter", "ArrowUp", "c", "F5") → { key, code, vk } for CDP Input.dispatchKeyEvent.
+function keyInfo(name: string): { key: string; code: string; vk: number } {
+  const named: Record<string, [string, string, number]> = {
+    enter: ["Enter", "Enter", 13], return: ["Enter", "Enter", 13],
+    tab: ["Tab", "Tab", 9], escape: ["Escape", "Escape", 27], esc: ["Escape", "Escape", 27],
+    backspace: ["Backspace", "Backspace", 8], delete: ["Delete", "Delete", 46], del: ["Delete", "Delete", 46],
+    space: [" ", "Space", 32], spacebar: [" ", "Space", 32],
+    up: ["ArrowUp", "ArrowUp", 38], arrowup: ["ArrowUp", "ArrowUp", 38],
+    down: ["ArrowDown", "ArrowDown", 40], arrowdown: ["ArrowDown", "ArrowDown", 40],
+    left: ["ArrowLeft", "ArrowLeft", 37], arrowleft: ["ArrowLeft", "ArrowLeft", 37],
+    right: ["ArrowRight", "ArrowRight", 39], arrowright: ["ArrowRight", "ArrowRight", 39],
+    home: ["Home", "Home", 36], end: ["End", "End", 35],
+    pageup: ["PageUp", "PageUp", 33], pagedown: ["PageDown", "PageDown", 34],
+    insert: ["Insert", "Insert", 45], ins: ["Insert", "Insert", 45],
+  };
+  const lk = name.toLowerCase();
+  if (named[lk]) return { key: named[lk][0], code: named[lk][1], vk: named[lk][2] };
+  const fm = /^f([1-9]|1[0-2])$/i.exec(name);
+  if (fm) { const n = Number(fm[1]); return { key: "F" + n, code: "F" + n, vk: 111 + n }; }
+  if (name.length === 1) {
+    const ch = name;
+    const up = ch.toUpperCase();
+    if (/[a-z]/i.test(ch)) return { key: ch, code: "Key" + up, vk: up.charCodeAt(0) };
+    if (/[0-9]/.test(ch)) return { key: ch, code: "Digit" + ch, vk: ch.charCodeAt(0) };
+    return { key: ch, code: "", vk: up.charCodeAt(0) };
+  }
+  return { key: name, code: "", vk: 0 };
+}
+
+async function cdpInput(tabId: number, params: any): Promise<any> {
+  const action: string = params.action;
+  if (params.activate) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      await chrome.tabs.update(tabId, { active: true });
+      await chrome.windows.update(tab.windowId!, { focused: true }).catch(() => {});
+      await sleep(150);
+    } catch {
+      /* activation best-effort */
+    }
+  }
+  await ensureAttached(tabId);
+  const x = params.x, y = params.y;
+  const needsXY = ["mouse_move", "left_click", "right_click", "middle_click", "double_click", "left_mouse_down", "left_mouse_up", "scroll", "left_click_drag"];
+  if (needsXY.includes(action) && (typeof x !== "number" || typeof y !== "number")) {
+    throw new Error(`input action '${action}' needs numeric x and y (CSS viewport pixels; divide screenshot pixels by dpr)`);
+  }
+
+  if (action === "mouse_move") {
+    await cmd(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, buttons: 0 });
+    return { moved: true, x, y };
+  }
+  if (action === "left_click" || action === "right_click" || action === "middle_click" || action === "double_click") {
+    const button = action === "right_click" ? "right" : action === "middle_click" ? "middle" : "left";
+    const mask = button === "right" ? 2 : button === "middle" ? 4 : 1;
+    const count = action === "double_click" ? 2 : Math.max(1, params.clickCount ?? 1);
+    await cmd(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, buttons: 0 });
+    for (let c = 1; c <= count; c++) {
+      await cmd(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button, buttons: mask, clickCount: c });
+      await cmd(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button, buttons: 0, clickCount: c });
+    }
+    return { clicked: action, x, y, clickCount: count };
+  }
+  if (action === "left_mouse_down") {
+    await cmd(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
+    return { down: true, x, y };
+  }
+  if (action === "left_mouse_up") {
+    await cmd(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
+    return { up: true, x, y };
+  }
+  if (action === "left_click_drag") {
+    const x2 = params.x2, y2 = params.y2;
+    if (typeof x2 !== "number" || typeof y2 !== "number") throw new Error("left_click_drag needs x2 and y2 (drag end, CSS px)");
+    await cmd(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, buttons: 0 });
+    await cmd(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
+    const steps = 12;
+    for (let i = 1; i <= steps; i++) {
+      await cmd(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: x + ((x2 - x) * i) / steps, y: y + ((y2 - y) * i) / steps, button: "left", buttons: 1 });
+      await sleep(12);
+    }
+    await cmd(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: x2, y: y2, button: "left", buttons: 0, clickCount: 1 });
+    return { dragged: true, from: [x, y], to: [x2, y2] };
+  }
+  if (action === "scroll") {
+    const dx = params.dx ?? 0, dy = params.dy ?? 0;
+    await cmd(tabId, "Input.dispatchMouseEvent", { type: "mouseWheel", x, y, deltaX: dx, deltaY: dy });
+    return { scrolled: true, x, y, dx, dy };
+  }
+  if (action === "type") {
+    const text = String(params.text ?? "");
+    for (const ch of Array.from(text)) {
+      await cmd(tabId, "Input.dispatchKeyEvent", { type: "keyDown", text: ch, unmodifiedText: ch, key: ch });
+      await cmd(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: ch });
+      await sleep(8);
+    }
+    return { typed: text.length };
+  }
+  if (action === "key") {
+    const combo = String(params.key ?? "");
+    if (!combo && !params.code) throw new Error("input action 'key' needs a key (e.g. 'Enter', 'ctrl+c') or an explicit code");
+    let mods = 0;
+    let base = "";
+    for (const p of combo.split("+").map((s) => s.trim()).filter(Boolean)) {
+      const lk = p.toLowerCase();
+      if (CDP_MODS[lk] !== undefined) mods |= CDP_MODS[lk];
+      else base = p;
+    }
+    const info = base ? keyInfo(base) : { key: "", code: "", vk: 0 };
+    const key = info.key;
+    const code = params.code ?? info.code;
+    const vk = params.keyCode ?? info.vk;
+    // printable single char with only Shift (or no) modifier → send text so the char inputs
+    const printable = key.length === 1 && (mods & ~8) === 0;
+    const common = { key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers: mods } as any;
+    const down: any = { ...common, type: printable ? "keyDown" : "rawKeyDown" };
+    if (printable) { down.text = mods & 8 ? key.toUpperCase() : key; down.unmodifiedText = key; }
+    await cmd(tabId, "Input.dispatchKeyEvent", down);
+    await cmd(tabId, "Input.dispatchKeyEvent", { ...common, type: "keyUp" });
+    return { key: combo || code, modifiers: mods };
+  }
+  throw new Error(`Unknown input action: ${action} (mouse_move|left_click|right_click|middle_click|double_click|left_mouse_down|left_mouse_up|left_click_drag|scroll|type|key)`);
 }
 
 // CDP deep snapshot: walks the pierced DOM tree (incl. CLOSED shadow roots and iframe docs),
@@ -1882,7 +2060,7 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "get_page_text": {
       const tab = await targetTab(params.tabId);
-      const results = await injectAllFrames(tab, bbPageText);
+      const results = await injectAllFrames(tab, bbPageText, [!!params.includeHidden]);
       const top = results.find((r) => r.frameId === 0)?.result as any;
       let combined = "";
       for (const r of results) {
@@ -1928,6 +2106,11 @@ async function dispatch(method: string, params: any): Promise<any> {
         ? await trustedAction(tab.id!, "type", params.ref, params.selector, params.text)
         : await interact(tab, "type", params.ref, params.selector, params.text ?? null, params);
       return withSnapshotIfRequested(tab, params, result);
+    }
+
+    case "input": {
+      const tab = await targetTab(params.tabId);
+      return cdpInput(tab.id!, params);
     }
 
     case "file_upload": {
@@ -2248,7 +2431,8 @@ async function dispatch(method: string, params: any): Promise<any> {
       await chrome.windows.update(tab.windowId!, { focused: true });
       await sleep(350);
       const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId!, { format: "png" });
-      return { base64: dataUrl.replace(/^data:image\/png;base64,/, ""), format: "png" };
+      const meta = await viewportMeta(tab);
+      return { base64: dataUrl.replace(/^data:image\/png;base64,/, ""), format: "png", ...meta };
     }
 
     case "eval_js": {

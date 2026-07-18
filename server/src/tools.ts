@@ -122,10 +122,13 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
 
   tool(
     "get_page_text",
-    "Get the visible text content of a page (title, url, and rendered body text). " +
-      "This is the primary tool for reading pages, e.g. summarizing a feed.",
-    { tabId: tabIdParam },
-    async ({ tabId }) => textResult(await hub.call("get_page_text", { tabId }))
+    "Get the visible text content of a page (title, url, and rendered body text). The primary tool for reading " +
+      "pages, e.g. summarizing a feed. Reads `innerText` (rendered text) by default, which OMITS `display:none` / " +
+      "collapsed content (e.g. un-expanded accordion bodies). Set includeHidden:true to read `textContent` instead, " +
+      "capturing hidden-but-present DOM (loses some block line breaks). Truly virtualized/unmounted content still " +
+      "needs a scroll/expand first.",
+    { tabId: tabIdParam, includeHidden: z.boolean().optional().describe("Include display:none/collapsed text via textContent (default false = rendered innerText only)") },
+    async ({ tabId, includeHidden }) => textResult(await hub.call("get_page_text", { tabId, includeHidden }))
   );
 
   tool(
@@ -228,6 +231,44 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       "Note: events are synthetic; some sites ignore them.",
     { key: z.string().describe("Key value, e.g. 'Enter'"), withSnapshot: withSnapshotParam, tabId: tabIdParam },
     async ({ key, withSnapshot, tabId }) => textResult(await hub.call("press_key", { key, withSnapshot, tabId }))
+  );
+
+  tool(
+    "input",
+    "Raw COORDINATE-level trusted input via CDP Input - for targets the element-based click/fill/type can't reach: " +
+      "a <canvas> remote desktop (VNC/RDP/Amazon DCV), a game, a WebGL/drawing app. Coordinates are CSS VIEWPORT " +
+      "pixels (top-left origin); since screenshots are DEVICE pixels, map them with the dpr the screenshot tool " +
+      "returns: inputCoord = screenshotPixel / dpr. Trusted (isTrusted) events via chrome.debugger, so it shows the " +
+      "banner. Actions: mouse_move · left_click/right_click/middle_click · double_click · left_mouse_down/left_mouse_up " +
+      "(held drags) · left_click_drag (x,y → x2,y2) · scroll (dx/dy at x,y) · type (per-char keystrokes to the FOCUSED " +
+      "element - click the field/canvas first) · key (a key or combo like 'Enter', 'Escape', 'ctrl+c', 'ctrl+shift+k'). " +
+      "NOTE: input is delivered even when the tab is backgrounded, but its frame is throttled then so you can't OBSERVE " +
+      "the result - use activate:true (or tab_activate) to foreground it. For ordinary DOM, prefer click/fill/type.",
+    {
+      action: z
+        .enum(["mouse_move", "left_click", "right_click", "middle_click", "double_click", "left_mouse_down", "left_mouse_up", "left_click_drag", "scroll", "type", "key"])
+        .describe("The input action"),
+      x: z.number().optional().describe("X in CSS viewport pixels (required for mouse actions)"),
+      y: z.number().optional().describe("Y in CSS viewport pixels (required for mouse actions)"),
+      x2: z.number().optional().describe("Drag end X (left_click_drag)"),
+      y2: z.number().optional().describe("Drag end Y (left_click_drag)"),
+      dx: z.number().optional().describe("Horizontal wheel delta (scroll)"),
+      dy: z.number().optional().describe("Vertical wheel delta (scroll; negative = up)"),
+      text: z.string().optional().describe("Text to type char-by-char into the focused element (action:type)"),
+      key: z.string().optional().describe("Key or combo (action:key), e.g. 'Enter', 'Escape', 'ArrowUp', 'ctrl+c'"),
+      code: z.string().optional().describe("Explicit CDP key code escape hatch, e.g. 'KeyC' (with action:key)"),
+      keyCode: z.number().optional().describe("Explicit Windows virtual key code escape hatch (with action:key)"),
+      clickCount: z.number().optional().describe("Click count for a click action (default 1)"),
+      activate: z.boolean().optional().describe("Foreground the tab first so you can observe the result (default false)"),
+      tabId: tabIdParam,
+    },
+    async (args) => {
+      if (["mouse_move", "left_click", "right_click", "middle_click", "double_click", "left_mouse_down", "left_mouse_up", "scroll", "left_click_drag"].includes(args.action) && (args.x === undefined || args.y === undefined))
+        throw new Error(`input action '${args.action}' requires x and y (CSS viewport pixels)`);
+      if (args.action === "type" && args.text === undefined) throw new Error("input action 'type' requires text");
+      if (args.action === "key" && !args.key && !args.code) throw new Error("input action 'key' requires key or code");
+      return textResult(await hub.call("input", args, 120_000));
+    }
   );
 
   tool(
@@ -334,14 +375,21 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       const buf = Buffer.from(r.base64, "base64");
       const dims = imageDims(buf);
       const mimeType = r.format === "jpeg" ? ("image/jpeg" as const) : ("image/png" as const);
+      // Viewport/visibility metadata: dpr maps screenshot device-pixels → CSS input coords
+      // (inputCoord = screenshotPixel / dpr); visibilityState + warning flag a throttled/stale frame.
+      const view = { dpr: r.dpr, cssWidth: r.cssWidth, cssHeight: r.cssHeight, visibilityState: r.visibilityState, hidden: r.hidden, hasFocus: r.hasFocus };
       if (savePath) {
         writeFileSync(savePath, buf);
-        return textResult({ path: savePath, bytes: buf.length, width: dims?.width, height: dims?.height, format: r.format });
+        return textResult({ path: savePath, bytes: buf.length, width: dims?.width, height: dims?.height, format: r.format, ...view, warning: r.warning });
       }
+      const meta =
+        `${dims?.width ?? "?"}×${dims?.height ?? "?"} ${r.format}, ${buf.length} bytes` +
+        (r.dpr ? ` · dpr ${r.dpr} · css ${r.cssWidth}×${r.cssHeight} · ${r.visibilityState}` : "") +
+        (r.warning ? `\n⚠ ${r.warning}` : "");
       return {
         content: [
           { type: "image" as const, data: r.base64, mimeType },
-          { type: "text" as const, text: `${dims?.width ?? "?"}×${dims?.height ?? "?"} ${r.format}, ${buf.length} bytes` },
+          { type: "text" as const, text: meta },
         ],
       };
     }
@@ -413,9 +461,10 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       cdp: z.boolean().optional().describe("Force the CDP Runtime.evaluate path (bypasses CSP; shows the banner)"),
       noFallback: z.boolean().optional().describe("Do not fall back to CDP if the page CSP blocks in-page eval"),
       awaitPromise: z.boolean().optional().describe("Await a returned Promise (default true)"),
+      timeoutMs: z.number().optional().describe("Max time to wait for the result (default 30000). Raise it if the code awaits/polls for longer than 30s."),
       tabId: tabIdParam,
     },
-    async (args) => textResult(await hub.call("eval_js", args))
+    async (args) => textResult(await hub.call("eval_js", args, args.timeoutMs ?? 30_000))
   );
 
   tool(
@@ -430,9 +479,10 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     {
       code: z.string().describe("JavaScript to evaluate (expression or statements) in the page's main world"),
       awaitPromise: z.boolean().optional().describe("Await a returned Promise (default true)"),
+      timeoutMs: z.number().optional().describe("Max time to wait for the result (default 30000). Raise it for a long await/poll inside the evaluated code (the fixed 30s cap otherwise kills it)."),
       tabId: tabIdParam,
     },
-    async (args) => textResult(await hub.call("cdp_eval", args))
+    async (args) => textResult(await hub.call("cdp_eval", args, args.timeoutMs ?? 30_000))
   );
 
   tool(

@@ -8,8 +8,8 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.7.0-3f3f46?style=flat-square">
-  <img alt="tools" src="https://img.shields.io/badge/tools-55-3f3f46?style=flat-square">
+  <img alt="version" src="https://img.shields.io/badge/version-0.8.0-3f3f46?style=flat-square">
+  <img alt="tools" src="https://img.shields.io/badge/tools-56-3f3f46?style=flat-square">
   <img alt="protocol" src="https://img.shields.io/badge/MCP-streamable_HTTP-52525b?style=flat-square">
   <img alt="browser" src="https://img.shields.io/badge/Chrome%2FEdge-Manifest_V3-52525b?style=flat-square">
   <img alt="language" src="https://img.shields.io/badge/TypeScript-strict-3178c6?style=flat-square">
@@ -19,7 +19,7 @@
 
 Browser Bridge is a local **MCP server + Manifest V3 Chrome extension** that lets AI coding agents - **Claude Code** and **OpenAI Codex CLI** - control the Chrome you use every day. Because it runs *inside* your real profile, the agent inherits your cookies, `HttpOnly` sessions, SSO, and 2FA state automatically. Ask it to *"read my feed and summarize it"* or *"capture the API traffic on this page and show me the responses"* - and it works against the live, authenticated app.
 
-It ships **55 tools** spanning everyday browsing, DevTools-grade network capture, and a full web-security testing toolkit.
+It ships **56 tools** spanning everyday browsing, DevTools-grade network capture, and a full web-security testing toolkit.
 
 ## Contents
 
@@ -97,6 +97,9 @@ start a network capture on this tab, reload it, and show me the JSON API respons
 # Web-security (authorized targets only)
 capture identity "A" for app.example.com, then log in as B and capture "B";
 replay the invoices request as A, B and anon and show me the authz_matrix
+
+# Remote desktop / canvas (e.g. a CTF AttackBox)
+screenshot the DCV desktop, click the terminal, type "id" and press Enter, then screenshot the output
 ```
 
 Both Claude Code and Codex drive the same live browser through the same endpoint.
@@ -109,7 +112,7 @@ Both Claude Code and Codex drive the same live browser through the same endpoint
 
 ## Features & tools
 
-- **Browse & interact** - tabs, navigation, and click / fill / hover / type / scroll with **auto-wait actionability** (found + visible + enabled, auto-escalating to a trusted CDP click when a target is overlay-covered), plus file and image upload - all reaching **into iframes (incl. cross-origin) and open shadow DOM**.
+- **Browse & interact** - tabs, navigation, and click / fill / hover / type / scroll with **auto-wait actionability** (found + visible + enabled, auto-escalating to a trusted CDP click when a target is overlay-covered), plus file and image upload - all reaching **into iframes (incl. cross-origin) and open shadow DOM** - and **coordinate-level trusted input** (`input`) for `<canvas>` remote desktops (VNC/RDP/Amazon DCV), games, and drawing apps.
 - **Read & inspect** - rendered page text, interactive-element snapshots with stable refs, screenshots (viewport → full-page retina, element clip, save-to-disk), and JavaScript evaluation that **bypasses strict CSP** via CDP.
 - **DevTools-grade capture** - full request/response **bodies**, response headers, `Set-Cookie`, timings, and **WebSocket/SSE frames** - with durable on-disk persistence and **HAR / MHTML** evidence export.
 - **Web-security toolkit** - named **identities**, an in-session request **replayer**, **BOLA/IDOR/BFLA** access-control diffing (`authz_matrix`), **Burp-style live interception**, an **intruder-style fuzzer** (sniper/pitchfork/clusterbomb/race), passive header/CORS/**secret** analysis, **JWT** decode, and **copy-as-curl**.
@@ -123,6 +126,7 @@ Both Claude Code and Codex drive the same live browser through the same endpoint
 | `tabs_list` · `tab_new` · `tab_activate` · `tab_close` | Manage tabs. `tabs_list(short:true)` returns id/title/origin/active only (no path/query), for quickly identifying tabs without echoing full URLs |
 | `navigate` · `go_back` · `go_forward` · `wait_for` | Navigation |
 | `click` · `fill` · `hover` · `type` · `press_key` · `scroll` | Interaction (iframe + open-shadow aware). **Auto-waits** for the element to be actionable (found + visible + enabled, `timeoutMs`) and returns structured `{notActionable, reason}` on failure. `click` detects overlay-covered targets and **auto-escalates to a trusted CDP click** (`via:"trusted"`); `fill`/`type` register in React inputs (native setter) and rich editors (execCommand). `trusted:true` for real CDP input; `withSnapshot:true` to get a fresh `snapshot` back inline |
+| `input` | **Coordinate-level trusted input** via CDP for targets element selectors can't reach - a `<canvas>` remote desktop (VNC/RDP/**Amazon DCV**), a game, a WebGL app. Actions: `mouse_move`, `left/right/middle_click`, `double_click`, `left_mouse_down/up`, `left_click_drag`, `scroll`, `type` (to the focused element), `key` (combos like `ctrl+c`). Coords are **CSS viewport pixels** (`= screenshotPixel / dpr`, and `screenshot` now returns `dpr`). `activate:true` to foreground the tab so you can observe |
 | `file_upload` | Set a file input via base64 or a local `path` (`DOM.setFileInputFiles`) |
 | `paste_image` | Paste a local image into a rich-text / contenteditable field; `trusted:true` uses the real OS clipboard + a genuine Cmd/Ctrl+V for strict editors (e.g. YesWeHack) that ignore synthetic events |
 </details>
@@ -132,12 +136,12 @@ Both Claude Code and Codex drive the same live browser through the same endpoint
 
 | Tool | Description |
 |---|---|
-| `get_page_text` | Rendered text of the page (and its iframes) |
+| `get_page_text` | Rendered text of the page (and its iframes). `includeHidden:true` reads `textContent` instead of `innerText`, capturing `display:none`/collapsed content (e.g. un-expanded accordion bodies) that the default drops |
 | `snapshot` | Interactive elements with refs (+ `enabled`/`inViewport` hints); `deep:true` pierces **closed** shadow roots. Refs are held in an **off-DOM registry**, so a snapshot no longer mutates the page (a ref whose element was since re-rendered is reported so the caller re-snapshots). Deep-snapshot refs are numbered in their own range per snapshot generation, so they can never be confused with a plain-snapshot ref or a stale one from an earlier deep snapshot |
-| `screenshot` | Visible viewport (banner-free) by default; `fullPage` for the whole page, `scale` for retina, `format`/`quality`, `selector` to clip, `savePath` to write a file |
+| `screenshot` | Visible viewport (banner-free) by default; `fullPage` for the whole page, `scale` for retina, `format`/`quality`, `selector` to clip, `savePath` to write a file. Returns `dpr` + CSS viewport size (to map screenshot pixels → `input` coords) and `visibilityState` - warns when the tab is occluded (its frame may be throttled/stale) |
 | `download_resource` | Download a URL to disk via Chrome's own download engine - up to 100MB by default (`maxBytes` to raise it), correct binary handling, real session cookies, banner-free; `savePath` to relocate it from the Downloads folder |
-| `eval_js` | Evaluate JavaScript in the page's main world (banner-free). **Auto-falls back to `cdp_eval` on strict-CSP pages** where in-page `eval` is blocked (`via:"cdp-fallback"`); `cdp:true` forces it, `noFallback:true` disables it |
-| `cdp_eval` | Evaluate JS in the page's real main-world context via CDP `Runtime.evaluate` - **not subject to CSP `unsafe-eval`**, so it runs on strict-CSP sites, and reaches the page's live JS (in-memory state, framework internals, closures, the app's own functions). Uses `chrome.debugger` (shows the banner) |
+| `eval_js` | Evaluate JavaScript in the page's main world (banner-free). **Auto-falls back to `cdp_eval` on strict-CSP pages** where in-page `eval` is blocked (`via:"cdp-fallback"`); `cdp:true` forces it, `noFallback:true` disables it. `timeoutMs` to wait past the 30s default |
+| `cdp_eval` | Evaluate JS in the page's real main-world context via CDP `Runtime.evaluate` - **not subject to CSP `unsafe-eval`**, so it runs on strict-CSP sites, and reaches the page's live JS (in-memory state, framework internals, closures, the app's own functions). Uses `chrome.debugger` (shows the banner). `timeoutMs` raises the 30s cap for a long await/poll |
 | `bridge_status` | Is the extension connected? |
 </details>
 
@@ -287,11 +291,12 @@ bearer_token_env_var = "BROWSER_BRIDGE_TOKEN"
 - `chrome.debugger` requires sole access to a tab - it **can't attach if DevTools is open** on that tab. `net_capture_start` only records traffic sent *after* it's called (navigate/reload to capture a page load).
 - The capture buffer is in-memory (a ring of `maxEntries` requests/tab, default 500, ~512 KB/body). An active capture is not torn down by the idle sweep; for a durable record beyond the ring cap use `net_capture_start(persist:true, savePath:…)`, which streams to disk. Persistence is **durability, not continuity** - if the service worker dies the debugger detaches and capture stops until restarted; the file holds what was captured before that.
 - One extension connection at a time (last connect wins); multiple MCP clients can share it concurrently. A call in flight when the extension disconnects fails fast instead of waiting out the timeout.
+- `input` coordinates are **CSS viewport pixels**, but screenshots are **device pixels** - map with the `dpr` the screenshot returns (`coord = screenshotPixel / dpr`). `input` is delivered even to a backgrounded tab, but a hidden tab's frame is throttled, so you can't *observe* the result until it's foregrounded (`activate:true` / `tab_activate`); `screenshot` flags this via `visibilityState`.
 - `download_resource` always uses the browser's live session - it can't download as a captured `identity`. `Cookie`/`Host`/`Origin`/`Referer`/`Content-Length` in its `headers` param are browser-forbidden and silently ignored. If Chrome's "Ask where to save each file" setting is enabled, downloads may prompt for a location instead of completing automatically.
 
 ## Roadmap
 
-Shipped in v0.7: **durable capture persistence** (`net_capture_start(persist)` streams to on-disk JSON-Lines, `maxEntries` sizes the ring), **copy-as-curl** (`request_to_curl`), **`analyze deep`** (same-origin external-JS secret sweep), plus reliability fixes (fail-fast on disconnect, no idle-detach of active captures, fast load-wait, off-DOM snapshot refs, single-sourced versioning). v0.6: **self-healing interaction**, **passive recon** (`analyze`) + **`jwt_decode`**, **HAR export**, **fuzz modes** + **`viaAppClient`** replay. v0.5 shipped interception, fuzzing, cookie/storage, console/CSP capture, and MHTML.
+Shipped in v0.8 (from real remote-desktop pentest feedback): **coordinate-level trusted input** (`input`) for canvas/VNC/RDP/DCV targets, `get_page_text(includeHidden)` for collapsed/hidden content, `cdp_eval`/`eval_js` `timeoutMs`, and `screenshot` `dpr`/`visibilityState` surfacing (coordinate mapping + occlusion warning). v0.7: **durable capture persistence** (`net_capture_start(persist)`, `maxEntries`), **copy-as-curl** (`request_to_curl`), **`analyze deep`**, plus reliability fixes (fail-fast on disconnect, no idle-detach of active captures, fast load-wait, off-DOM snapshot refs, single-sourced versioning). v0.6: **self-healing interaction**, **passive recon** (`analyze`) + **`jwt_decode`**, **HAR export**, **fuzz modes** + **`viaAppClient`** replay. v0.5 shipped interception, fuzzing, cookie/storage, console/CSP capture, and MHTML.
 
 Ideas explored for future phases: source-map de-minification on downloads, GraphQL introspection helpers, a client-side DOM-XSS / postMessage / prototype-pollution suite, and hunt-workflow playbooks with structured findings.
 
@@ -302,7 +307,7 @@ server/                 MCP server (TypeScript · @modelcontextprotocol/sdk · w
   src/index.ts            HTTP MCP endpoint + auth + session management
   src/hub.ts              single extension socket, request/response correlation, capture sinks
   src/capture-sink.ts     durable on-disk JSON-Lines sink for persist captures
-  src/tools.ts            the 55 MCP tools
+  src/tools.ts            the 56 MCP tools
 extension/              Manifest V3 extension (bundled with esbuild via build.mjs)
   manifest.json
   src/background.ts       service worker: WS client, injection, chrome.debugger (CDP) layer
