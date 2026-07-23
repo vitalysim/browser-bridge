@@ -8,8 +8,8 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.8.0-3f3f46?style=flat-square">
-  <img alt="tools" src="https://img.shields.io/badge/tools-56-3f3f46?style=flat-square">
+  <img alt="version" src="https://img.shields.io/badge/version-0.9.0-3f3f46?style=flat-square">
+  <img alt="tools" src="https://img.shields.io/badge/tools-59-3f3f46?style=flat-square">
   <img alt="protocol" src="https://img.shields.io/badge/MCP-streamable_HTTP-52525b?style=flat-square">
   <img alt="browser" src="https://img.shields.io/badge/Chrome%2FEdge-Manifest_V3-52525b?style=flat-square">
   <img alt="language" src="https://img.shields.io/badge/TypeScript-strict-3178c6?style=flat-square">
@@ -19,7 +19,7 @@
 
 Browser Bridge is a local **MCP server + Manifest V3 Chrome extension** that lets AI coding agents - **Claude Code** and **OpenAI Codex CLI** - control the Chrome you use every day. Because it runs *inside* your real profile, the agent inherits your cookies, `HttpOnly` sessions, SSO, and 2FA state automatically. Ask it to *"read my feed and summarize it"* or *"capture the API traffic on this page and show me the responses"* - and it works against the live, authenticated app.
 
-It ships **56 tools** spanning everyday browsing, DevTools-grade network capture, and a full web-security testing toolkit.
+It ships **59 tools** spanning everyday browsing, DevTools-grade network capture, a full web-security testing toolkit, and **playbooks** — saved, self-healing recipes for repetitive tasks.
 
 ## Contents
 
@@ -28,6 +28,7 @@ It ships **56 tools** spanning everyday browsing, DevTools-grade network capture
 - [See it in action](#see-it-in-action)
 - [Architecture](#architecture)
 - [Features & tools](#features--tools)
+- [Playbooks](#playbooks)
 - [Setup](#setup)
 - [Security & responsible use](#security--responsible-use)
 - [Limitations](#limitations)
@@ -186,6 +187,15 @@ Both Claude Code and Codex drive the same live browser through the same endpoint
 </details>
 
 <details>
+<summary><b>Playbooks</b> (saved, self-healing task recipes)</summary>
+
+| Tool | Description |
+|---|---|
+| `playbook_record_start` · `playbook_record_stop` | Record mode: stream every tool call to a JSON-Lines draft, then stop - a seed you distill into a durable playbook |
+| `playbook_save` | Write a playbook's Markdown to disk server-side (global home or project-local), regardless of the client's write scope |
+</details>
+
+<details>
 <summary><b>Screenshot recipes</b></summary>
 
 `screenshot` defaults to a banner-free capture of the visible viewport. Options (these use `chrome.debugger`, so they show the debugging banner):
@@ -200,6 +210,16 @@ Both Claude Code and Codex drive the same live browser through the same endpoint
 
 `savePath` returns `{ path, bytes, width, height }` instead of a multi-MB inline image. Capture maxes out at Chrome's ~16384px surface size, and an oversized PNG auto-falls back to JPEG.
 </details>
+
+## Playbooks
+
+Repetitive tasks - "delete this kind of post", "run a BOLA check on an endpoint" - cost expensive first-time understanding (snapshot, find selectors, trial and error). A **playbook** saves that resolved knowledge to a local Markdown file so the next run is cheap.
+
+A playbook is a **self-healing document, not a macro**: it records *intent + robust role/accessible-name locators + checkpoints + the hard-won "understanding"* - never raw clicks, coordinates, snapshot refs, or captured requestIds (those are ephemeral and break next run). The agent runs it **with judgment** - re-perceiving each step, verifying the target before acting, and re-deriving a step that has drifted - which is the whole advantage over a brittle record-replay macro. Destructive/irreversible steps require confirmation.
+
+Playbooks live at `~/.browser-bridge/playbooks/<slug>.md` (global) or `./playbooks/<slug>.md` (project-local, git-shareable); every connected agent learns the convention automatically via the MCP `instructions` field. Capture one with **record mode**: `playbook_record_start` → do the task once → `playbook_record_stop` → distill the draft → `playbook_save`.
+
+**Format, execution protocol, heal/safety rules, and two worked examples (a DOM delete + a BOLA/IDOR flow): [docs/PLAYBOOKS.md](docs/PLAYBOOKS.md).**
 
 ## Setup
 
@@ -296,9 +316,9 @@ bearer_token_env_var = "BROWSER_BRIDGE_TOKEN"
 
 ## Roadmap
 
-Shipped in v0.8 (from real remote-desktop pentest feedback): **coordinate-level trusted input** (`input`) for canvas/VNC/RDP/DCV targets, `get_page_text(includeHidden)` for collapsed/hidden content, `cdp_eval`/`eval_js` `timeoutMs`, and `screenshot` `dpr`/`visibilityState` surfacing (coordinate mapping + occlusion warning). v0.7: **durable capture persistence** (`net_capture_start(persist)`, `maxEntries`), **copy-as-curl** (`request_to_curl`), **`analyze deep`**, plus reliability fixes (fail-fast on disconnect, no idle-detach of active captures, fast load-wait, off-DOM snapshot refs, single-sourced versioning). v0.6: **self-healing interaction**, **passive recon** (`analyze`) + **`jwt_decode`**, **HAR export**, **fuzz modes** + **`viaAppClient`** replay. v0.5 shipped interception, fuzzing, cookie/storage, console/CSP capture, and MHTML.
+Shipped in v0.9: **playbooks** - saved, self-healing task recipes (Markdown at `~/.browser-bridge/playbooks/`, record-mode capture via `playbook_record_start`/`stop`/`playbook_save`, agents auto-told the convention); see [docs/PLAYBOOKS.md](docs/PLAYBOOKS.md). v0.8 (from real remote-desktop pentest feedback): **coordinate-level trusted input** (`input`) for canvas/VNC/RDP/DCV targets, `get_page_text(includeHidden)` for collapsed/hidden content, `cdp_eval`/`eval_js` `timeoutMs`, and `screenshot` `dpr`/`visibilityState` surfacing (coordinate mapping + occlusion warning). v0.7: **durable capture persistence** (`net_capture_start(persist)`, `maxEntries`), **copy-as-curl** (`request_to_curl`), **`analyze deep`**, plus reliability fixes (fail-fast on disconnect, no idle-detach of active captures, fast load-wait, off-DOM snapshot refs, single-sourced versioning). v0.6: **self-healing interaction**, **passive recon** (`analyze`) + **`jwt_decode`**, **HAR export**, **fuzz modes** + **`viaAppClient`** replay. v0.5 shipped interception, fuzzing, cookie/storage, console/CSP capture, and MHTML.
 
-Ideas explored for future phases: source-map de-minification on downloads, GraphQL introspection helpers, a client-side DOM-XSS / postMessage / prototype-pollution suite, and hunt-workflow playbooks with structured findings.
+Ideas explored for future phases: source-map de-minification on downloads, GraphQL introspection helpers, and a client-side DOM-XSS / postMessage / prototype-pollution suite.
 
 ## Project structure
 
@@ -307,14 +327,14 @@ server/                 MCP server (TypeScript · @modelcontextprotocol/sdk · w
   src/index.ts            HTTP MCP endpoint + auth + session management
   src/hub.ts              single extension socket, request/response correlation, capture sinks
   src/capture-sink.ts     durable on-disk JSON-Lines sink for persist captures
-  src/tools.ts            the 56 MCP tools
+  src/tools.ts            the 59 MCP tools
 extension/              Manifest V3 extension (bundled with esbuild via build.mjs)
   manifest.json
   src/background.ts       service worker: WS client, injection, chrome.debugger (CDP) layer
   src/options.ts          token + connection UI
   icons/                  generated app icons
 scripts/                install-service.mjs / uninstall-service.mjs (systemd or launchd)
-docs/                   README art (banner.svg hero · architecture.svg diagram)
+docs/                   PLAYBOOKS.md (playbook format + protocol) · banner.svg · architecture.svg
 ```
 
 ## Contributing

@@ -21,6 +21,8 @@ export class ExtensionHub {
   private pending = new Map<string, Pending>();
   // Active on-disk capture sinks (persist:true captures), keyed by the tab being captured.
   private captureSinks = new Map<number, CaptureSink>();
+  // Optional record sink: when set, every hub.call is appended as a JSONL draft (playbook record-mode).
+  private recordSink: CaptureSink | null = null;
 
   constructor(httpServer: HttpServer, token: string) {
     const wss = new WebSocketServer({ noServer: true });
@@ -143,6 +145,25 @@ export class ExtensionHub {
     }
   }
 
+  // ---- record mode: append every hub.call to a JSONL draft (seed for a playbook) ----
+  // The draft is a raw tool-call log; the agent distills it into a durable playbook (ephemeral
+  // refs/requestIds must become role/text locators, and any secret-bearing params must be stripped).
+  startRecording(savePath: string): { saved: string } {
+    this.recordSink?.close(); // replace any prior recording
+    this.recordSink = new CaptureSink(savePath); // opens (truncating) now; a bad path throws here
+    return { saved: savePath };
+  }
+  stopRecording(): { saved: string; count: number } | null {
+    if (!this.recordSink) return null;
+    const out = { saved: this.recordSink.path, count: this.recordSink.written };
+    this.recordSink.close();
+    this.recordSink = null;
+    return out;
+  }
+  get recording(): boolean {
+    return this.recordSink !== null;
+  }
+
   call(method: string, params: Record<string, unknown> = {}, timeoutMs = CALL_TIMEOUT_MS): Promise<any> {
     if (!this.connected) {
       throw new Error(
@@ -153,6 +174,7 @@ export class ExtensionHub {
     const id = randomUUID();
     const socket = this.ws!;
     socket.send(JSON.stringify({ id, method, params }));
+    this.recordSink?.append([{ ts: Date.now(), method, params }]);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);

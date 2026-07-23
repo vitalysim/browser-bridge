@@ -40,6 +40,23 @@ function loadToken(): string {
 }
 
 const token = loadToken();
+
+// Ensure the playbooks home exists (advertised to agents via the MCP instructions below).
+try {
+  mkdirSync(join(homedir(), ".browser-bridge", "playbooks"), { recursive: true });
+} catch {
+  /* best-effort */
+}
+
+// Delivered to every connected agent (Claude Code + Codex) in the MCP initialize response.
+const PLAYBOOK_INSTRUCTIONS =
+  "Repeatable browser tasks can be saved as reusable 'playbooks' (Markdown) under ~/.browser-bridge/playbooks/*.md " +
+  "(or ./playbooks/*.md in a project). Before a repeatable task, check there for a matching playbook and run it " +
+  "(dry-run first). After resolving a new repeatable task, offer to save it: use playbook_record_start/stop to " +
+  "capture a draft, then distill it and playbook_save. Format, execution protocol, and safety rules are in " +
+  "docs/PLAYBOOKS.md. Never store secrets, cookies, or ephemeral refs/requestIds in a playbook; destructive or " +
+  "irreversible steps require explicit confirmation.";
+
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
@@ -47,7 +64,7 @@ const httpServer = createServer(app);
 const hub = new ExtensionHub(httpServer, token);
 
 function buildMcpServer(): McpServer {
-  const server = new McpServer({ name: "browser-bridge", version: VERSION });
+  const server = new McpServer({ name: "browser-bridge", version: VERSION }, { instructions: PLAYBOOK_INSTRUCTIONS });
   registerTools(server, hub, VERSION);
   return server;
 }

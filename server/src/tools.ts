@@ -1,11 +1,16 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { writeFileSync, readFileSync, renameSync, copyFileSync, unlinkSync } from "fs";
+import { writeFileSync, readFileSync, renameSync, copyFileSync, unlinkSync, mkdirSync } from "fs";
+import { homedir } from "os";
+import { join, dirname } from "path";
 import type { ExtensionHub } from "./hub.js";
 import { CaptureSink } from "./capture-sink.js";
 
 const MAX_TEXT_CHARS = 60_000;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Expand a leading ~/ to the home dir (Node fs doesn't do it). For playbook/record paths.
+const expandHome = (p: string) => (p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
 
 // Parse pixel dimensions from a PNG or JPEG buffer (header only).
 function imageDims(buf: Buffer): { width: number; height: number } | null {
@@ -1012,11 +1017,52 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     },
   );
 
+  // ---- playbooks (saved, self-healing task recipes; see docs/PLAYBOOKS.md) ----
+  tool(
+    "playbook_record_start",
+    "Start RECORD MODE: append every subsequent tool call (method + params, timestamped) to a JSON-Lines file as a " +
+      "DRAFT SEED for a playbook. Perform the repeatable task once, then call playbook_record_stop. The draft is a raw " +
+      "call log - you then DISTILL it into a durable playbook (docs/PLAYBOOKS.md): translate ephemeral refs/requestIds " +
+      "into role/accessible-name locators, generalize concrete values into params, add checkpoints + 'understanding' " +
+      "notes, and STRIP any secrets/cookies/bearers. Never ship the raw draft as the playbook.",
+    { savePath: z.string().describe("Absolute path (or ~/…) for the draft .jsonl, e.g. ~/.browser-bridge/playbooks/<slug>.draft.jsonl") },
+    async ({ savePath }) => {
+      const p = expandHome(savePath);
+      mkdirSync(dirname(p), { recursive: true });
+      return textResult(hub.startRecording(p));
+    }
+  );
+
+  tool(
+    "playbook_record_stop",
+    "Stop record mode and close the draft JSONL. Returns {saved, count} where count is the number of calls recorded.",
+    {},
+    async () => textResult(hub.stopRecording() ?? { recording: false, note: "was not recording" })
+  );
+
+  tool(
+    "playbook_save",
+    "Write a playbook's Markdown to disk server-side (so it lands in the global home regardless of the client's write " +
+      "scope). Playbooks live at ~/.browser-bridge/playbooks/<slug>.md (global, cross-project) or ./playbooks/<slug>.md " +
+      "(project-local, git-shareable). NEVER include secrets, cookies, bearers, refs, or requestIds - only descriptions, " +
+      "role/text locators, checkpoints, and 'understanding' notes. Format + protocol: docs/PLAYBOOKS.md.",
+    {
+      savePath: z.string().describe("Absolute path (or ~/…) to write the .md playbook to"),
+      markdown: z.string().describe("The full playbook Markdown (YAML frontmatter + steps), per docs/PLAYBOOKS.md"),
+    },
+    async ({ savePath, markdown }) => {
+      const p = expandHome(savePath);
+      mkdirSync(dirname(p), { recursive: true });
+      writeFileSync(p, markdown, "utf8");
+      return textResult({ saved: p, bytes: Buffer.byteLength(markdown) });
+    }
+  );
+
   tool(
     "bridge_status",
     "Check whether the Chrome extension is currently connected to the bridge.",
     {},
-    async () => textResult({ extensionConnected: hub.connected })
+    async () => textResult({ extensionConnected: hub.connected, recording: hub.recording })
   );
 }
 
