@@ -29,3 +29,15 @@ await build({
   define: { __BB_VERSION__: JSON.stringify(version) },
 });
 console.log(`built extension v${version}`);
+
+// Vendored rrweb recorder — a standalone IIFE injected into pages via executeScript({files}) by
+// session_record_start. Kept out of the service-worker bundle; rrweb is bundled in.
+await build({
+  entryPoints: [join(dir, "src/rrweb-record-entry.ts")],
+  bundle: true,
+  format: "iife",
+  outfile: join(dir, "vendor/rrweb-record.js"),
+  target: "chrome116",
+  legalComments: "none",
+});
+console.log("built vendor/rrweb-record.js");

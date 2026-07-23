@@ -1,6 +1,6 @@
 {
   "name": "browser-bridge-extension",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "private": true,
   "scripts": {
     "build": "node build.mjs",
@@ -9,6 +9,8 @@
   "devDependencies": {
     "@types/chrome": "^0.0.287",
     "esbuild": "^0.24.0",
+    "rrweb": "^2.1.1",
+    "rrweb-player": "^2.1.1",
     "typescript": "^5.7.0"
   }
 }

@@ -1090,6 +1090,50 @@ function finalizeCapture(tabId: number) {
   flushCapture(s, tabId, true);
 }
 
+// ---- session recording (rrweb) ----
+// Banner-free (scripting only, no chrome.debugger), so its per-tab state lives HERE, not on the CDP
+// Session (which would force ensureAttached -> the banner). The injected recorder relays event batches
+// via chrome.runtime.sendMessage({cmd:"bb-rec"}); we re-batch and stream them over the WS capture
+// channel with stream:"session" so they land in a distinct sink (not the net-capture sink).
+interface RecState {
+  queue: any[];
+  timer: ReturnType<typeof setTimeout> | null;
+  allFrames: boolean;
+  maskInputs: boolean;
+  recordCanvas: boolean;
+}
+const sessionRecordings = new Map<number, RecState>();
+
+function queueRecord(rec: RecState, tabId: number, events: any[]) {
+  for (const e of events) rec.queue.push({ kind: "rrweb", event: e });
+  if (rec.queue.length >= 50) return void flushRecord(rec, tabId);
+  if (!rec.timer) rec.timer = setTimeout(() => flushRecord(rec, tabId), 300);
+}
+function flushRecord(rec: RecState, tabId: number, done = false) {
+  if (rec.timer) {
+    clearTimeout(rec.timer);
+    rec.timer = null;
+  }
+  const entries = rec.queue;
+  rec.queue = [];
+  if ((entries.length || done) && ws && ws.readyState === WebSocket.OPEN) {
+    try {
+      ws.send(JSON.stringify({ type: "capture", stream: "session", tabId, entries, done }));
+    } catch {
+      /* socket write failed - best-effort */
+    }
+  }
+}
+// (Re)inject + start the recorder in a tab's frames. Called on start and on navigation-complete.
+async function injectRecorder(tabId: number, rec: RecState) {
+  await chrome.scripting.executeScript({ target: { tabId, allFrames: rec.allFrames }, files: ["vendor/rrweb-record.js"] });
+  await chrome.scripting.executeScript({
+    target: { tabId, allFrames: rec.allFrames },
+    func: (opts: any) => (window as any).__bbRec?.start(opts),
+    args: [{ allFrames: rec.allFrames, maskInputs: rec.maskInputs, recordCanvas: rec.recordCanvas }],
+  });
+}
+
 // scheme + host only, no path/query/fragment - for compact tab listings where the path may carry
 // opaque ids (mail item ids, doc tokens) that shouldn't be echoed unnecessarily.
 function safeOrigin(url: string | undefined): string {
@@ -2725,6 +2769,45 @@ async function dispatch(method: string, params: any): Promise<any> {
       return { mhtml: r?.data ?? "", url: tab.url, title: tab.title };
     }
 
+    // ---- session recording (rrweb → HTML replay); banner-free, scripting only ----
+    case "session_record_start": {
+      const tab = await targetTab(params.tabId);
+      assertScriptable(tab);
+      const tabId = tab.id!;
+      const rec: RecState = {
+        queue: [],
+        timer: null,
+        allFrames: !!params.allFrames,
+        maskInputs: !!params.maskInputs,
+        recordCanvas: !!params.recordCanvas,
+      };
+      await injectRecorder(tabId, rec);
+      sessionRecordings.set(tabId, rec);
+      return { recording: true, tabId, allFrames: rec.allFrames, url: tab.url };
+    }
+
+    case "session_record_stop": {
+      const tab = await targetTab(params.tabId);
+      const tabId = tab.id!;
+      const rec = sessionRecordings.get(tabId);
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId, allFrames: rec?.allFrames ?? false },
+          func: () => (window as any).__bbRec?.stop(),
+        });
+      } catch {
+        /* tab navigated/closed - the final flush below still ships buffered events */
+      }
+      // The recorder's final batch is relayed via sendMessage (a separate task) - let it reach
+      // onMessage/queueRecord before we flush the `done` marker, or the last events are lost.
+      await sleep(200);
+      if (rec) {
+        flushRecord(rec, tabId, true);
+        sessionRecordings.delete(tabId);
+      }
+      return { stopped: true, tabId, wasRecording: !!rec };
+    }
+
     default:
       throw new Error(`Unknown method: ${method}`);
   }
@@ -2758,6 +2841,11 @@ chrome.debugger.onDetach.addListener((source) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   finalizeCapture(tabId);
   sessions.delete(tabId);
+  const rec = sessionRecordings.get(tabId);
+  if (rec) {
+    flushRecord(rec, tabId, true); // flush + close the session sink (final `done`)
+    sessionRecordings.delete(tabId);
+  }
 });
 chrome.downloads.onDeterminingFilename.addListener((_item, suggest) => {
   suggest(); // accept Chrome's tentative filename; avoids an interactive save-location prompt
@@ -2769,14 +2857,35 @@ chrome.storage.onChanged.addListener((changes, area) => {
     connect();
   }
 });
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.cmd === "reconnect") {
     ws?.close();
     reconnectDelay = 1_000;
     connect();
     sendResponse({ ok: true });
+    return false;
+  }
+  // rrweb event batches relayed from an injected recorder → stream to the session sink.
+  if (msg?.cmd === "bb-rec") {
+    const tabId = sender.tab?.id;
+    if (tabId != null) {
+      const rec = sessionRecordings.get(tabId);
+      if (rec) queueRecord(rec, tabId, msg.events || []);
+    }
+    return false;
   }
   return false;
+});
+
+// Re-inject the recorder after a full document load while recording (a navigation destroys the
+// injected recorder; rrweb takes a fresh full snapshot and the replay stitches the segments).
+chrome.tabs.onUpdated.addListener((tabId, info) => {
+  if (info.status !== "complete") return;
+  const rec = sessionRecordings.get(tabId);
+  if (!rec) return;
+  void injectRecorder(tabId, rec).catch(() => {
+    /* not scriptable / gone */
+  });
 });
 
 connect();

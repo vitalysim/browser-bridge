@@ -8,8 +8,8 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.9.0-3f3f46?style=flat-square">
-  <img alt="tools" src="https://img.shields.io/badge/tools-59-3f3f46?style=flat-square">
+  <img alt="version" src="https://img.shields.io/badge/version-0.10.0-3f3f46?style=flat-square">
+  <img alt="tools" src="https://img.shields.io/badge/tools-62-3f3f46?style=flat-square">
   <img alt="protocol" src="https://img.shields.io/badge/MCP-streamable_HTTP-52525b?style=flat-square">
   <img alt="browser" src="https://img.shields.io/badge/Chrome%2FEdge-Manifest_V3-52525b?style=flat-square">
   <img alt="language" src="https://img.shields.io/badge/TypeScript-strict-3178c6?style=flat-square">
@@ -19,7 +19,7 @@
 
 Browser Bridge is a local **MCP server + Manifest V3 Chrome extension** that lets AI coding agents - **Claude Code** and **OpenAI Codex CLI** - control the Chrome you use every day. Because it runs *inside* your real profile, the agent inherits your cookies, `HttpOnly` sessions, SSO, and 2FA state automatically. Ask it to *"read my feed and summarize it"* or *"capture the API traffic on this page and show me the responses"* - and it works against the live, authenticated app.
 
-It ships **59 tools** spanning everyday browsing, DevTools-grade network capture, a full web-security testing toolkit, and **playbooks** — saved, self-healing recipes for repetitive tasks.
+It ships **62 tools** spanning everyday browsing, DevTools-grade network capture, a full web-security testing toolkit, **playbooks** (saved, self-healing recipes), and **session recording** (record an interaction, replay it as a self-contained HTML timeline).
 
 ## Contents
 
@@ -29,6 +29,7 @@ It ships **59 tools** spanning everyday browsing, DevTools-grade network capture
 - [Architecture](#architecture)
 - [Features & tools](#features--tools)
 - [Playbooks](#playbooks)
+- [Recording](#recording)
 - [Setup](#setup)
 - [Security & responsible use](#security--responsible-use)
 - [Limitations](#limitations)
@@ -196,6 +197,16 @@ Both Claude Code and Codex drive the same live browser through the same endpoint
 </details>
 
 <details>
+<summary><b>Session recording</b> (record → self-contained HTML replay)</summary>
+
+| Tool | Description |
+|---|---|
+| `session_record_start` | Start recording the tab as a session replay (rrweb) - DOM + mutations + input/scroll/mouse, **banner-free**. `allFrames:true` also records cross-origin iframes; `maskInputs:true` redacts form values (default off) |
+| `session_record_stop` | Stop and assemble a **self-contained HTML** replay (rrweb-player inlined) with play/scrub/speed; opens offline in any browser |
+| `session_record_status` | List active recordings (tab, events file, events so far) |
+</details>
+
+<details>
 <summary><b>Screenshot recipes</b></summary>
 
 `screenshot` defaults to a banner-free capture of the visible viewport. Options (these use `chrome.debugger`, so they show the debugging banner):
@@ -220,6 +231,14 @@ A playbook is a **self-healing document, not a macro**: it records *intent + rob
 Playbooks live at `~/.browser-bridge/playbooks/<slug>.md` (global) or `./playbooks/<slug>.md` (project-local, git-shareable); every connected agent learns the convention automatically via the MCP `instructions` field. Capture one with **record mode**: `playbook_record_start` → do the task once → `playbook_record_stop` → distill the draft → `playbook_save`.
 
 **Format, execution protocol, heal/safety rules, and two worked examples (a DOM delete + a BOLA/IDOR flow): [docs/PLAYBOOKS.md](docs/PLAYBOOKS.md).**
+
+## Recording
+
+Record a live interaction and replay it. `session_record_start` captures the DOM + mutations + input/scroll/mouse over time (rrweb), **banner-free**; interact with the page; `session_record_stop` assembles a **single self-contained HTML file** that plays the whole thing back with a **play button, timeline scrubber, and speed control** - offline, in any browser.
+
+Because the extension injects the recorder into **every frame including cross-origin iframes** (which page-level rrweb can't) and is **CSP-immune**, it records sites and embedded frames a normal recorder can't even load on. Events stream to `~/.browser-bridge/recordings/*.events.jsonl` during capture (surviving long sessions), then get inlined with the rrweb-player into the HTML on stop.
+
+Note: input **masking is OFF by default** - the replay contains cleartext form values/passwords (`maskInputs:true` to redact). Canvas/WebGL and DRM video aren't captured (a `render_recording_video` → MP4 export, which screencasts the replay, is planned for those). **Details: [docs/RECORDING.md](docs/RECORDING.md).**
 
 ## Setup
 
@@ -316,7 +335,7 @@ bearer_token_env_var = "BROWSER_BRIDGE_TOKEN"
 
 ## Roadmap
 
-Shipped in v0.9: **playbooks** - saved, self-healing task recipes (Markdown at `~/.browser-bridge/playbooks/`, record-mode capture via `playbook_record_start`/`stop`/`playbook_save`, agents auto-told the convention); see [docs/PLAYBOOKS.md](docs/PLAYBOOKS.md). v0.8 (from real remote-desktop pentest feedback): **coordinate-level trusted input** (`input`) for canvas/VNC/RDP/DCV targets, `get_page_text(includeHidden)` for collapsed/hidden content, `cdp_eval`/`eval_js` `timeoutMs`, and `screenshot` `dpr`/`visibilityState` surfacing (coordinate mapping + occlusion warning). v0.7: **durable capture persistence** (`net_capture_start(persist)`, `maxEntries`), **copy-as-curl** (`request_to_curl`), **`analyze deep`**, plus reliability fixes (fail-fast on disconnect, no idle-detach of active captures, fast load-wait, off-DOM snapshot refs, single-sourced versioning). v0.6: **self-healing interaction**, **passive recon** (`analyze`) + **`jwt_decode`**, **HAR export**, **fuzz modes** + **`viaAppClient`** replay. v0.5 shipped interception, fuzzing, cookie/storage, console/CSP capture, and MHTML.
+Shipped in v0.10: **session recording** - record a live interaction and replay it as a self-contained HTML timeline (rrweb; `session_record_start`/`stop`/`status`), banner-free, capturing cross-origin iframes; see [docs/RECORDING.md](docs/RECORDING.md). v0.9: **playbooks** - saved, self-healing task recipes (Markdown at `~/.browser-bridge/playbooks/`, record-mode capture via `playbook_record_start`/`stop`/`playbook_save`, agents auto-told the convention); see [docs/PLAYBOOKS.md](docs/PLAYBOOKS.md). v0.8 (from real remote-desktop pentest feedback): **coordinate-level trusted input** (`input`) for canvas/VNC/RDP/DCV targets, `get_page_text(includeHidden)` for collapsed/hidden content, `cdp_eval`/`eval_js` `timeoutMs`, and `screenshot` `dpr`/`visibilityState` surfacing (coordinate mapping + occlusion warning). v0.7: **durable capture persistence** (`net_capture_start(persist)`, `maxEntries`), **copy-as-curl** (`request_to_curl`), **`analyze deep`**, plus reliability fixes (fail-fast on disconnect, no idle-detach of active captures, fast load-wait, off-DOM snapshot refs, single-sourced versioning). v0.6: **self-healing interaction**, **passive recon** (`analyze`) + **`jwt_decode`**, **HAR export**, **fuzz modes** + **`viaAppClient`** replay. v0.5 shipped interception, fuzzing, cookie/storage, console/CSP capture, and MHTML.
 
 Ideas explored for future phases: source-map de-minification on downloads, GraphQL introspection helpers, and a client-side DOM-XSS / postMessage / prototype-pollution suite.
 
@@ -327,14 +346,16 @@ server/                 MCP server (TypeScript · @modelcontextprotocol/sdk · w
   src/index.ts            HTTP MCP endpoint + auth + session management
   src/hub.ts              single extension socket, request/response correlation, capture sinks
   src/capture-sink.ts     durable on-disk JSON-Lines sink for persist captures
-  src/tools.ts            the 59 MCP tools
+  src/tools.ts            the 62 MCP tools
 extension/              Manifest V3 extension (bundled with esbuild via build.mjs)
   manifest.json
   src/background.ts       service worker: WS client, injection, chrome.debugger (CDP) layer
   src/options.ts          token + connection UI
   icons/                  generated app icons
 scripts/                install-service.mjs / uninstall-service.mjs (systemd or launchd)
-docs/                   PLAYBOOKS.md (playbook format + protocol) · banner.svg · architecture.svg
+docs/                   PLAYBOOKS.md · RECORDING.md · banner.svg · architecture.svg
+  server/vendor/          rrweb-player (inlined into session-replay HTML)
+  extension/vendor/       rrweb-record.js (injected recorder; built by build.mjs)
 ```
 
 ## Contributing

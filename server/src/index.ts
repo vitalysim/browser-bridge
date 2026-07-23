@@ -41,9 +41,10 @@ function loadToken(): string {
 
 const token = loadToken();
 
-// Ensure the playbooks home exists (advertised to agents via the MCP instructions below).
+// Ensure the playbooks + recordings homes exist (advertised to agents via the MCP instructions below).
 try {
   mkdirSync(join(homedir(), ".browser-bridge", "playbooks"), { recursive: true });
+  mkdirSync(join(homedir(), ".browser-bridge", "recordings"), { recursive: true });
 } catch {
   /* best-effort */
 }
@@ -55,7 +56,9 @@ const PLAYBOOK_INSTRUCTIONS =
   "(dry-run first). After resolving a new repeatable task, offer to save it: use playbook_record_start/stop to " +
   "capture a draft, then distill it and playbook_save. Format, execution protocol, and safety rules are in " +
   "docs/PLAYBOOKS.md. Never store secrets, cookies, or ephemeral refs/requestIds in a playbook; destructive or " +
-  "irreversible steps require explicit confirmation.";
+  "irreversible steps require explicit confirmation. " +
+  "To record a live interaction as a replayable video, use session_record_start / session_record_stop (produces a " +
+  "self-contained HTML replay with a play/scrub timeline); see docs/RECORDING.md.";
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));

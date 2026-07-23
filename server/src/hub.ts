@@ -21,6 +21,9 @@ export class ExtensionHub {
   private pending = new Map<string, Pending>();
   // Active on-disk capture sinks (persist:true captures), keyed by the tab being captured.
   private captureSinks = new Map<number, CaptureSink>();
+  // Active session-recording sinks (rrweb events), keyed by tab. Separate map + a stream:"session"
+  // discriminator so a recording and a net-capture on the SAME tab don't write to the same file.
+  private sessionSinks = new Map<number, CaptureSink>();
   // Optional record sink: when set, every hub.call is appended as a JSONL draft (playbook record-mode).
   private recordSink: CaptureSink | null = null;
 
@@ -102,6 +105,8 @@ export class ExtensionHub {
       // The extension streaming these captures is gone - close every sink so no handle leaks.
       for (const sink of this.captureSinks.values()) sink.close();
       this.captureSinks.clear();
+      for (const sink of this.sessionSinks.values()) sink.close();
+      this.sessionSinks.clear();
     });
     ws.on("error", (err) => console.error(`[hub] ws error: ${err.message}`));
   }
@@ -133,15 +138,37 @@ export class ExtensionHub {
     return s.written;
   }
 
-  // Route a streamed {type:"capture", tabId, entries, done} message to the tab's sink.
+  // ---- session-recording sinks (rrweb events) ----
+  sessionSinkPathInUse(path: string): boolean {
+    for (const s of this.sessionSinks.values()) if (s.path === path) return true;
+    return false;
+  }
+  registerSessionSink(tabId: number, sink: CaptureSink): void {
+    this.sessionSinks.get(tabId)?.close();
+    this.sessionSinks.set(tabId, sink);
+  }
+  closeSessionSink(tabId: number): number | undefined {
+    const s = this.sessionSinks.get(tabId);
+    if (!s) return undefined;
+    s.close();
+    this.sessionSinks.delete(tabId);
+    return s.written;
+  }
+  // {tabId, path, written} for each active session recording (for session_record_status).
+  sessionSinkList(): { tabId: number; path: string; written: number }[] {
+    return [...this.sessionSinks.entries()].map(([tabId, s]) => ({ tabId, path: s.path, written: s.written }));
+  }
+
+  // Route a streamed {type:"capture", stream?, tabId, entries, done} message to the right sink.
   private onCapture(msg: any): void {
     const tabId = msg.tabId;
-    const sink = this.captureSinks.get(tabId);
-    if (!sink) return; // no sink (already closed, or capture wasn't started with persist)
+    const sinks = msg.stream === "session" ? this.sessionSinks : this.captureSinks;
+    const sink = sinks.get(tabId);
+    if (!sink) return; // no sink (already closed, or capture wasn't started for this stream)
     if (Array.isArray(msg.entries) && msg.entries.length) sink.append(msg.entries);
     if (msg.done) {
       sink.close();
-      this.captureSinks.delete(tabId);
+      sinks.delete(tabId);
     }
   }
 

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { writeFileSync, readFileSync, renameSync, copyFileSync, unlinkSync, mkdirSync } from "fs";
 import { homedir } from "os";
 import { join, dirname } from "path";
+import { fileURLToPath } from "url";
 import type { ExtensionHub } from "./hub.js";
 import { CaptureSink } from "./capture-sink.js";
 
@@ -1058,6 +1059,91 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     }
   );
 
+  // ---- session recording (rrweb -> self-contained HTML replay) ----
+  const recordingPaths = new Map<number, string>(); // tabId -> events JSONL path
+
+  tool(
+    "session_record_start",
+    "Start recording the tab as a session replay (rrweb): captures the DOM + mutations + input/scroll/mouse over " +
+      "time, BANNER-FREE (no debugger). Interact with the page, then call session_record_stop to get a self-contained " +
+      "HTML file that plays the whole interaction back with a timeline/scrubber. allFrames:true also records " +
+      "cross-origin iframes (a browser-bridge superpower over page-level rrweb). maskInputs:true redacts form values " +
+      "(default OFF - the replay contains cleartext inputs/passwords). One recording per tab.",
+    {
+      tabId: tabIdParam,
+      allFrames: z.boolean().optional().describe("Also record cross-origin iframes (default false = top frame + same-origin subframes)"),
+      maskInputs: z.boolean().optional().describe("Redact form input values in the recording (default false)"),
+      recordCanvas: z.boolean().optional().describe("Attempt to record <canvas>/WebGL (heavier; default false)"),
+      eventsPath: z.string().optional().describe("Absolute path (or ~/…) for the raw events JSONL; default ~/.browser-bridge/recordings/session-<ts>.events.jsonl"),
+    },
+    async (args) => {
+      const eventsPath = expandHome(
+        args.eventsPath ||
+          join(homedir(), ".browser-bridge", "recordings", `session-${new Date().toISOString().replace(/[:.]/g, "-")}.events.jsonl`)
+      );
+      mkdirSync(dirname(eventsPath), { recursive: true });
+      if (hub.sessionSinkPathInUse(eventsPath)) throw new Error(`another recording is already writing ${eventsPath}`);
+      const sink = new CaptureSink(eventsPath); // opens now -> a bad path fails THIS call
+      try {
+        const r = await hub.call("session_record_start", {
+          tabId: args.tabId,
+          allFrames: !!args.allFrames,
+          maskInputs: !!args.maskInputs,
+          recordCanvas: !!args.recordCanvas,
+        });
+        if (r?.tabId == null) throw new Error("extension did not return the recorded tabId");
+        hub.registerSessionSink(r.tabId, sink);
+        recordingPaths.set(r.tabId, eventsPath);
+        return textResult({ ...r, eventsPath });
+      } catch (e) {
+        sink.close();
+        throw e;
+      }
+    }
+  );
+
+  tool(
+    "session_record_stop",
+    "Stop the tab's session recording and assemble a self-contained HTML replay (rrweb-player inlined) at savePath. " +
+      "Open the .html in any browser to replay the interaction with play/pause/scrub/speed. Returns " +
+      "{saved, htmlBytes, eventCount, durationMs}.",
+    {
+      savePath: z.string().optional().describe("Absolute path (or ~/…) for the .html replay; default = the events file with .html"),
+      title: z.string().optional().describe("Title shown on the replay page"),
+      autoplay: z.boolean().optional().describe("Autoplay on open (default false)"),
+      tabId: tabIdParam,
+    },
+    async (args) => {
+      const r = await hub.call("session_record_stop", { tabId: args.tabId }, 30_000);
+      const tabId = r?.tabId;
+      hub.closeSessionSink(tabId); // usually already closed by the streamed `done`; idempotent
+      const eventsPath = recordingPaths.get(tabId);
+      recordingPaths.delete(tabId);
+      if (!eventsPath) throw new Error("no recording was active for this tab");
+      const events = parseSessionEvents(readFileSync(eventsPath, "utf8"));
+      if (!events.length) throw new Error(`recording had no events (${eventsPath}) - did you interact with the page?`);
+      const savePath = expandHome(args.savePath || eventsPath.replace(/\.events\.jsonl$|\.jsonl$/, "") + ".html");
+      mkdirSync(dirname(savePath), { recursive: true });
+      const htmlBytes = writeRrwebHtml(savePath, events, { title: args.title, autoplay: !!args.autoplay });
+      let min = Infinity, max = 0;
+      for (const e of events) {
+        const t = e.timestamp || 0;
+        if (t) {
+          if (t < min) min = t;
+          if (t > max) max = t;
+        }
+      }
+      return textResult({ saved: savePath, htmlBytes, eventCount: events.length, durationMs: max > min ? max - min : 0, eventsPath });
+    }
+  );
+
+  tool(
+    "session_record_status",
+    "List active session recordings (tab, events-file path, events written so far).",
+    {},
+    async () => textResult({ recordings: hub.sessionSinkList() })
+  );
+
   tool(
     "bridge_status",
     "Check whether the Chrome extension is currently connected to the bridge.",
@@ -1299,4 +1385,62 @@ function harEntry(r: any, nowIso: string): any {
   };
   if (r.requestBody) entry.request.postData = { mimeType: ct, text: r.requestBody };
   return entry;
+}
+
+// ---- session replay: assemble a self-contained rrweb-player HTML (pure) ----
+// Vendored rrweb-player (MIT), read once. Path is relative to the compiled dist/tools.js.
+const VENDOR_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "vendor");
+let PLAYER_JS = "";
+let PLAYER_CSS = "";
+try {
+  PLAYER_JS = readFileSync(join(VENDOR_DIR, "rrweb-player.umd.min.js"), "utf8");
+  PLAYER_CSS = readFileSync(join(VENDOR_DIR, "rrweb-player.css"), "utf8");
+} catch {
+  /* vendored player missing - writeRrwebHtml throws a clear error */
+}
+const htmlEsc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+
+// Write one offline HTML file that inlines the player + events, opening with play/scrub controls.
+function writeRrwebHtml(savePath: string, events: any[], meta: { title?: string; autoplay?: boolean }): number {
+  if (!PLAYER_JS) throw new Error("vendored rrweb-player not found in server/vendor/ - build/vendor it first");
+  const title = htmlEsc(meta.title || "Session replay");
+  // Escape '<' in the events JSON so a captured "</script>" can't close our inline <script> block.
+  const json = JSON.stringify(events).replace(/</g, "\\u003c");
+  const html = `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+<style>${PLAYER_CSS}</style>
+<style>html,body{margin:0;background:#0b0b0d}#bb-player{display:flex;justify-content:center;padding:12px}</style>
+</head><body>
+<div id="bb-player"></div>
+<script id="bb-events" type="application/json">${json}</script>
+<script>${PLAYER_JS}</script>
+<script>
+(function(){
+  var events = JSON.parse(document.getElementById('bb-events').textContent);
+  var g = window.rrwebPlayer || {};
+  var P = g.default || g.Player || g;
+  new P({ target: document.getElementById('bb-player'),
+          props: { events: events, showController: true, autoplay: ${meta.autoplay ? "true" : "false"}, speedOption: [1,2,4,8] } });
+})();
+</script>
+</body></html>`;
+  writeFileSync(savePath, html, "utf8");
+  return Buffer.byteLength(html);
+}
+
+// Parse a session events JSONL (rows {kind:"rrweb", event}) into a timestamp-sorted rrweb event array.
+function parseSessionEvents(jsonl: string): any[] {
+  const events: any[] = [];
+  for (const line of jsonl.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const row = JSON.parse(line);
+      if (row && row.kind === "rrweb" && row.event) events.push(row.event);
+    } catch {
+      /* skip a torn last line */
+    }
+  }
+  events.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+  return events;
 }
