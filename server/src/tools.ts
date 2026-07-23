@@ -1466,7 +1466,10 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
   /* stage: the replay is centered in the band between the top metabar and the bottom control bar.
      Do NOT touch .rr-player__frame width or .replayer-wrapper transform - it breaks the computed scale. */
   #bb-player{position:relative;z-index:2;display:flex;align-items:center;justify-content:center;width:100vw;height:100vh;padding:var(--bar-top) 0 var(--bar-bot);overflow:hidden}
-  #bb-player .rr-player{float:none;border-radius:2px;background:var(--ink);box-shadow:0 0 0 1px var(--line),0 40px 90px rgba(0,0,0,.62)}
+  #bb-player .rr-player{float:none;border-radius:2px;background:var(--ink);box-shadow:0 0 0 1px var(--line),0 40px 90px rgba(0,0,0,.62);margin-bottom:-80px}
+  /* ^ .rr-player still reserves the HIDDEN 80px controller at its bottom (frame + 80); negate it via
+     CSS (the player only ever sets inline width/height, never margin, so this persists) so the visible
+     FRAME - not the frame+controller box - is what centers in the band between the metabar and the bar. */
   #bb-player .rr-player__frame{border-radius:2px}
   #bb-player .rr-controller{display:none!important} /* hidden: still mounts + emits ui-update time/state to our bar */
 
@@ -1549,6 +1552,8 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
     if (!(s > 0)) s = 0.1;
     try { player.$set({ width: Math.round(vw * s), height: Math.round(vh * s) }); } catch(e){}
     try { if (player.triggerResize) player.triggerResize(); } catch(e){}
+    // (the hidden controller's 80px reserve is negated in CSS via .rr-player margin-bottom, so the
+    // frame centers in the band; doing it here in JS gets wiped by the player's async re-render)
   }
   var t; function refit(){ clearTimeout(t); t = setTimeout(fit, 100); }
   window.addEventListener('resize', refit);
