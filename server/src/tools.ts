@@ -1,10 +1,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { writeFileSync, readFileSync, renameSync, copyFileSync, unlinkSync, mkdirSync } from "fs";
+import { writeFileSync, readFileSync, renameSync, copyFileSync, unlinkSync, mkdirSync, mkdtempSync, rmSync, existsSync } from "fs";
 import { writeFile as writeFileAsync } from "fs/promises";
-import { homedir } from "os";
+import { homedir, tmpdir } from "os";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
+import { spawn } from "child_process";
 import type { ExtensionHub } from "./hub.js";
 import { CaptureSink } from "./capture-sink.js";
 import { inlineAssets } from "./rrweb-inline.js";
@@ -1180,6 +1181,70 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
   );
 
   tool(
+    "render_recording_video",
+    "Render a saved session replay (.html from session_record_stop, v0.14+) into a high-resolution MP4. Deterministic: " +
+      "opens the replay in a tab, seeks the player frame-by-frame and captures each frame as a lossless PNG at `scale`x " +
+      "(the page + green mouse-trail/click/keystroke overlay, no player bars), then ffmpeg -> H.264. Frame-exact, no " +
+      "dropped frames. NOTE it drives a focused tab for the whole render (steals focus) and takes a while (~frames * ~0.4s). " +
+      "Returns {saved, frames, fps, scale, durationMs}.",
+    {
+      htmlPath: z.string().describe("Absolute path (or ~/…) to a saved replay .html (must be v0.14+ with the export harness)"),
+      out: z.string().optional().describe("Absolute path (or ~/…) for the .mp4; default = the .html path with .mp4"),
+      fps: z.number().optional().describe("Frames per second (default 30)"),
+      scale: z.number().optional().describe("Resolution multiplier over the recorded viewport (default 2 = ~retina/4K; 1 = native)"),
+      crf: z.number().optional().describe("H.264 quality, lower=better (default 16, ~visually lossless)"),
+      settleMs: z.number().optional().describe("Wait after each seek before capture (default 40)"),
+    },
+    async (args) => {
+      const htmlPath = expandHome(args.htmlPath);
+      if (!existsSync(htmlPath)) throw new Error(`replay html not found: ${htmlPath}`);
+      const out = expandHome(args.out || htmlPath.replace(/\.html?$/i, "") + ".mp4");
+      const fps = Math.max(1, Math.min(60, Math.round(args.fps ?? 30)));
+      const scale = Math.max(1, Math.min(4, args.scale ?? 2));
+      const crf = Math.max(0, Math.min(51, Math.round(args.crf ?? 16)));
+      const settleMs = Math.max(0, Math.round(args.settleMs ?? 40));
+      const frameDir = mkdtempSync(join(tmpdir(), "bb-frames-"));
+      const evalJs = (tabId: number, code: string) => hub.call("eval_js", { tabId, code }, 20_000);
+
+      const tab = await hub.call("tab_new", { url: "file://" + htmlPath }, 30_000);
+      const tabId = tab?.tabId;
+      if (tabId == null) throw new Error("could not open the replay tab");
+      try {
+        // Wait for the export harness, then enter export framing; read total duration.
+        let total = 0;
+        for (let i = 0; i < 80; i++) {
+          const r = await evalJs(
+            tabId,
+            "(function(){ if(!window.__bbExport) return 'nope'; window.__bbExport.enterMode(); return String(window.__bbExport.total||0); })()"
+          );
+          const v = r?.value;
+          if (v && v !== "nope") { total = parseFloat(v) || 0; break; }
+          await sleep(300);
+        }
+        if (!total) throw new Error("replay export harness not ready (regenerate the replay with v0.14+), or zero duration");
+
+        const nframes = Math.max(1, Math.ceil((total / 1000) * fps));
+        for (let f = 0; f < nframes; f++) {
+          const t = Math.min(total, Math.round((f * 1000) / fps));
+          await evalJs(tabId, "window.__bbExport.renderAt(" + t + ")");
+          if (settleMs) await sleep(settleMs);
+          // hub.call hits the EXTENSION directly (returns base64); savePath is a server-tool concern, so
+          // we write the frame ourselves.
+          const shot = await hub.call("screenshot", { tabId, selector: ".rr-player__frame", scale, format: "png" }, 60_000);
+          if (!shot?.base64) throw new Error(`empty screenshot at frame ${f} (t=${t}ms)`);
+          writeFileSync(join(frameDir, "f" + String(f).padStart(6, "0") + ".png"), Buffer.from(shot.base64, "base64"));
+        }
+
+        await runFfmpeg(frameDir, fps, crf, out);
+        return textResult({ saved: out, frames: nframes, fps, scale, crf, durationMs: total });
+      } finally {
+        await hub.call("tab_close", { tabIds: [tabId] }, 15_000).catch(() => {});
+        try { rmSync(frameDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+      }
+    }
+  );
+
+  tool(
     "bridge_status",
     "Check whether the Chrome extension is currently connected to the bridge.",
     {},
@@ -1435,6 +1500,40 @@ try {
 }
 const htmlEsc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
 
+// Resolve the ffmpeg binary by absolute path - the launchd service's PATH omits Homebrew's bin, so a
+// bare "ffmpeg" spawn ENOENTs.
+function ffmpegBin(): string {
+  const envBin = process.env.FFMPEG_PATH;
+  const candidates = [envBin, "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"].filter(Boolean) as string[];
+  for (const c of candidates) if (existsSync(c)) return c;
+  return "ffmpeg";
+}
+
+// Assemble the PNG frames (fNNNNNN.png) in `dir` into an H.264 MP4 via ffmpeg. yuv420p needs even
+// dimensions, so we round the frame down to even with a scale filter.
+function runFfmpeg(dir: string, fps: number, crf: number, out: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const args = [
+      "-y",
+      "-framerate", String(fps),
+      "-start_number", "0",
+      "-i", join(dir, "f%06d.png"),
+      "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+      "-c:v", "libx264",
+      "-preset", "medium",
+      "-crf", String(crf),
+      "-pix_fmt", "yuv420p",
+      "-movflags", "+faststart",
+      out,
+    ];
+    const p = spawn(ffmpegBin(), args, { stdio: ["ignore", "ignore", "pipe"] });
+    let err = "";
+    p.stderr.on("data", (d) => { err += String(d); if (err.length > 12000) err = err.slice(-12000); });
+    p.on("error", (e) => reject(new Error(`ffmpeg failed to start (is it installed?): ${e.message}`)));
+    p.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg exited ${code}: ${err.slice(-1400)}`))));
+  });
+}
+
 // Write one offline HTML file that inlines the player + events, opening with play/scrub controls.
 // The replay FILLS the viewer window at the RECORDED page's exact aspect ratio (fit-to-viewport):
 // the player box is sized to the recorded viewport's aspect scaled to fit the window, so there is no
@@ -1576,6 +1675,7 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
     var pts = [];                 // {x,y,t} recent mouse points for the smooth trail
     var LIFE = 700;               // trail fade window (ms)
     var wrap=null, trail=null, ctx=null, hud=null, mouseEl=null;
+    var exportMode=false;         // when true, the live rAF trail + event-cast overlay yield to __bbExport.renderAt
     var lastVal = {};             // per-input last value (typed-text fallback / paste detection)
     var hudTokens = [], hudTimer=null;
 
@@ -1594,6 +1694,7 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
       replayer.on('event-cast', onCast);
       requestAnimationFrame(draw);
       buildBar();
+      exSetup();
     }
     function fmt(ms){ var s=Math.max(0,Math.round(ms/1000)); var m=Math.floor(s/60); s=s%60; return m+':'+(s<10?'0':'')+s; }
     var ICON_PLAY='<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
@@ -1640,6 +1741,7 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
     }
     function draw(){
       requestAnimationFrame(draw);
+      if(exportMode) return; // export drives the canvas deterministically via renderAt()
       if(!ctx) return;
       if(trail.width!==vw || trail.height!==vh){ trail.width=vw; trail.height=vh; } // track mid-session viewport
       var now = performance.now();
@@ -1724,6 +1826,7 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
       hudPush(delta, false);
     }
     function onCast(e){
+      if(exportMode) return; // overlay is reconstructed per-frame by renderAt() during export
       if(!e || !e.data) return;
       if(e.type===3){
         var d=e.data;
@@ -1735,6 +1838,68 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
         if(tk) hudPush(tk.text, tk.mod);
       }
     }
+    // ---- export harness: deterministic per-frame render for high-res MP4 export ----
+    // Reconstructs the overlay (trail/clicks/keystrokes) at an arbitrary replay time from the event
+    // data, so an external renderer can seek + screenshot each frame (the live rAF/event-cast path is
+    // gated off via exportMode). window.__bbExport is published once the canvas/HUD exist.
+    var EX_MOVES=[], EX_CLICKS=[], EX_KEYS=[], startT = events.length ? (events[0].timestamp||0) : 0;
+    function exPrepare(){
+      var lv={};
+      for(var i=0;i<events.length;i++){ var e=events[i]; if(!e || e.timestamp==null) continue; var base=e.timestamp-startT;
+        if(e.type===3 && e.data){ var d=e.data;
+          if(d.source===1 && d.positions){ for(var j=0;j<d.positions.length;j++){ var q=d.positions[j]; if(q && q.x!=null) EX_MOVES.push({t:base+(q.timeOffset||0),x:q.x,y:q.y}); } }
+          else if(d.source===2 && (d.type===2||d.type===4||d.type===7) && d.x!=null){ EX_CLICKS.push({t:base,x:d.x,y:d.y}); }
+          else if(d.source===5){ var pv=lv[d.id]!=null?lv[d.id]:''; var cv=d.text!=null?String(d.text):''; lv[d.id]=cv; var dl=(cv.length>=pv.length && cv.slice(0,pv.length)===pv)?cv.slice(pv.length):cv; if(dl && !(hasKeys && dl.length<2)) EX_KEYS.push({t:base,text:dl,mod:false}); }
+        } else if(e.type===5 && e.data && e.data.tag==='bb-key'){ var tk=fmtKey(e.data.payload||{}); if(tk) EX_KEYS.push({t:base,text:tk.text,mod:tk.mod}); }
+      }
+      EX_MOVES.sort(function(a,b){return a.t-b.t;}); EX_CLICKS.sort(function(a,b){return a.t-b.t;}); EX_KEYS.sort(function(a,b){return a.t-b.t;});
+    }
+    function exTrail(T){
+      var pts=[]; for(var i=0;i<EX_MOVES.length;i++){ var mm=EX_MOVES[i]; if(mm.t>T) break; if(mm.t>=T-LIFE) pts.push(mm); }
+      var n=pts.length; if(n<2) return;
+      ctx.lineCap='round'; ctx.lineJoin='round'; var SEG=18;
+      for(var i=0;i<n-1;i++){ var p0=pts[i>0?i-1:0],p1=pts[i],p2=pts[i+1],p3=pts[i<n-2?i+2:n-1]; var prev=p1;
+        for(var s=1;s<=SEG;s++){ var pt=catmull(p0,p1,p2,p3,s/SEG); var frac=(i+s/SEG)/(n-1); ctx.strokeStyle='rgba(74,222,128,'+(0.12+0.62*frac).toFixed(3)+')'; ctx.lineWidth=1.2+3.3*frac; ctx.beginPath(); ctx.moveTo(prev.x,prev.y); ctx.lineTo(pt.x,pt.y); ctx.stroke(); prev=pt; } }
+    }
+    function exClicks(T){
+      for(var i=0;i<EX_CLICKS.length;i++){ var c=EX_CLICKS[i]; var age=T-c.t; if(age<0) break; if(age>600) continue; var p=age/600; var r=13*(0.3+2.4*p); ctx.globalAlpha=0.95*(1-p); ctx.strokeStyle='#4ade80'; ctx.lineWidth=1.6; ctx.beginPath(); ctx.arc(c.x,c.y,r,0,6.2832); ctx.stroke(); ctx.globalAlpha=1; }
+    }
+    function exHud(T){
+      var toks=[]; for(var i=0;i<EX_KEYS.length;i++){ var k=EX_KEYS[i]; if(k.t>T) break; if(k.t>=T-1400) toks.push(k); }
+      toks=toks.slice(-16); hud.textContent='';
+      for(var i=0;i<toks.length;i++){ var el=document.createElement('span'); el.className='bb-key'+(toks[i].mod?' mod':''); el.textContent=toks[i].text; hud.appendChild(el); }
+      hud.classList.toggle('show', toks.length>0);
+    }
+    function exSetup(){
+      exPrepare();
+      window.__bbExport = {
+        total: (function(){ try{ return (player.getMetaData()||{}).totalTime||0; }catch(e){ return 0; } })(),
+        vw: vw, vh: vh,
+        // Enter export framing: hide the bars, fill the window with the frame at recorded aspect, and
+        // move the HUD inside the frame so an element-clip screenshot of .rr-player__frame includes it.
+        enterMode: function(){
+          exportMode=true;
+          var mb=document.getElementById('bb-meta'), br=document.getElementById('bb-bar');
+          if(mb) mb.style.display='none'; if(br) br.style.display='none';
+          document.getElementById('bb-player').style.padding='0';
+          var s=Math.min(window.innerWidth/vw, window.innerHeight/vh); if(!(s>0)) s=0.1;
+          try{ player.$set({width:Math.round(vw*s),height:Math.round(vh*s)}); if(player.triggerResize) player.triggerResize(); }catch(e){}
+          try{ var fr=document.querySelector('.rr-player__frame').getBoundingClientRect(); hud.style.bottom=Math.max(8,(window.innerHeight - fr.bottom + Math.round(fr.height*0.03)))+'px'; }catch(e){}
+          return true;
+        },
+        // Seek to ms and draw the reconstructed overlay for that instant (call, wait a beat, screenshot).
+        renderAt: function(ms){
+          try{ player.pause(); }catch(e){}
+          try{ player.goto(ms); }catch(e){}
+          try{ player.pause(); }catch(e){}
+          if(trail.width!==vw||trail.height!==vh){ trail.width=vw; trail.height=vh; }
+          ctx.clearRect(0,0,trail.width,trail.height);
+          exTrail(ms); exClicks(ms); exHud(ms);
+          return true;
+        }
+      };
+    }
+
     ensure();
   })();
 })();

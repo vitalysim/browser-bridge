@@ -9,7 +9,7 @@
 
 <p align="center">
   <img alt="version" src="https://img.shields.io/badge/version-0.11.0-3f3f46?style=flat-square">
-  <img alt="tools" src="https://img.shields.io/badge/tools-62-3f3f46?style=flat-square">
+  <img alt="tools" src="https://img.shields.io/badge/tools-63-3f3f46?style=flat-square">
   <img alt="protocol" src="https://img.shields.io/badge/MCP-streamable_HTTP-52525b?style=flat-square">
   <img alt="browser" src="https://img.shields.io/badge/Chrome%2FEdge-Manifest_V3-52525b?style=flat-square">
   <img alt="language" src="https://img.shields.io/badge/TypeScript-strict-3178c6?style=flat-square">
@@ -19,7 +19,7 @@
 
 Browser Bridge is a local **MCP server + Manifest V3 Chrome extension** that lets AI coding agents - **Claude Code** and **OpenAI Codex CLI** - control the Chrome you use every day. Because it runs *inside* your real profile, the agent inherits your cookies, `HttpOnly` sessions, SSO, and 2FA state automatically. Ask it to *"read my feed and summarize it"* or *"capture the API traffic on this page and show me the responses"* - and it works against the live, authenticated app.
 
-It ships **62 tools** spanning everyday browsing, DevTools-grade network capture, a full web-security testing toolkit, **playbooks** (saved, self-healing recipes), and **session recording** (record an interaction, replay it as a self-contained HTML timeline).
+It ships **63 tools** spanning everyday browsing, DevTools-grade network capture, a full web-security testing toolkit, **playbooks** (saved, self-healing recipes), and **session recording** (record an interaction, replay it as a self-contained HTML timeline).
 
 ## Contents
 
@@ -346,7 +346,7 @@ server/                 MCP server (TypeScript · @modelcontextprotocol/sdk · w
   src/index.ts            HTTP MCP endpoint + auth + session management
   src/hub.ts              single extension socket, request/response correlation, capture sinks
   src/capture-sink.ts     durable on-disk JSON-Lines sink for persist captures
-  src/tools.ts            the 62 MCP tools
+  src/tools.ts            the 63 MCP tools
 extension/              Manifest V3 extension (bundled with esbuild via build.mjs)
   manifest.json
   src/background.ts       service worker: WS client, injection, chrome.debugger (CDP) layer
