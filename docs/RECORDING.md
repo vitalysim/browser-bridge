@@ -30,6 +30,11 @@ The replay **fills the viewer window at the recorded page's exact aspect ratio**
 sized to the recorded viewport and scaled to fit, so there's no wasted letterbox - just a dark margin around a
 correctly-proportioned replay. It **rescales on window resize** and follows mid-session viewport changes.
 
+The replay ships with a custom **FRACTURE**-styled player chrome: a monochrome black stage, a top metabar
+(`FRACTURE // <title>` + event count, duration, a live indicator) and a bottom control bar (play/pause, a mono
+timecode, a scrubber, `1×/2×/4×/8×` speed chips, skip-idle, the interactions toggle, and fullscreen). rrweb's default
+controller is hidden; the bar is wired to the player API.
+
 ### Interaction overlay (mouse trail, clicks, keystrokes)
 - **Smooth mouse trail.** The replay draws a soft, rounded, brand-colored trail behind the cursor (replacing rrweb's
   default hard-cornered red line). It's always on and fades within ~0.6 s.

@@ -1450,25 +1450,82 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
 <title>${title}</title>
 <style>${PLAYER_CSS}</style>
 <style>
-  html,body{margin:0;height:100%;background:#0b0b0d;overflow:hidden}
-  /* full-viewport dark centering container; neutralize the vendored player's float/radius/shadow chrome
-     (do NOT touch .rr-player__frame width or .replayer-wrapper transform - that breaks the computed scale) */
-  #bb-player{display:flex;align-items:center;justify-content:center;width:100vw;height:100vh;padding:0;overflow:hidden}
-  #bb-player .rr-player{float:none;border-radius:0;box-shadow:none;background:#0b0b0d}
-  /* interaction overlay: smooth mouse trail (always on), click ripples + keystroke HUD (toggle) */
+  /* ===== FRACTURE // DS-1 - replay chrome. Monochrome stage; chroma = live/severity, never decoration. ===== */
+  :root{
+    --ink:#000;--ink-2:#050506;--surface:#0a0a0b;--surface-2:#101012;--surface-3:#17171a;
+    --white:#fff;--text:#ededee;--text-2:#a2a2a7;--text-3:#6c6c73;--text-4:#3b3b41;
+    --line:rgba(255,255,255,.09);--line-2:rgba(255,255,255,.17);--line-hair:rgba(255,255,255,.045);
+    --live:#4ade80;--live-line:rgba(74,222,128,.42);--live-bg:rgba(74,222,128,.10);
+    --font-mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+    --font-disp:"Inter Tight","Helvetica Neue",Helvetica,Arial,sans-serif;
+    --bar-top:46px;--bar-bot:78px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--ink);color:var(--text);font-family:var(--font-mono);overflow:hidden}
+  body::after{content:"";position:fixed;inset:0;z-index:1;pointer-events:none;background:radial-gradient(130% 92% at 50% 0%,transparent 0,transparent 44%,rgba(0,0,0,.72) 100%)}
+  /* stage: the replay is centered in the band between the top metabar and the bottom control bar.
+     Do NOT touch .rr-player__frame width or .replayer-wrapper transform - it breaks the computed scale. */
+  #bb-player{position:relative;z-index:2;display:flex;align-items:center;justify-content:center;width:100vw;height:100vh;padding:var(--bar-top) 0 var(--bar-bot);overflow:hidden}
+  #bb-player .rr-player{float:none;border-radius:2px;background:var(--ink);box-shadow:0 0 0 1px var(--line),0 40px 90px rgba(0,0,0,.62)}
+  #bb-player .rr-player__frame{border-radius:2px}
+  #bb-player .rr-controller{display:none!important} /* hidden: still mounts + emits ui-update time/state to our bar */
+
+  /* ---- top metabar ---- */
+  #bb-meta{position:fixed;top:0;left:0;right:0;z-index:30;height:var(--bar-top);display:flex;align-items:center;gap:18px;padding:0 22px;background:rgba(0,0,0,.72);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-bottom:1px solid var(--line);font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--text-3)}
+  #bb-meta .mark{color:var(--white);font-weight:700;letter-spacing:.26em}
+  #bb-meta .sep{color:var(--text-4)}
+  #bb-meta .ttl{font-family:var(--font-disp);font-weight:600;font-size:12px;letter-spacing:-.01em;text-transform:none;color:var(--text)}
+  #bb-meta .spacer{flex:1}
+  #bb-meta .stat b{color:var(--white);font-weight:600}
+  #bb-meta .live{display:inline-flex;align-items:center;gap:7px;color:var(--live)}
+  #bb-meta .live .d{width:5px;height:5px;border-radius:50%;background:var(--live);box-shadow:0 0 8px var(--live)}
+  @media(max-width:720px){#bb-meta .hide-sm{display:none}}
+
+  /* ---- bottom control bar ---- */
+  #bb-bar{position:fixed;left:0;right:0;bottom:0;z-index:30;height:var(--bar-bot);display:flex;align-items:center;gap:16px;padding:0 22px;background:rgba(5,5,6,.86);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-top:1px solid var(--line);font-family:var(--font-mono)}
+  .bb-ic{width:38px;height:38px;flex:none;display:inline-flex;align-items:center;justify-content:center;padding:0;border:1px solid var(--line-2);border-radius:3px;background:transparent;color:var(--text);cursor:pointer;transition:border-color .16s,color .16s,opacity .16s,background .16s}
+  .bb-ic:hover{border-color:var(--white);color:var(--white)}
+  .bb-ic svg{width:15px;height:15px}
+  #bb-play{border-color:var(--white);background:var(--white);color:var(--ink)} /* the single solid mark */
+  #bb-play:hover{opacity:.82}
+  .bb-time{font-size:11px;letter-spacing:.06em;color:var(--text-3);white-space:nowrap;font-variant-numeric:tabular-nums}
+  .bb-time b{color:var(--white);font-weight:600}
+  .bb-track{position:relative;flex:1;min-width:80px;height:26px;display:flex;align-items:center;cursor:pointer;touch-action:none}
+  .bb-track .rail{position:absolute;left:0;right:0;height:2px;background:var(--line-2);transition:height .12s}
+  .bb-track .fill{position:absolute;left:0;height:2px;background:var(--white);width:0;transition:height .12s}
+  .bb-track .knob{position:absolute;left:0;width:3px;height:13px;background:var(--white);transform:translateX(-50%)}
+  .bb-track:hover .rail,.bb-track:hover .fill{height:3px}
+  .bb-chips{display:flex;gap:6px;align-items:center}
+  .bb-chip{font-family:var(--font-mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;padding:7px 12px;border-radius:999px;border:1px solid var(--line);color:var(--text-3);background:transparent;cursor:pointer;transition:border-color .14s,color .14s,background .14s;white-space:nowrap}
+  .bb-chip:hover{border-color:var(--line-2);color:var(--text)}
+  .bb-chip.on{background:var(--white);border-color:var(--white);color:var(--ink);font-weight:600}
+  .bb-chip.live.on{background:var(--live);border-color:var(--live);color:var(--ink)}
+  .bb-div{width:1px;height:26px;background:var(--line);flex:none}
+  @media(max-width:820px){#bb-bar{gap:10px;padding:0 12px}.bb-hide-sm{display:none}}
+
+  /* ---- interaction overlay: smooth "live" comet trail + click ripples + keystroke HUD ---- */
   .bb-trail{position:absolute;left:0;top:0;pointer-events:none}
-  .bb-click{position:absolute;width:24px;height:24px;margin:-12px 0 0 -12px;border-radius:50%;border:2px solid #4950f6;background:rgba(73,80,246,.18);pointer-events:none;animation:bb-ripple .6s ease-out forwards}
-  @keyframes bb-ripple{0%{transform:scale(.4);opacity:.9}100%{transform:scale(2.6);opacity:0}}
-  .bb-hud{position:fixed;left:50%;bottom:96px;transform:translateX(-50%);z-index:2147483646;display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:center;max-width:82vw;padding:8px 12px;border-radius:10px;background:rgba(17,16,62,.82);box-shadow:0 6px 24px rgba(0,0,0,.35);opacity:0;transition:opacity .25s;pointer-events:none}
+  .bb-click{position:absolute;width:26px;height:26px;margin:-13px 0 0 -13px;border-radius:50%;border:1.5px solid var(--live);background:var(--live-bg);pointer-events:none;animation:bb-ripple .6s ease-out forwards}
+  @keyframes bb-ripple{0%{transform:scale(.3);opacity:.95}100%{transform:scale(2.7);opacity:0}}
+  .bb-hud{position:fixed;left:50%;bottom:calc(var(--bar-bot) + 16px);transform:translateX(-50%);z-index:29;display:flex;gap:5px;align-items:center;flex-wrap:wrap;justify-content:center;max-width:80vw;padding:8px 10px;border-radius:8px;background:rgba(5,5,6,.9);border:1px solid var(--line);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);box-shadow:0 12px 34px rgba(0,0,0,.55);opacity:0;transition:opacity .2s;pointer-events:none}
   .bb-hud.show{opacity:1}
-  .bb-key{display:inline-block;padding:2px 8px;border-radius:6px;background:#4950f6;color:#fff;font:600 13px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;white-space:pre}
-  .bb-key.mod{background:#2b2f7a}
-  #bb-toggle{width:32px;height:32px;display:inline-flex;align-items:center;justify-content:center;padding:0;margin:0 2px;border:none;border-radius:50%;background:none;cursor:pointer;color:#4950f6;font-size:16px;line-height:1}
-  #bb-toggle:hover{background:#e0e1fe}
-  #bb-toggle.on{color:#fff;background:#4950f6}
+  .bb-key{font-family:var(--font-mono);font-size:12px;letter-spacing:.02em;padding:3px 8px;border-radius:3px;background:var(--surface-3);border:1px solid var(--line-2);color:var(--text);white-space:pre}
+  .bb-key.mod{color:var(--live);border-color:var(--live-line);background:var(--live-bg)}
 </style>
 </head><body>
+<div id="bb-meta"><span class="mark">FRACTURE</span><span class="sep">//</span><span class="ttl">${title}</span><span class="spacer"></span><span class="stat hide-sm">EVENTS <b id="bb-ev">0</b></span><span class="stat hide-sm">DUR <b id="bb-dur">0:00</b></span><span class="live"><span class="d"></span>REPLAY</span></div>
 <div id="bb-player"></div>
+<div id="bb-bar">
+  <button id="bb-play" class="bb-ic" title="Play / pause"></button>
+  <div class="bb-time"><b id="bb-cur">0:00</b> / <span id="bb-total">0:00</span></div>
+  <div id="bb-track" class="bb-track"><div class="rail"></div><div class="fill"></div><div class="knob"></div></div>
+  <div class="bb-div bb-hide-sm"></div>
+  <div id="bb-speeds" class="bb-chips"><button class="bb-chip on" data-s="1">1&#215;</button><button class="bb-chip" data-s="2">2&#215;</button><button class="bb-chip" data-s="4">4&#215;</button><button class="bb-chip" data-s="8">8&#215;</button></div>
+  <div class="bb-div bb-hide-sm"></div>
+  <button id="bb-skip" class="bb-chip${meta.skipInactive ? " on" : ""} bb-hide-sm" title="Skip idle stretches">Skip idle</button>
+  <button id="bb-keys" class="bb-chip live on" title="Show clicks &amp; keystrokes">Keys</button>
+  <button id="bb-full" class="bb-ic" title="Fullscreen"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>
+</div>
 <script id="bb-events" type="application/json">${json}</script>
 <script>${PLAYER_JS}</script>
 <script>
@@ -1480,7 +1537,7 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
   // pixels, so the fit math is DPR-correct by construction - never multiply by devicePixelRatio.
   var m = events.find(function(e){ return e.type === 4; });
   var vw = (m && m.data && m.data.width) || 1024, vh = (m && m.data && m.data.height) || 576;
-  var CTRL = 80; // rrweb-player controller-bar height in the currently vendored build
+  var CTRL = 46 + 78; // reserve the top metabar (46) + bottom control bar (78) so the replay fits between them
   var player = new P({ target: document.getElementById('bb-player'),
     props: { events: events, showController: true, autoPlay: ${meta.autoplay ? "true" : "false"},
              skipInactive: ${meta.skipInactive ? "true" : "false"}, speedOption: [1,2,4,8],
@@ -1531,7 +1588,45 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
       document.getElementById('bb-player').appendChild(hud);
       replayer.on('event-cast', onCast);
       requestAnimationFrame(draw);
-      addToggle();
+      buildBar();
+    }
+    function fmt(ms){ var s=Math.max(0,Math.round(ms/1000)); var m=Math.floor(s/60); s=s%60; return m+':'+(s<10?'0':'')+s; }
+    var ICON_PLAY='<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
+    var ICON_PAUSE='<svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 4h4v16H6zM14 4h4v16h-4z"/></svg>';
+    function buildBar(){
+      var play=document.getElementById('bb-play');
+      if(!play){ requestAnimationFrame(buildBar); return; }
+      var total=1; try{ total=(player.getMetaData()||{}).totalTime||1; }catch(e){}
+      var evEl=document.getElementById('bb-ev'); if(evEl) evEl.textContent=String(events.length);
+      var durEl=document.getElementById('bb-dur'); if(durEl) durEl.textContent=fmt(total);
+      var totEl=document.getElementById('bb-total'); if(totEl) totEl.textContent=fmt(total);
+      var curEl=document.getElementById('bb-cur');
+      var fill=document.querySelector('#bb-track .fill'), knob=document.querySelector('#bb-track .knob'), track=document.getElementById('bb-track');
+      var dragging=false;
+      function setProg(ms){ var f=total>0?Math.max(0,Math.min(1,ms/total)):0; fill.style.width=(f*100)+'%'; knob.style.left=(f*100)+'%'; if(curEl) curEl.textContent=fmt(ms); }
+      // play / pause
+      play.innerHTML = ${meta.autoplay ? "ICON_PAUSE" : "ICON_PLAY"};
+      play.addEventListener('click', function(){ try{ player.toggle(); }catch(e){} });
+      // time + state (the hidden vendored controller still dispatches these)
+      player.addEventListener('ui-update-current-time', function(d){ if(!dragging) setProg((d&&d.payload)||0); });
+      player.addEventListener('ui-update-player-state', function(d){ var pl=(d&&d.payload)==='playing'; play.innerHTML=pl?ICON_PAUSE:ICON_PLAY; });
+      // scrub
+      function seekAt(cx){ var r=track.getBoundingClientRect(); var f=r.width>0?(cx-r.left)/r.width:0; f=Math.max(0,Math.min(1,f)); setProg(f*total); try{ player.goto(f*total); }catch(e){} }
+      track.addEventListener('pointerdown', function(ev){ dragging=true; try{ track.setPointerCapture(ev.pointerId); }catch(e){} seekAt(ev.clientX); });
+      track.addEventListener('pointermove', function(ev){ if(dragging) seekAt(ev.clientX); });
+      window.addEventListener('pointerup', function(){ dragging=false; });
+      // speed
+      var chips=document.querySelectorAll('#bb-speeds .bb-chip');
+      for(var i=0;i<chips.length;i++){ (function(c){ c.addEventListener('click', function(){ var sp=parseInt(c.getAttribute('data-s'),10)||1; try{ player.setSpeed(sp); }catch(e){} for(var j=0;j<chips.length;j++) chips[j].classList.remove('on'); c.classList.add('on'); }); })(chips[i]); }
+      // skip idle
+      var skip=document.getElementById('bb-skip');
+      if(skip) skip.addEventListener('click', function(){ try{ player.toggleSkipInactive(); }catch(e){} skip.classList.toggle('on'); });
+      // clicks + keystrokes toggle (default ON)
+      var keys=document.getElementById('bb-keys');
+      if(keys) keys.addEventListener('click', function(){ show=!show; keys.classList.toggle('on', show); if(!show){ hud.classList.remove('show'); hudTokens=[]; } });
+      // fullscreen
+      var full=document.getElementById('bb-full');
+      if(full) full.addEventListener('click', function(){ var el=document.getElementById('bb-player'); try{ if(document.fullscreenElement) document.exitFullscreen(); else el.requestFullscreen(); }catch(e){} });
     }
     function catmull(p0,p1,p2,p3,t){ // centripetal-ish Catmull-Rom: a smooth curve THROUGH the points
       var t2=t*t, t3=t2*t;
@@ -1569,7 +1664,7 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
         for(var s=1;s<=SEG;s++){
           var pt=catmull(p0,p1,p2,p3,s/SEG);
           var frac=(i+s/SEG)/(n-1);        // 0 = oldest tail .. 1 = newest head
-          ctx.strokeStyle='rgba(73,80,246,'+(0.10+0.6*frac).toFixed(3)+')';
+          ctx.strokeStyle='rgba(74,222,128,'+(0.12+0.62*frac).toFixed(3)+')'; // FRACTURE "live" green
           ctx.lineWidth=1.2+3.3*frac;      // taper: thin faint tail -> thick bright head
           ctx.beginPath(); ctx.moveTo(prev.x,prev.y); ctx.lineTo(pt.x,pt.y); ctx.stroke();
           prev=pt;
@@ -1634,15 +1729,6 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
         var tk=fmtKey(e.data.payload||{});
         if(tk) hudPush(tk.text, tk.mod);
       }
-    }
-    function addToggle(){
-      var btns=document.querySelector('.rr-controller__btns');
-      if(!btns){ requestAnimationFrame(addToggle); return; }
-      var b=document.createElement('button');
-      b.id='bb-toggle'; b.className='on'; b.title='Show clicks and keystrokes';
-      b.textContent='⌨'; // keyboard glyph
-      b.addEventListener('click', function(){ show=!show; b.className=show?'on':''; if(!show){ hud.classList.remove('show'); hudTokens=[]; } });
-      btns.appendChild(b);
     }
     ensure();
   })();
