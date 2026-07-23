@@ -11,6 +11,7 @@ type StartOpts = { allFrames?: boolean; maskInputs?: boolean; recordCanvas?: boo
   if (w.__bbRec) return; // idempotent — the file may be injected more than once per frame
 
   let stopFn: (() => void) | null = null;
+  let keyHandler: ((e: KeyboardEvent) => void) | null = null;
   let batch: any[] = [];
   let timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -58,14 +59,51 @@ type StartOpts = { allFrames?: boolean; maskInputs?: boolean; recordCanvas?: boo
           recordCanvas: !!opts.recordCanvas,
           checkoutEveryNms: 30_000, // periodic full snapshot bounds loss on SW death
           maskAllInputs: !!opts.maskInputs,
-          sampling: { mousemove: 50 },
+          sampling: { mousemove: 16 }, // ~60fps mouse sampling so the replay trail is dense enough to render smoothly
           inlineStylesheet: true,
           collectFonts: false,
         }) || null;
+      // rrweb doesn't record physical keydowns; capture them as custom events so the replay can show a
+      // keystroke HUD (Enter/arrows/shortcuts + typed chars). Rides the same emit->relay->JSONL->replay path.
+      const mask = !!opts.maskInputs;
+      keyHandler = (e: KeyboardEvent) => {
+        try {
+          let key = e.key;
+          // Honor maskInputs: don't leak, in cleartext keystrokes, what input-masking would redact.
+          if (mask && typeof key === "string" && key.length === 1) {
+            const t = e.target as any;
+            const tag = t && t.tagName;
+            const masked =
+              tag === "TEXTAREA" ||
+              (t && t.isContentEditable) ||
+              (tag === "INPUT" && /^(text|password|search|email|tel|url|number|)$/i.test(t.type || ""));
+            if (masked) key = "•";
+          }
+          (record as any).addCustomEvent("bb-key", {
+            key,
+            code: e.code,
+            ctrl: e.ctrlKey,
+            meta: e.metaKey,
+            alt: e.altKey,
+            shift: e.shiftKey,
+          });
+        } catch {
+          /* recorder stopped between keydown and emit */
+        }
+      };
+      document.addEventListener("keydown", keyHandler, true);
       this.recording = true;
       return { started: true, top: isTop, crossOrigin };
     },
     stop() {
+      if (keyHandler) {
+        try {
+          document.removeEventListener("keydown", keyHandler, true);
+        } catch {
+          /* ignore */
+        }
+        keyHandler = null;
+      }
       try {
         stopFn && stopFn();
       } catch {

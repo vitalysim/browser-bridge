@@ -1455,6 +1455,17 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
      (do NOT touch .rr-player__frame width or .replayer-wrapper transform - that breaks the computed scale) */
   #bb-player{display:flex;align-items:center;justify-content:center;width:100vw;height:100vh;padding:0;overflow:hidden}
   #bb-player .rr-player{float:none;border-radius:0;box-shadow:none;background:#0b0b0d}
+  /* interaction overlay: smooth mouse trail (always on), click ripples + keystroke HUD (toggle) */
+  .bb-trail{position:absolute;left:0;top:0;pointer-events:none}
+  .bb-click{position:absolute;width:24px;height:24px;margin:-12px 0 0 -12px;border-radius:50%;border:2px solid #4950f6;background:rgba(73,80,246,.18);pointer-events:none;animation:bb-ripple .6s ease-out forwards}
+  @keyframes bb-ripple{0%{transform:scale(.4);opacity:.9}100%{transform:scale(2.6);opacity:0}}
+  .bb-hud{position:fixed;left:50%;bottom:96px;transform:translateX(-50%);z-index:2147483646;display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:center;max-width:82vw;padding:8px 12px;border-radius:10px;background:rgba(17,16,62,.82);box-shadow:0 6px 24px rgba(0,0,0,.35);opacity:0;transition:opacity .25s;pointer-events:none}
+  .bb-hud.show{opacity:1}
+  .bb-key{display:inline-block;padding:2px 8px;border-radius:6px;background:#4950f6;color:#fff;font:600 13px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;white-space:pre}
+  .bb-key.mod{background:#2b2f7a}
+  #bb-toggle{width:32px;height:32px;display:inline-flex;align-items:center;justify-content:center;padding:0;margin:0 2px;border:none;border-radius:50%;background:none;cursor:pointer;color:#4950f6;font-size:16px;line-height:1}
+  #bb-toggle:hover{background:#e0e1fe}
+  #bb-toggle.on{color:#fff;background:#4950f6}
 </style>
 </head><body>
 <div id="bb-player"></div>
@@ -1474,6 +1485,7 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
     props: { events: events, showController: true, autoPlay: ${meta.autoplay ? "true" : "false"},
              skipInactive: ${meta.skipInactive ? "true" : "false"}, speedOption: [1,2,4,8],
              width: vw, height: vh,
+             mouseTail: false, /* disable rrweb's red, hard-cornered trail; we draw a smooth one below */
              maxScale: 0 /* uncap scaling so small/mobile recordings upscale to fill; relies on the vendored player's "a && push(a)" falsy-guard */ } });
   function fit(){
     var s = Math.min(window.innerWidth / vw, (window.innerHeight - CTRL) / vh);
@@ -1490,6 +1502,150 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
     if (rp && rp.on) rp.on('resize', function(d){ if (d && d.width && d.height){ vw = d.width; vh = d.height; fit(); } });
   } catch(e){}
   requestAnimationFrame(fit);
+
+  // ---- interaction overlay: smooth mouse trail (always on) + click ripples + keystroke HUD (toggle, default ON) ----
+  (function(){
+    var replayer = null;
+    try { replayer = player.getReplayer(); } catch(e){}
+    if (!replayer || !replayer.on) return;
+    var hasKeys = false;
+    for (var i=0;i<events.length;i++){ var e=events[i]; if(e && e.type===5 && e.data && e.data.tag==='bb-key'){ hasKeys=true; break; } }
+    var show = true;              // interactions overlay default ON
+    var pts = [];                 // {x,y,t} recent mouse points for the smooth trail
+    var LIFE = 700;               // trail fade window (ms)
+    var wrap=null, trail=null, ctx=null, hud=null, mouseEl=null;
+    var lastVal = {};             // per-input last value (typed-text fallback / paste detection)
+    var hudTokens = [], hudTimer=null;
+
+    function ensure(){
+      wrap = document.querySelector('.replayer-wrapper'); // the single scaled element; recorded x/y map into it
+      if(!wrap){ requestAnimationFrame(ensure); return; }
+      trail = document.createElement('canvas');
+      trail.className = 'bb-trail';
+      trail.width = vw; trail.height = vh;
+      mouseEl = wrap.querySelector('.replayer-mouse');
+      if(mouseEl) wrap.insertBefore(trail, mouseEl); else wrap.appendChild(trail); // above iframe, below cursor
+      ctx = trail.getContext('2d');
+      hud = document.createElement('div');
+      hud.className = 'bb-hud';
+      document.getElementById('bb-player').appendChild(hud);
+      replayer.on('event-cast', onCast);
+      requestAnimationFrame(draw);
+      addToggle();
+    }
+    function catmull(p0,p1,p2,p3,t){ // centripetal-ish Catmull-Rom: a smooth curve THROUGH the points
+      var t2=t*t, t3=t2*t;
+      return { x:0.5*(2*p1.x+(p2.x-p0.x)*t+(2*p0.x-5*p1.x+4*p2.x-p3.x)*t2+(3*p1.x-p0.x-3*p2.x+p3.x)*t3),
+               y:0.5*(2*p1.y+(p2.y-p0.y)*t+(2*p0.y-5*p1.y+4*p2.y-p3.y)*t2+(3*p1.y-p0.y-3*p2.y+p3.y)*t3) };
+    }
+    function draw(){
+      requestAnimationFrame(draw);
+      if(!ctx) return;
+      if(trail.width!==vw || trail.height!==vh){ trail.width=vw; trail.height=vh; } // track mid-session viewport
+      var now = performance.now();
+      // Sample the CURSOR's live position each frame so the trail TRAILS the mouse. (Feeding it from
+      // batched MouseMove events made the trail jump ahead of the still-animating cursor - it led the
+      // mouse instead of following it.) The head point is thus always exactly at the cursor.
+      if(mouseEl){
+        var lx=parseFloat(mouseEl.style.left), ly=parseFloat(mouseEl.style.top);
+        if(!isNaN(lx) && !isNaN(ly)){
+          var last = pts.length ? pts[pts.length-1] : null;
+          var far = last ? (Math.abs(last.x-lx)>400 || Math.abs(last.y-ly)>400) : false; // seek jump: reset
+          if(far) pts.length = 0;
+          if(!last || Math.abs(last.x-lx)>0.5 || Math.abs(last.y-ly)>0.5) pts.push({x:lx,y:ly,t:now});
+        }
+      }
+      while(pts.length && now - pts[0].t > LIFE) pts.shift();
+      ctx.clearRect(0,0,trail.width,trail.height);
+      var n = pts.length;
+      if(n < 2) return;
+      ctx.lineCap='round'; ctx.lineJoin='round';
+      // Draw a Catmull-Rom spline through the points, finely resampled (SEG sub-steps per span) into a
+      // tapered, fading comet - fluid and rounded even when the recorded samples are sparse.
+      var SEG = 18;
+      for(var i=0;i<n-1;i++){
+        var p0=pts[i>0?i-1:0], p1=pts[i], p2=pts[i+1], p3=pts[i<n-2?i+2:n-1];
+        var prev=p1;
+        for(var s=1;s<=SEG;s++){
+          var pt=catmull(p0,p1,p2,p3,s/SEG);
+          var frac=(i+s/SEG)/(n-1);        // 0 = oldest tail .. 1 = newest head
+          ctx.strokeStyle='rgba(73,80,246,'+(0.10+0.6*frac).toFixed(3)+')';
+          ctx.lineWidth=1.2+3.3*frac;      // taper: thin faint tail -> thick bright head
+          ctx.beginPath(); ctx.moveTo(prev.x,prev.y); ctx.lineTo(pt.x,pt.y); ctx.stroke();
+          prev=pt;
+        }
+      }
+    }
+    function ripple(x,y){
+      if(!show || !wrap) return;
+      var el=document.createElement('span');
+      el.className='bb-click';
+      el.style.left=x+'px'; el.style.top=y+'px';
+      wrap.appendChild(el);
+      setTimeout(function(){ if(el.parentNode) el.parentNode.removeChild(el); }, 650);
+    }
+    function renderHud(){
+      hud.textContent='';
+      for(var i=0;i<hudTokens.length;i++){
+        var c=document.createElement('span');
+        c.className='bb-key'+(hudTokens[i].mod?' mod':'');
+        c.textContent=hudTokens[i].text; // textContent, not innerHTML: the recording's own text stays inert
+        hud.appendChild(c);
+      }
+    }
+    function hudPush(text, mod){
+      if(!show || !text) return;
+      hudTokens.push({text:text, mod:!!mod});
+      if(hudTokens.length>16) hudTokens.shift();
+      renderHud();
+      hud.classList.add('show');
+      clearTimeout(hudTimer);
+      hudTimer=setTimeout(function(){ hud.classList.remove('show'); hudTokens=[]; }, 1400);
+    }
+    var SPECIAL={Enter:'↵',Tab:'⇥',Escape:'⎋',Backspace:'⌫',Delete:'⌦',ArrowLeft:'←',ArrowUp:'↑',ArrowRight:'→',ArrowDown:'↓',' ':'␣',CapsLock:'⇪',PageUp:'PgUp',PageDown:'PgDn',Home:'Home',End:'End'};
+    function fmtKey(p){
+      var k=p.key;
+      if(k==='Shift'||k==='Control'||k==='Alt'||k==='Meta'||k==='Dead') return null; // lone modifier: skip
+      var parts=[];
+      if(p.meta) parts.push('⌘'); if(p.ctrl) parts.push('⌃'); if(p.alt) parts.push('⌥');
+      if(p.shift && (!k || k.length>1)) parts.push('⇧'); // shift shown for non-printables; printables already cased
+      parts.push(SPECIAL[k] || k);
+      return { text: parts.join(' '), mod: !!(p.meta||p.ctrl||p.alt) };
+    }
+    function onInput(d){
+      var prev = lastVal[d.id]!=null ? lastVal[d.id] : '';
+      var cur = d.text!=null ? String(d.text) : '';
+      lastVal[d.id]=cur;
+      var delta;
+      if(cur.length>=prev.length && cur.slice(0,prev.length)===prev) delta=cur.slice(prev.length);
+      else delta=cur; // replaced / backspaced: show the current value
+      if(!delta) return;
+      if(hasKeys && delta.length<2) return; // physical keys already cover single chars; keep pastes/autofill
+      hudPush(delta, false);
+    }
+    function onCast(e){
+      if(!e || !e.data) return;
+      if(e.type===3){
+        var d=e.data;
+        // (mouse trail is fed by sampling the cursor in draw(), not from these MouseMove batches)
+        if(d.source===2 && (d.type===2||d.type===4||d.type===7) && d.x!=null){ ripple(d.x,d.y); } // Click/DblClick/TouchStart
+        else if(d.source===5){ onInput(d); }
+      } else if(e.type===5 && e.data.tag==='bb-key'){
+        var tk=fmtKey(e.data.payload||{});
+        if(tk) hudPush(tk.text, tk.mod);
+      }
+    }
+    function addToggle(){
+      var btns=document.querySelector('.rr-controller__btns');
+      if(!btns){ requestAnimationFrame(addToggle); return; }
+      var b=document.createElement('button');
+      b.id='bb-toggle'; b.className='on'; b.title='Show clicks and keystrokes';
+      b.textContent='⌨'; // keyboard glyph
+      b.addEventListener('click', function(){ show=!show; b.className=show?'on':''; if(!show){ hud.classList.remove('show'); hudTokens=[]; } });
+      btns.appendChild(b);
+    }
+    ensure();
+  })();
 })();
 </script>
 </body></html>`;

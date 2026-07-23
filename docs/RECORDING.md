@@ -30,6 +30,18 @@ The replay **fills the viewer window at the recorded page's exact aspect ratio**
 sized to the recorded viewport and scaled to fit, so there's no wasted letterbox - just a dark margin around a
 correctly-proportioned replay. It **rescales on window resize** and follows mid-session viewport changes.
 
+### Interaction overlay (mouse trail, clicks, keystrokes)
+- **Smooth mouse trail.** The replay draws a soft, rounded, brand-colored trail behind the cursor (replacing rrweb's
+  default hard-cornered red line). It's always on and fades within ~0.6 s.
+- **Interactions toggle** (a keyboard button `⌨` in the player controls, **on by default**) shows/hides:
+  - **Click ripples** - an expanding ring at each click/double-click/tap.
+  - **Keystroke HUD** - a caption of what you typed. For recordings made with the current extension it shows **physical
+    keys** (letters plus `Enter ↵`, arrows, and shortcuts like `⌘ C`); older recordings fall back to the **typed field
+    text**, and pastes/autofills are surfaced either way.
+- **Privacy.** Physical-key capture logs every keystroke, so with masking **off** (the default) it will show passwords
+  key-by-key. Recording with `maskInputs:true` redacts printable keys typed into inputs (shown as `•`), consistent with
+  how it masks input values. Treat a recording as sensitive as the session it captured.
+
 ## What makes this better than page-level rrweb
 
 - **Truly self-contained / offline-faithful.** On stop, the server fetches **every external asset the capture
