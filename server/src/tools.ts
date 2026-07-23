@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { writeFileSync, readFileSync, renameSync, copyFileSync, unlinkSync, mkdirSync } from "fs";
+import { writeFile as writeFileAsync } from "fs/promises";
 import { homedir } from "os";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -1061,7 +1062,9 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
   );
 
   // ---- session recording (rrweb -> self-contained HTML replay) ----
-  const recordingPaths = new Map<number, string>(); // tabId -> events JSONL path
+  // The tabId -> events-file path bookkeeping lives on the hub singleton (hub.setRecordingPath/…),
+  // NOT a per-MCP-session closure, so session_record_stop resolves the path even if start and stop
+  // are issued from different MCP sessions/clients (e.g. after a reconnect, or Claude Code + Codex).
 
   tool(
     "session_record_start",
@@ -1094,7 +1097,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         });
         if (r?.tabId == null) throw new Error("extension did not return the recorded tabId");
         hub.registerSessionSink(r.tabId, sink);
-        recordingPaths.set(r.tabId, eventsPath);
+        hub.setRecordingPath(r.tabId, eventsPath);
         return textResult({ ...r, eventsPath });
       } catch (e) {
         sink.close();
@@ -1117,31 +1120,37 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       skipInactive: z.boolean().optional().describe("Fast-forward idle/scroll-only stretches in the player (default false = play everything in real time)"),
       inlineAssets: z.boolean().optional().describe("Inline external CSS/fonts/images for a self-contained offline file (default true)"),
       assetBudgetMB: z.number().optional().describe("Total inline budget in MB (default 50); oversized/over-budget assets are left live and reported in `skipped`"),
+      perAssetMB: z.number().optional().describe("Per-asset size cap in MB (default 2); a single asset larger than this is left live and reported in `skipped`"),
       tabId: tabIdParam,
     },
     async (args) => {
       const r = await hub.call("session_record_stop", { tabId: args.tabId }, 30_000);
       const tabId = r?.tabId;
       hub.closeSessionSink(tabId); // usually already closed by the streamed `done`; idempotent
-      const eventsPath = recordingPaths.get(tabId);
-      recordingPaths.delete(tabId);
+      const eventsPath = hub.getRecordingPath(tabId);
+      hub.deleteRecordingPath(tabId);
       if (!eventsPath) throw new Error("no recording was active for this tab");
       const events = parseSessionEvents(readFileSync(eventsPath, "utf8"));
       if (!events.length) throw new Error(`recording had no events (${eventsPath}) - did you interact with the page?`);
       // Inline external assets so the replay is self-contained/offline-faithful (fetched via the extension).
+      const perAssetMaxBytes = Math.round((args.perAssetMB ?? 2) * 1024 * 1024);
       let report: { inlined: number; bytesInlined: number; skipped: any[] } | undefined;
       if (args.inlineAssets !== false) {
         const fetchBatch = async (urls: string[]) => {
-          const res = await hub.call("fetch_resources", { urls }, 120_000);
+          // Forward the per-asset cap so the extension doesn't drop assets between 2MB and the cap.
+          const res = await hub.call("fetch_resources", { urls, perAssetMaxBytes }, 120_000);
           const map: Record<string, any> = {};
           for (const it of res?.resources || []) map[it.url] = it;
           return map;
         };
-        report = await inlineAssets(events, fetchBatch, { totalBudgetBytes: (args.assetBudgetMB ?? 50) * 1024 * 1024 });
+        report = await inlineAssets(events, fetchBatch, {
+          totalBudgetBytes: (args.assetBudgetMB ?? 50) * 1024 * 1024,
+          perAssetMaxBytes,
+        });
       }
       const savePath = expandHome(args.savePath || eventsPath.replace(/\.events\.jsonl$|\.jsonl$/, "") + ".html");
       mkdirSync(dirname(savePath), { recursive: true });
-      const htmlBytes = writeRrwebHtml(savePath, events, { title: args.title, autoplay: !!args.autoplay, skipInactive: !!args.skipInactive });
+      const htmlBytes = await writeRrwebHtml(savePath, events, { title: args.title, autoplay: !!args.autoplay, skipInactive: !!args.skipInactive });
       let min = Infinity, max = 0;
       for (const e of events) {
         const t = e.timestamp || 0;
@@ -1427,7 +1436,11 @@ try {
 const htmlEsc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
 
 // Write one offline HTML file that inlines the player + events, opening with play/scrub controls.
-function writeRrwebHtml(savePath: string, events: any[], meta: { title?: string; autoplay?: boolean; skipInactive?: boolean }): number {
+// The replay FILLS the viewer window at the RECORDED page's exact aspect ratio (fit-to-viewport):
+// the player box is sized to the recorded viewport's aspect scaled to fit the window, so there is no
+// internal letterbox - the only empty space is the dark page background around the replay. It rescales
+// on window/visualViewport resize and honors mid-session viewport changes via the Replayer 'resize'.
+async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: string; autoplay?: boolean; skipInactive?: boolean }): Promise<number> {
   if (!PLAYER_JS) throw new Error("vendored rrweb-player not found in server/vendor/ - build/vendor it first");
   const title = htmlEsc(meta.title || "Session replay");
   // Escape '<' in the events JSON so a captured "</script>" can't close our inline <script> block.
@@ -1436,7 +1449,13 @@ function writeRrwebHtml(savePath: string, events: any[], meta: { title?: string;
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${title}</title>
 <style>${PLAYER_CSS}</style>
-<style>html,body{margin:0;background:#0b0b0d}#bb-player{display:flex;justify-content:center;padding:12px}</style>
+<style>
+  html,body{margin:0;height:100%;background:#0b0b0d;overflow:hidden}
+  /* full-viewport dark centering container; neutralize the vendored player's float/radius/shadow chrome
+     (do NOT touch .rr-player__frame width or .replayer-wrapper transform - that breaks the computed scale) */
+  #bb-player{display:flex;align-items:center;justify-content:center;width:100vw;height:100vh;padding:0;overflow:hidden}
+  #bb-player .rr-player{float:none;border-radius:0;box-shadow:none;background:#0b0b0d}
+</style>
 </head><body>
 <div id="bb-player"></div>
 <script id="bb-events" type="application/json">${json}</script>
@@ -1446,12 +1465,35 @@ function writeRrwebHtml(savePath: string, events: any[], meta: { title?: string;
   var events = JSON.parse(document.getElementById('bb-events').textContent);
   var g = window.rrwebPlayer || {};
   var P = g.default || g.Player || g;
-  new P({ target: document.getElementById('bb-player'),
-          props: { events: events, showController: true, autoPlay: ${meta.autoplay ? "true" : "false"}, skipInactive: ${meta.skipInactive ? "true" : "false"}, speedOption: [1,2,4,8] } });
+  // Recorded viewport (CSS pixels) from the first Meta (type 4) event; the viewer window is also in CSS
+  // pixels, so the fit math is DPR-correct by construction - never multiply by devicePixelRatio.
+  var m = events.find(function(e){ return e.type === 4; });
+  var vw = (m && m.data && m.data.width) || 1024, vh = (m && m.data && m.data.height) || 576;
+  var CTRL = 80; // rrweb-player controller-bar height in the currently vendored build
+  var player = new P({ target: document.getElementById('bb-player'),
+    props: { events: events, showController: true, autoPlay: ${meta.autoplay ? "true" : "false"},
+             skipInactive: ${meta.skipInactive ? "true" : "false"}, speedOption: [1,2,4,8],
+             width: vw, height: vh,
+             maxScale: 0 /* uncap scaling so small/mobile recordings upscale to fill; relies on the vendored player's "a && push(a)" falsy-guard */ } });
+  function fit(){
+    var s = Math.min(window.innerWidth / vw, (window.innerHeight - CTRL) / vh);
+    if (!(s > 0)) s = 0.1;
+    try { player.$set({ width: Math.round(vw * s), height: Math.round(vh * s) }); } catch(e){}
+    try { if (player.triggerResize) player.triggerResize(); } catch(e){}
+  }
+  var t; function refit(){ clearTimeout(t); t = setTimeout(fit, 100); }
+  window.addEventListener('resize', refit);
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', refit);
+  // Mid-session viewport changes (reload/resize during the recording): re-fit to each new aspect.
+  try {
+    var rp = player.getReplayer && player.getReplayer();
+    if (rp && rp.on) rp.on('resize', function(d){ if (d && d.width && d.height){ vw = d.width; vh = d.height; fit(); } });
+  } catch(e){}
+  requestAnimationFrame(fit);
 })();
 </script>
 </body></html>`;
-  writeFileSync(savePath, html, "utf8");
+  await writeFileAsync(savePath, html, "utf8"); // off the shared event loop (replay can be 50MB+)
   return Buffer.byteLength(html);
 }
 

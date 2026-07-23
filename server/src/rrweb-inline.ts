@@ -29,10 +29,44 @@ const isHttp = (u: string) => /^https?:\/\//i.test(u || "");
 const isChromeExt = (u: string) => /^chrome-extension:\/\//i.test(u || "");
 const isInlineable = (u: string) => isHttp(u) && !/^data:|^blob:|^about:/i.test(u);
 
-function firstSrcsetUrl(srcset: string): string {
-  const parts = String(srcset || "").split(",").map((s) => s.trim()).filter(Boolean);
-  if (!parts.length) return "";
-  return parts[parts.length - 1].split(/\s+/)[0]; // last candidate = largest
+// Parse a srcset into {url, desc} candidates, comma-in-URL safe. `split(",")` breaks on URLs that
+// contain commas (data: URIs, some CDN paths); the HTML srcset grammar ends a non-data URL at the
+// first comma but lets a data: URL keep its commas up to whitespace.
+function parseSrcsetCandidates(srcset: string): { url: string; desc: string }[] {
+  const s = String(srcset || "");
+  const n = s.length;
+  const out: { url: string; desc: string }[] = [];
+  const isWs = (c: string) => c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f";
+  let i = 0;
+  while (i < n) {
+    while (i < n && (isWs(s[i]) || s[i] === ",")) i++; // skip separators
+    if (i >= n) break;
+    const start = i;
+    while (i < n && !isWs(s[i])) i++;
+    let url = s.slice(start, i);
+    if (!/^data:/i.test(url)) {
+      const ci = url.indexOf(",");
+      if (ci !== -1) { url = url.slice(0, ci); i = start + ci; } // non-data URL ends at its first comma
+    }
+    while (i < n && isWs(s[i])) i++;
+    const dStart = i;
+    while (i < n && s[i] !== ",") i++; // descriptor runs to the next candidate comma
+    const desc = s.slice(dStart, i).trim();
+    if (url) out.push({ url, desc });
+  }
+  return out;
+}
+// Highest-resolution candidate: max `w` descriptor, else max `x`/density, else the last listed.
+function pickLargestSrcset(srcset: string): string {
+  const cands = parseSrcsetCandidates(srcset);
+  if (!cands.length) return "";
+  let best = cands[cands.length - 1], bestScore = -1;
+  for (const c of cands) {
+    const mw = /(\d+(?:\.\d+)?)w/.exec(c.desc), mx = /(\d+(?:\.\d+)?)x/.exec(c.desc);
+    const score = mw ? parseFloat(mw[1]) : mx ? parseFloat(mx[1]) : 1;
+    if (score > bestScore) { bestScore = score; best = c; }
+  }
+  return best.url;
 }
 
 export async function inlineAssets(events: any[], fetchBatch: FetchBatch, opts: InlineOpts = {}): Promise<InlineReport> {
@@ -57,6 +91,12 @@ export async function inlineAssets(events: any[], fetchBatch: FetchBatch, opts: 
         continue;
       }
       const b = r.bytes ?? Math.floor((r.base64.length * 3) / 4);
+      if (b > perAssetMax) {
+        // Defensive server-side cap (the extension is also asked to enforce it via perAssetMaxBytes).
+        dataUriCache.set(u, null);
+        skipped.push({ url: u, reason: "per-asset-exceeded", bytes: b });
+        continue;
+      }
       if (used + b > totalBudget) {
         dataUriCache.set(u, null);
         skipped.push({ url: u, reason: "budget-exceeded", bytes: b });
@@ -103,17 +143,20 @@ export async function inlineAssets(events: any[], fetchBatch: FetchBatch, opts: 
         css = css.split(imp.stmt).join(inner != null ? (imp.media ? `@media ${imp.media}{${inner}}` : inner) : "");
       }
     }
-    // 2) url() refs -> data URIs (fetch first, then replace).
+    // 2) url() refs -> data URIs. RESOLVE against baseUrl FIRST, then gate on the absolute URL, so
+    //    relative refs (url(../fonts/x.woff2), self-hosted sprites) are inlined - not silently dropped.
+    //    Base-less callers (style attr/tag, incremental rules) throw on a relative and skip it as before.
     const refs = new Set<string>();
     css.replace(URL_IN_CSS, (_m, _q1, u1, _q2, u2, u3) => {
       const raw = (u1 ?? u2 ?? u3 ?? "").trim();
-      if (raw && isInlineable(raw)) {
-        try {
-          refs.add(new URL(raw, baseUrl || undefined).href);
-        } catch {
-          /* unresolvable */
-        }
+      if (!raw || isChromeExt(raw)) return _m;
+      let abs: string;
+      try {
+        abs = new URL(raw, baseUrl || undefined).href;
+      } catch {
+        return _m; // unresolvable relative with no base
       }
+      if (isInlineable(abs)) refs.add(abs);
       return _m;
     });
     await ensureBinaries([...refs]);
@@ -121,17 +164,50 @@ export async function inlineAssets(events: any[], fetchBatch: FetchBatch, opts: 
       const raw = (u1 ?? u2 ?? u3 ?? "").trim();
       if (!raw) return m;
       if (isChromeExt(raw)) return "url()"; // neutralize a foreign extension's asset
-      if (!isInlineable(raw)) return m;
       let abs: string;
       try {
         abs = new URL(raw, baseUrl || undefined).href;
       } catch {
         return m;
       }
+      if (!isInlineable(abs)) return m;
       const du = getDataUri(abs);
       return du ? `url("${du}")` : m; // leave live if unavailable/over budget
     });
     return css;
+  }
+
+  // Rewrite a srcset in place: inline every candidate URL to a data URI, preserving descriptors, so
+  // whichever candidate the replay browser picks is already inlined.
+  async function rewriteSrcset(srcset: string): Promise<string> {
+    const cands = parseSrcsetCandidates(srcset);
+    if (!cands.length) return srcset;
+    await ensureBinaries(cands.map((c) => c.url).filter(isInlineable));
+    return cands
+      .map((c) => {
+        const du = isInlineable(c.url) ? getDataUri(c.url) : null;
+        const u = du || c.url;
+        return c.desc ? `${u} ${c.desc}` : u;
+      })
+      .join(", ");
+  }
+
+  // Inline asset-bearing attributes on a mutation attribute-update object. A source-0 mutation entry
+  // ({id, attributes:{name:value}}) carries no tagName, so we key off attribute names. rrweb encodes
+  // attribute REMOVAL as `false`, so every value is guarded with typeof === "string". URLs in mutations
+  // are already absolutized by rrweb at record time.
+  async function inlineAttrs(a: any) {
+    if (!a || typeof a !== "object") return;
+    for (const attr of ["src", "poster", "href", "xlink:href"]) {
+      const v = a[attr];
+      if (typeof v === "string" && isInlineable(v)) {
+        await ensureBinaries([v]);
+        const du = getDataUri(v);
+        if (du) a[attr] = du;
+      }
+    }
+    if (typeof a.srcset === "string" && a.srcset) a.srcset = await rewriteSrcset(a.srcset);
+    if (typeof a.style === "string" && a.style.indexOf("url(") !== -1) a.style = await rewriteCss(a.style, "", 0);
   }
 
   // Inline the assets referenced by a single serialized element node (no strip, no recursion).
@@ -163,13 +239,14 @@ export async function inlineAssets(events: any[], fetchBatch: FetchBatch, opts: 
       a._cssText = await rewriteCss(a._cssText, "", 0);
     } else if (tag === "img") {
       if (!a.rr_dataURL) {
-        const url = a.src && isInlineable(a.src) ? a.src : firstSrcsetUrl(a.srcset || "");
+        const url = a.src && isInlineable(a.src) ? a.src : pickLargestSrcset(a.srcset || "");
         if (isInlineable(url)) {
           await ensureBinaries([url]);
           const du = getDataUri(url);
           if (du) a.rr_dataURL = du;
         }
       }
+      if (typeof a.srcset === "string" && a.srcset) a.srcset = await rewriteSrcset(a.srcset);
     } else if (tag === "source" || tag === "video" || tag === "audio" || tag === "image") {
       for (const attr of ["src", "poster", "href", "xlink:href"]) {
         const v = a[attr];
@@ -179,17 +256,8 @@ export async function inlineAssets(events: any[], fetchBatch: FetchBatch, opts: 
           if (du) a[attr] = du;
         }
       }
-      if (a.srcset) {
-        const u = firstSrcsetUrl(a.srcset);
-        if (isInlineable(u)) {
-          await ensureBinaries([u]);
-          const du = getDataUri(u);
-          if (du) {
-            a.src = du;
-            delete a.srcset;
-          }
-        }
-      }
+      // Inline every srcset candidate in place (a <source> in <picture> is selected by srcset, not src).
+      if (typeof a.srcset === "string" && a.srcset) a.srcset = await rewriteSrcset(a.srcset);
     }
     if (typeof a.style === "string" && a.style.indexOf("url(") !== -1) a.style = await rewriteCss(a.style, "", 0);
   }
@@ -230,8 +298,26 @@ export async function inlineAssets(events: any[], fetchBatch: FetchBatch, opts: 
           await walkChildren(add.node);
         }
       }
-    } else if (t === 3 && d?.source === 8 && Array.isArray(d.adds)) {
-      for (const ad of d.adds) if (typeof ad?.rule === "string") ad.rule = await rewriteCss(ad.rule, "", 0);
+      // Lazy-loaded assets arrive as attribute mutations (img src/srcset set by JS after load, etc.);
+      // inline them too, or a scroll-triggered image stays a live URL and breaks offline.
+      if (Array.isArray(d.attributes)) {
+        for (const upd of d.attributes) await inlineAttrs(upd?.attributes);
+      }
+    } else if (t === 3 && d?.source === 8) {
+      // Incremental CSS: inserted rules (adds[].rule) + whole-sheet replace()/replaceSync().
+      if (Array.isArray(d.adds)) {
+        for (const ad of d.adds) if (typeof ad?.rule === "string") ad.rule = await rewriteCss(ad.rule, "", 0);
+      }
+      if (typeof d.replace === "string") d.replace = await rewriteCss(d.replace, "", 0);
+      if (typeof d.replaceSync === "string") d.replaceSync = await rewriteCss(d.replaceSync, "", 0);
+    } else if (t === 3 && d?.source === 13 && d?.set && typeof d.set.value === "string" && d.set.value.indexOf("url(") !== -1) {
+      // StyleDeclaration: a single property set to a url()-bearing value (e.g. background-image).
+      d.set.value = await rewriteCss(d.set.value, "", 0);
+    } else if (t === 3 && d?.source === 15 && Array.isArray(d.styles)) {
+      // AdoptedStyleSheet: constructable stylesheets attached post-snapshot.
+      for (const st of d.styles) {
+        if (Array.isArray(st?.rules)) for (const rl of st.rules) if (typeof rl?.rule === "string") rl.rule = await rewriteCss(rl.rule, "", 0);
+      }
     }
   }
 

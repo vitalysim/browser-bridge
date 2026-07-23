@@ -26,6 +26,10 @@ export class ExtensionHub {
   private sessionSinks = new Map<number, CaptureSink>();
   // Optional record sink: when set, every hub.call is appended as a JSONL draft (playbook record-mode).
   private recordSink: CaptureSink | null = null;
+  // Events-file path for each active session recording, keyed by tab. Lives on the hub (not a
+  // per-MCP-session tool closure) so session_record_stop can resolve the path regardless of which
+  // MCP client/session issued session_record_start (start+stop need not share a session).
+  private recordingPaths = new Map<number, string>();
 
   constructor(httpServer: HttpServer, token: string) {
     const wss = new WebSocketServer({ noServer: true });
@@ -89,10 +93,6 @@ export class ExtensionHub {
     });
 
     ws.on("close", () => {
-      if (this.ws === ws) {
-        this.ws = null;
-        console.error("[hub] extension disconnected");
-      }
       // Reject calls still in flight on THIS socket so they fail fast instead of
       // waiting out the full timeout. Only this socket's pending are rejected, so a
       // call issued on a freshly-replaced connection isn't killed by the old one's close.
@@ -102,11 +102,18 @@ export class ExtensionHub {
         clearTimeout(p.timer);
         p.reject(new Error("Browser extension disconnected before responding"));
       }
-      // The extension streaming these captures is gone - close every sink so no handle leaks.
-      for (const sink of this.captureSinks.values()) sink.close();
-      this.captureSinks.clear();
-      for (const sink of this.sessionSinks.values()) sink.close();
-      this.sessionSinks.clear();
+      // Only tear down capture/session sinks when the CURRENT (live) socket closes. If a stale
+      // socket is closing because it was just REPLACED (SW respawn / reconnect), this.ws already
+      // points at the new socket - closing sinks here would orphan the new connection's sinks and
+      // every subsequent capture batch would be silently dropped (truncated JSONL / events file).
+      if (this.ws === ws) {
+        this.ws = null;
+        console.error("[hub] extension disconnected");
+        for (const sink of this.captureSinks.values()) sink.close();
+        this.captureSinks.clear();
+        for (const sink of this.sessionSinks.values()) sink.close();
+        this.sessionSinks.clear();
+      }
     });
     ws.on("error", (err) => console.error(`[hub] ws error: ${err.message}`));
   }
@@ -158,6 +165,16 @@ export class ExtensionHub {
   sessionSinkList(): { tabId: number; path: string; written: number }[] {
     return [...this.sessionSinks.entries()].map(([tabId, s]) => ({ tabId, path: s.path, written: s.written }));
   }
+  // Events-file path bookkeeping for a recording, on the hub so start/stop work across MCP sessions.
+  setRecordingPath(tabId: number, path: string): void {
+    this.recordingPaths.set(tabId, path);
+  }
+  getRecordingPath(tabId: number): string | undefined {
+    return this.recordingPaths.get(tabId);
+  }
+  deleteRecordingPath(tabId: number): boolean {
+    return this.recordingPaths.delete(tabId);
+  }
 
   // Route a streamed {type:"capture", stream?, tabId, entries, done} message to the right sink.
   private onCapture(msg: any): void {
@@ -191,7 +208,9 @@ export class ExtensionHub {
     return this.recordSink !== null;
   }
 
-  call(method: string, params: Record<string, unknown> = {}, timeoutMs = CALL_TIMEOUT_MS): Promise<any> {
+  // async so pre-send failures (not-connected guard, socket.send throw) reject the returned Promise
+  // instead of throwing synchronously - honoring the Promise<any> contract for every .then/.catch caller.
+  async call(method: string, params: Record<string, unknown> = {}, timeoutMs = CALL_TIMEOUT_MS): Promise<any> {
     if (!this.connected) {
       throw new Error(
         "Browser extension is not connected. Make sure Chrome is running, the Browser Bridge " +

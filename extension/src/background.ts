@@ -858,7 +858,14 @@ async function ensureAttached(tabId: number): Promise<Session> {
   let s = sessions.get(tabId);
   if (!s) {
     await attach(tabId);
-    await Promise.all([cmd(tabId, "DOM.enable"), cmd(tabId, "Page.enable")]);
+    // If an enable fails AFTER a successful attach, detach so we don't strand an orphaned debugger
+    // (stuck "being debugged" banner + a leaked attach that nothing will ever clean up).
+    try {
+      await Promise.all([cmd(tabId, "DOM.enable"), cmd(tabId, "Page.enable")]);
+    } catch (e) {
+      await detachSession(tabId).catch(() => {});
+      throw e;
+    }
     s = {
       attachedAt: Date.now(),
       lastUsedAt: Date.now(),
@@ -908,6 +915,17 @@ function idleSweep() {
   }
 }
 
+// Bound the per-request side-map so it can't outgrow the ring cap and OOM the service worker on a
+// long capture. 2x the ring cap gives headroom for the ExtraInfo-before-requestWillBeSent CDP race.
+function capExtra(s: Session): void {
+  const max = s.netMax * 2;
+  while (s.extra.size > max) {
+    const k = s.extra.keys().next().value as string | undefined; // Map is insertion-ordered: oldest first
+    if (k === undefined) break;
+    s.extra.delete(k);
+  }
+}
+
 // Buffer Network.* CDP events into the per-tab session (listener registered synchronously below).
 function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, params: any) {
   const tabId = source.tabId;
@@ -923,7 +941,12 @@ function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, param
   if (method === "Network.requestWillBeSent") {
     const url = params.request?.url ?? "";
     if (s.netFilter && !url.includes(s.netFilter)) return;
-    if (s.net.length >= s.netMax) s.net.shift();
+    // Evict the oldest ring entry AND its side data together, or s.extra grows unbounded past the
+    // ring cap and eventually OOM-kills the MV3 service worker (silently ending a long capture).
+    if (s.net.length >= s.netMax) {
+      const ev = s.net.shift();
+      if (ev) s.extra.delete(ev.requestId);
+    }
     s.net.push({
       requestId: params.requestId,
       method: params.request?.method,
@@ -947,6 +970,7 @@ function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, param
     const x = s.extra.get(params.requestId) ?? {};
     x.reqHeaders = params.headers;
     s.extra.set(params.requestId, x);
+    capExtra(s);
   } else if (method === "Network.responseReceivedExtraInfo") {
     // raw response headers incl. Set-Cookie (dropped from Network.responseReceived.headers)
     const x = s.extra.get(params.requestId) ?? {};
@@ -954,6 +978,7 @@ function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, param
     const sc = params.headers?.["set-cookie"] ?? params.headers?.["Set-Cookie"];
     if (sc) x.setCookie = String(sc).split("\n");
     s.extra.set(params.requestId, x);
+    capExtra(s);
   } else if (method === "Network.loadingFinished") {
     const e = find(params.requestId);
     if (e) {
@@ -997,6 +1022,7 @@ function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, param
     if (s.persist) queueCapture(s, tabId, { kind: "ws", ...f });
   } else if (method === "Network.webSocketClosed") {
     pushWs(s, { requestId: params.requestId, url: s.wsUrls.get(params.requestId), dir: "close", ts: Date.now() });
+    s.wsUrls.delete(params.requestId); // ws is done; free its url (never lives in the s.net ring)
   } else if (method === "Network.eventSourceMessageReceived") {
     const f: WsFrame = {
       requestId: params.requestId,
@@ -1124,14 +1150,40 @@ function flushRecord(rec: RecState, tabId: number, done = false) {
     }
   }
 }
+// Inject + start the recorder in ONE frame, bounded by a timeout. A single allFrames:true
+// executeScript blocks on a wedged cross-origin child (ad/embed that never settles) and can hang the
+// whole record-start call past its 30s timeout, leaving the tab in a broken recording state. Injecting
+// per-frame with an individual timeout means one unresponsive frame can't stall the others.
+function injectFrame(tabId: number, frameId: number, rec: RecState, timeoutMs: number): Promise<boolean> {
+  const run = (async () => {
+    await chrome.scripting.executeScript({ target: { tabId, frameIds: [frameId] }, files: ["vendor/rrweb-record.js"] });
+    await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] },
+      func: (opts: any) => (window as any).__bbRec?.start(opts),
+      args: [{ allFrames: rec.allFrames, maskInputs: rec.maskInputs, recordCanvas: rec.recordCanvas }],
+    });
+    return true;
+  })();
+  return Promise.race([
+    run.catch(() => false),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs)),
+  ]);
+}
+
 // (Re)inject + start the recorder in a tab's frames. Called on start and on navigation-complete.
 async function injectRecorder(tabId: number, rec: RecState) {
-  await chrome.scripting.executeScript({ target: { tabId, allFrames: rec.allFrames }, files: ["vendor/rrweb-record.js"] });
-  await chrome.scripting.executeScript({
-    target: { tabId, allFrames: rec.allFrames },
-    func: (opts: any) => (window as any).__bbRec?.start(opts),
-    args: [{ allFrames: rec.allFrames, maskInputs: rec.maskInputs, recordCanvas: rec.recordCanvas }],
-  });
+  // Top frame is mandatory (own origin, always injectable) and gets a generous budget.
+  await injectFrame(tabId, 0, rec, 8000);
+  if (!rec.allFrames) return;
+  // Cross-origin iframes: inject each independently and in parallel, each with its own short timeout,
+  // so a frame that never responds is simply skipped (best-effort) instead of blocking record-start.
+  let frames: { frameId: number }[] = [];
+  try {
+    frames = (await chrome.webNavigation.getAllFrames({ tabId })) ?? [];
+  } catch {
+    return; // no webNavigation result -> top-frame recording only
+  }
+  await Promise.all(frames.filter((f) => f.frameId !== 0).map((f) => injectFrame(tabId, f.frameId, rec, 4000)));
 }
 
 // scheme + host only, no path/query/fragment - for compact tab listings where the path may carry

@@ -20,20 +20,29 @@ session_record_stop({ savePath, title?, autoplay? })   → { saved, htmlBytes, e
   (default: the events file with `.html`). Double-click it — it replays offline, no server, no network.
 - **`session_record_status`** lists active recordings (tab, file, events so far).
 
-Start options: `allFrames:true` also records **cross-origin iframes**; `maskInputs:true` redacts form values;
-`recordCanvas:true` attempts `<canvas>`. Stop options: `inlineAssets` (default **true** — see below), `assetBudgetMB`
-(default 50), `skipInactive` (default **false** — play idle/scroll stretches in real time), `autoplay`.
+Start options: `allFrames:true` also records **cross-origin iframes** (best-effort: injected per-frame with a per-frame
+timeout, so one wedged ad/embed frame can't stall the start); `maskInputs:true` redacts form values; `recordCanvas:true`
+attempts `<canvas>`. Stop options: `inlineAssets` (default **true** - see below), `assetBudgetMB` (total budget,
+default 50), `perAssetMB` (per-asset cap, default 2), `skipInactive` (default **false** - play idle/scroll stretches in
+real time), `autoplay`.
+
+The replay **fills the viewer window at the recorded page's exact aspect ratio** (fit-to-viewport): the player box is
+sized to the recorded viewport and scaled to fit, so there's no wasted letterbox - just a dark margin around a
+correctly-proportioned replay. It **rescales on window resize** and follows mid-session viewport changes.
 
 ## What makes this better than page-level rrweb
 
 - **Truly self-contained / offline-faithful.** On stop, the server fetches **every external asset the capture
   references — cross-origin stylesheets, fonts, and images — through the extension** (MV3 background `fetch` under
   `<all_urls>` has no CORS wall and sends your session cookies) and **inlines them** into the file (`_cssText` for
-  sheets, `data:` URIs for images/fonts, `@import` chains flattened). So the replay renders from *captured* data, not
-  by re-fetching the live site — it works offline and won't break when the CDN or site changes. Page-level rrweb
-  cannot read cross-origin CSS at all. It also **strips nodes injected by your *other* extensions**
-  (`chrome-extension://…`). Oversized/over-budget assets (2 MB/asset, 50 MB total by default) are left live and
-  reported in `skipped`.
+  sheets, `data:` URIs for images/fonts, `@import` chains flattened). This covers the hard cases page-level rrweb
+  misses: **relative `url()`/`@import` refs** in fetched cross-origin CSS (self-hosted fonts, sprite backgrounds) are
+  resolved against their sheet and inlined; **lazy-loaded images** that arrive as later DOM mutations (scroll-triggered
+  `src`/`srcset`) are inlined too; **`srcset`** is parsed comma-safely and every candidate inlined; and **incremental
+  CSS** (`insertRule`, `replace`/`replaceSync`, adopted stylesheets) is rewritten. So the replay renders from
+  *captured* data, not by re-fetching the live site — it works offline and won't break when the CDN or site changes. It
+  also **strips nodes injected by your *other* extensions** (`chrome-extension://…`). Oversized/over-budget assets
+  (2 MB/asset via `perAssetMB`, 50 MB total via `assetBudgetMB` by default) are left live and reported in `skipped`.
 - **Cross-origin iframes are actually captured.** Vanilla rrweb needs its script running on the third-party origin
   (which you don't control). The extension injects the recorder into *any* cross-origin child — payment, OAuth, ad,
   embedded-doc frames — via `<all_urls>`, with zero cooperation from the framed site (`allFrames:true`).
