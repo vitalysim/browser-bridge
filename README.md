@@ -347,9 +347,25 @@ bearer_token_env_var = "BROWSER_BRIDGE_TOKEN"
 
 ## Roadmap
 
-Shipped in v0.14: **MP4 export** - `render_recording_video` turns a saved replay into a high-resolution, frame-exact H.264 MP4 (deterministic seek + lossless-PNG frames → ffmpeg) whose mouse-trail/click/keystroke motion matches the live playback. v0.13: a redesigned, custom **FRACTURE**-styled replay player with a toggleable **interaction overlay** (smooth mouse trail, click ripples, keystroke HUD incl. physical keys) and **full-page fit-to-viewport** rendering. v0.12: **audit-driven correctness/reliability fixes** (a 56-agent review) across the hub, extension, and inline pipeline - a silent capture-loss guard on socket replacement, MV3 memory-leak caps, cross-session recording, and robust `allFrames` injection. v0.11: **offline-faithful session replay** - `session_record_stop` now inlines every external asset (cross-origin CSS/fonts/images fetched through the extension, no CORS wall) + strips foreign-extension nodes + fixes scroll playback, so the HTML is truly self-contained. v0.10: **session recording** - record a live interaction and replay it as a self-contained HTML timeline (rrweb; `session_record_start`/`stop`/`status`), banner-free, capturing cross-origin iframes; see [docs/RECORDING.md](docs/RECORDING.md). v0.9: **playbooks** - saved, self-healing task recipes (Markdown at `~/.browser-bridge/playbooks/`, record-mode capture via `playbook_record_start`/`stop`/`playbook_save`, agents auto-told the convention); see [docs/PLAYBOOKS.md](docs/PLAYBOOKS.md). v0.8 (from real remote-desktop pentest feedback): **coordinate-level trusted input** (`input`) for canvas/VNC/RDP/DCV targets, `get_page_text(includeHidden)` for collapsed/hidden content, `cdp_eval`/`eval_js` `timeoutMs`, and `screenshot` `dpr`/`visibilityState` surfacing (coordinate mapping + occlusion warning). v0.7: **durable capture persistence** (`net_capture_start(persist)`, `maxEntries`), **copy-as-curl** (`request_to_curl`), **`analyze deep`**, plus reliability fixes (fail-fast on disconnect, no idle-detach of active captures, fast load-wait, off-DOM snapshot refs, single-sourced versioning). v0.6: **self-healing interaction**, **passive recon** (`analyze`) + **`jwt_decode`**, **HAR export**, **fuzz modes** + **`viaAppClient`** replay. v0.5 shipped interception, fuzzing, cookie/storage, console/CSP capture, and MHTML.
+**Shipped** (newest first):
 
-Ideas explored for future phases: a realtime-screencast video mode (to also capture time-based *page* animation - CSS keyframes/GIF/`<video>` - that deterministic seek can't pin), source-map de-minification on downloads, GraphQL introspection helpers, and a client-side DOM-XSS / postMessage / prototype-pollution suite.
+- **v0.14 · MP4 export** - `render_recording_video` renders a saved replay to a high-resolution, frame-exact **H.264 MP4** (deterministic seek + lossless-PNG frames → ffmpeg); the mouse-trail / click / keystroke motion matches the live playback. `chrome:true` includes the player UI.
+- **v0.13 · Designed replay player** - a custom **FRACTURE**-styled player with **full-page fit-to-viewport** rendering and a toggleable **interaction overlay**: smooth mouse trail, click ripples, and a keystroke HUD (typed text + physical keys).
+- **v0.12 · Correctness & reliability** - an audit-driven pass (56-agent review): a silent capture-loss guard on socket replacement, MV3 memory-leak caps, cross-session recording, and robust `allFrames` injection.
+- **v0.11 · Offline-faithful replay** - `session_record_stop` inlines every external asset (cross-origin CSS / fonts / images, fetched *through the extension* - no CORS wall) and strips foreign-extension nodes, so the HTML is truly self-contained.
+- **v0.10 · Session recording** - record a live interaction and replay it as a self-contained HTML timeline (rrweb; `session_record_start` / `stop` / `status`), banner-free, capturing cross-origin iframes. → [docs/RECORDING.md](docs/RECORDING.md)
+- **v0.9 · Playbooks** - saved, self-healing task recipes (Markdown at `~/.browser-bridge/playbooks/`; record-mode capture via `playbook_record_start` / `stop` / `playbook_save`). → [docs/PLAYBOOKS.md](docs/PLAYBOOKS.md)
+- **v0.8 · Remote-desktop pentest feedback** - coordinate-level trusted input (`input`) for canvas / VNC / RDP / DCV, `get_page_text(includeHidden)`, `cdp_eval` / `eval_js` `timeoutMs`, and `screenshot` `dpr` / `visibilityState`.
+- **v0.7 · Durable capture & handoff** - `net_capture_start(persist)` + `maxEntries`, copy-as-curl (`request_to_curl`), `analyze deep`, plus reliability fixes.
+- **v0.6 · Self-healing interaction, recon & evidence** - passive recon (`analyze`) + `jwt_decode`, HAR export, fuzz modes + `viaAppClient` replay.
+- **v0.5 · Security-toolkit foundation** - interception, fuzzing, cookie / storage, console / CSP capture, and MHTML.
+
+**Exploring next:**
+
+- A **realtime-screencast video mode** - to also capture time-based *page* animation (CSS keyframes / GIF / `<video>`) that deterministic seek can't pin.
+- Source-map **de-minification** on downloads.
+- **GraphQL** introspection helpers.
+- A client-side **DOM-XSS / postMessage / prototype-pollution** suite.
 
 ## Project structure
 
