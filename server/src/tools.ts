@@ -1232,6 +1232,8 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
           // we write the frame ourselves.
           const shot = await hub.call("screenshot", { tabId, selector: ".rr-player__frame", scale, format: "png" }, 60_000);
           if (!shot?.base64) throw new Error(`empty screenshot at frame ${f} (t=${t}ms)`);
+          if (shot.format && shot.format !== "png")
+            throw new Error(`frame ${f} came back as ${shot.format}, not png (frame too large at scale ${scale}) - lower scale`);
           writeFileSync(join(frameDir, "f" + String(f).padStart(6, "0") + ".png"), Buffer.from(shot.base64, "base64"));
         }
 
@@ -1854,21 +1856,53 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
       }
       EX_MOVES.sort(function(a,b){return a.t-b.t;}); EX_CLICKS.sort(function(a,b){return a.t-b.t;}); EX_KEYS.sort(function(a,b){return a.t-b.t;});
     }
-    function exTrail(T){
-      var pts=[]; for(var i=0;i<EX_MOVES.length;i++){ var mm=EX_MOVES[i]; if(mm.t>T) break; if(mm.t>=T-LIFE) pts.push(mm); }
+    // Exact-ms cursor position, LINEARLY INTERPOLATED from the ~60Hz EX_MOVES. This is what the live rAF
+    // path gets by sampling the continuously-tweened sprite; rrweb's goto() only snaps to the last ~500ms
+    // batch, so we compute the true sub-batch position ourselves and drive everything from it.
+    function exCursorAt(T){
+      var n=EX_MOVES.length; if(!n) return null;
+      if(T<=EX_MOVES[0].t) return {x:EX_MOVES[0].x,y:EX_MOVES[0].y};
+      if(T>=EX_MOVES[n-1].t) return {x:EX_MOVES[n-1].x,y:EX_MOVES[n-1].y};
+      var lo=0,hi=n-1; while(lo+1<hi){ var mid=(lo+hi)>>1; if(EX_MOVES[mid].t<=T) lo=mid; else hi=mid; }
+      var a=EX_MOVES[lo],b=EX_MOVES[hi]; var dt=b.t-a.t; var f=dt>0?(T-a.t)/dt:0;
+      return {x:a.x+(b.x-a.x)*f, y:a.y+(b.y-a.y)*f};
+    }
+    function exTrail(T, hx, hy){
+      var raw=[]; for(var i=0;i<EX_MOVES.length;i++){ var mm=EX_MOVES[i]; if(mm.t>T) break; if(mm.t>=T-LIFE) raw.push(mm); }
+      // Mirror live draw()'s far-jump reset: drop everything before a >400px inter-sample gap so a fast
+      // cross-screen flick doesn't spline into one long streak the live path would have cleared.
+      var pts=[]; for(var i=0;i<raw.length;i++){ if(pts.length){ var l=pts[pts.length-1]; if(Math.abs(l.x-raw[i].x)>400 || Math.abs(l.y-raw[i].y)>400) pts=[]; } pts.push(raw[i]); }
+      // Head = the exact-ms interpolated cursor (the SAME point we override the sprite to), so the bright
+      // comet head, the trail body, and the visible cursor all coincide - exactly like the live path.
+      if(hx!=null && hy!=null && !isNaN(hx) && !isNaN(hy)){
+        var lastp=pts.length?pts[pts.length-1]:null;
+        if(!lastp || Math.abs(lastp.x-hx)>0.5 || Math.abs(lastp.y-hy)>0.5) pts.push({t:T,x:hx,y:hy});
+      }
       var n=pts.length; if(n<2) return;
       ctx.lineCap='round'; ctx.lineJoin='round'; var SEG=18;
       for(var i=0;i<n-1;i++){ var p0=pts[i>0?i-1:0],p1=pts[i],p2=pts[i+1],p3=pts[i<n-2?i+2:n-1]; var prev=p1;
         for(var s=1;s<=SEG;s++){ var pt=catmull(p0,p1,p2,p3,s/SEG); var frac=(i+s/SEG)/(n-1); ctx.strokeStyle='rgba(74,222,128,'+(0.12+0.62*frac).toFixed(3)+')'; ctx.lineWidth=1.2+3.3*frac; ctx.beginPath(); ctx.moveTo(prev.x,prev.y); ctx.lineTo(pt.x,pt.y); ctx.stroke(); prev=pt; } }
     }
     function exClicks(T){
-      for(var i=0;i<EX_CLICKS.length;i++){ var c=EX_CLICKS[i]; var age=T-c.t; if(age<0) break; if(age>600) continue; var p=age/600; var r=13*(0.3+2.4*p); ctx.globalAlpha=0.95*(1-p); ctx.strokeStyle='#4ade80'; ctx.lineWidth=1.6; ctx.beginPath(); ctx.arc(c.x,c.y,r,0,6.2832); ctx.stroke(); ctx.globalAlpha=1; }
+      // Match the live CSS ripple (.6s ease-out; scale .3->2.7; opacity .95->0; translucent green fill).
+      for(var i=0;i<EX_CLICKS.length;i++){ var c=EX_CLICKS[i]; var age=T-c.t; if(age<0) break; if(age>600) continue;
+        var lin=age/600, p=1-(1-lin)*(1-lin); // ease-out
+        var r=13*(0.3+2.4*p), eop=0.95*(1-p);
+        ctx.beginPath(); ctx.arc(c.x,c.y,r,0,6.2832);
+        ctx.globalAlpha=eop*0.12; ctx.fillStyle='#4ade80'; ctx.fill();
+        ctx.globalAlpha=eop; ctx.strokeStyle='#4ade80'; ctx.lineWidth=1.5; ctx.stroke();
+        ctx.globalAlpha=1; }
     }
     function exHud(T){
-      var toks=[]; for(var i=0;i<EX_KEYS.length;i++){ var k=EX_KEYS[i]; if(k.t>T) break; if(k.t>=T-1400) toks.push(k); }
-      toks=toks.slice(-16); hud.textContent='';
+      // Reproduce live's shared 1400ms timer: tokens accumulate through a burst, then ALL clear at once
+      // 1400ms after the LAST key (not a per-token sliding window).
+      var last=-1; for(var i=0;i<EX_KEYS.length;i++){ if(EX_KEYS[i].t>T) break; last=i; }
+      if(last<0 || (T-EX_KEYS[last].t)>1400){ hud.classList.remove('show'); hud.textContent=''; return; }
+      var start=last; while(start>0 && (EX_KEYS[start].t-EX_KEYS[start-1].t)<1400) start--;
+      var toks=EX_KEYS.slice(start,last+1); toks=toks.slice(-16);
+      hud.textContent='';
       for(var i=0;i<toks.length;i++){ var el=document.createElement('span'); el.className='bb-key'+(toks[i].mod?' mod':''); el.textContent=toks[i].text; hud.appendChild(el); }
-      hud.classList.toggle('show', toks.length>0);
+      hud.classList.add('show');
     }
     function exSetup(){
       exPrepare();
@@ -1885,6 +1919,9 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
           var s=Math.min(window.innerWidth/vw, window.innerHeight/vh); if(!(s>0)) s=0.1;
           try{ player.$set({width:Math.round(vw*s),height:Math.round(vh*s)}); if(player.triggerResize) player.triggerResize(); }catch(e){}
           try{ var fr=document.querySelector('.rr-player__frame').getBoundingClientRect(); hud.style.bottom=Math.max(8,(window.innerHeight - fr.bottom + Math.round(fr.height*0.03)))+'px'; }catch(e){}
+          // Kill the cursor's 50ms slide so goto() snaps it to the exact frame position (else the settle
+          // screenshots it mid-transition and the trail head drifts off the cursor).
+          try{ var mEl=document.querySelector('.replayer-mouse'); if(mEl) mEl.style.transition='none'; }catch(e){}
           return true;
         },
         // Seek to ms and draw the reconstructed overlay for that instant (call, wait a beat, screenshot).
@@ -1892,9 +1929,15 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
           try{ player.pause(); }catch(e){}
           try{ player.goto(ms); }catch(e){}
           try{ player.pause(); }catch(e){}
+          // Do NOT trust the seeked sprite: rrweb snaps it to the last ~500ms MouseMove BATCH, so it lags
+          // and steps. Interpolate the exact-ms cursor from the dense EX_MOVES and OVERRIDE the sprite (after
+          // goto, transition already off) so the visible cursor, comet head, and trail body are ONE source -
+          // exactly the single-source coincidence that makes the live rAF path smooth.
+          var cur=exCursorAt(ms);
+          if(cur){ try{ var me=document.querySelector('.replayer-mouse'); if(me){ me.style.left=cur.x+'px'; me.style.top=cur.y+'px'; } }catch(e){} }
           if(trail.width!==vw||trail.height!==vh){ trail.width=vw; trail.height=vh; }
           ctx.clearRect(0,0,trail.width,trail.height);
-          exTrail(ms); exClicks(ms); exHud(ms);
+          exTrail(ms, cur?cur.x:null, cur?cur.y:null); exClicks(ms); exHud(ms);
           return true;
         }
       };
