@@ -21,6 +21,12 @@ Browser Bridge is a local **MCP server + Manifest V3 Chrome extension** that let
 
 It ships **63 tools** spanning everyday browsing, DevTools-grade network capture, a full web-security testing toolkit, **playbooks** (saved, self-healing recipes), and **session recording** - record an interaction into a self-contained, offline-faithful HTML replay (full-page, custom-designed player, with a smooth mouse-trail / click / keystroke overlay) and **export it to a high-resolution MP4**.
 
+<p align="center">
+  <img src="docs/replay.gif" alt="Session replay: a recorded interaction played back in the self-contained FRACTURE player - a smooth green mouse trail follows the cursor, click ripples fire, and a keystroke HUD shows what was typed, with a play/scrub timeline and speed controls" width="820">
+  <br>
+  <sub><em>Record a session → a self-contained, offline replay with a smooth mouse-trail / click / keystroke overlay → export to a high-res MP4.</em></sub>
+</p>
+
 ## Contents
 
 - [Quick start](#quick-start)

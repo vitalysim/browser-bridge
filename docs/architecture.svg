@@ -55,7 +55,7 @@
     <rect x="100" y="384" width="520" height="118" rx="12" fill="#17171b" stroke="#303038" stroke-width="1.5"/>
     <text x="128" y="410" font-size="11" letter-spacing="2.5" font-weight="600" fill="#71717a">MANIFEST V3 EXTENSION</text>
     <text x="128" y="440" font-size="23" font-weight="700" fill="#f4f4f5">Chrome extension</text>
-    <text x="128" y="468" font-size="14" fill="#a1a1aa"><tspan fill="#8a8a93">default -</tspan> chrome.tabs · scripting · capture &#160;<tspan fill="#8a8a93">(banner-free)</tspan></text>
+    <text x="128" y="468" font-size="14" fill="#a1a1aa"><tspan fill="#8a8a93">default -</tspan> chrome.tabs · scripting · capture · rrweb recorder &#160;<tspan fill="#8a8a93">(banner-free)</tspan></text>
     <text x="128" y="490" font-size="14" fill="#a1a1aa"><tspan fill="#8a8a93">opt-in -</tspan> chrome.debugger · Network · Fetch · DOM &#160;<tspan fill="#8a8a93">(CDP)</tspan></text>
   </g>
 

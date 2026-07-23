@@ -1194,6 +1194,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       scale: z.number().optional().describe("Resolution multiplier over the recorded viewport (default 2 = ~retina/4K; 1 = native)"),
       crf: z.number().optional().describe("H.264 quality, lower=better (default 16, ~visually lossless)"),
       settleMs: z.number().optional().describe("Wait after each seek before capture (default 40)"),
+      chrome: z.boolean().optional().describe("Include the FRACTURE player chrome (metabar + control bar) in the frame instead of just the page + overlay (default false)"),
     },
     async (args) => {
       const htmlPath = expandHome(args.htmlPath);
@@ -1203,6 +1204,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       const scale = Math.max(1, Math.min(4, args.scale ?? 2));
       const crf = Math.max(0, Math.min(51, Math.round(args.crf ?? 16)));
       const settleMs = Math.max(0, Math.round(args.settleMs ?? 40));
+      const withChrome = !!args.chrome; // include the FRACTURE metabar + control bar (the framed player look)
       const frameDir = mkdtempSync(join(tmpdir(), "bb-frames-"));
       const evalJs = (tabId: number, code: string) => hub.call("eval_js", { tabId, code }, 20_000);
 
@@ -1215,7 +1217,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         for (let i = 0; i < 80; i++) {
           const r = await evalJs(
             tabId,
-            "(function(){ if(!window.__bbExport) return 'nope'; window.__bbExport.enterMode(); return String(window.__bbExport.total||0); })()"
+            "(function(){ if(!window.__bbExport) return 'nope'; window.__bbExport.enterMode(" + (withChrome ? "true" : "false") + "); return String(window.__bbExport.total||0); })()"
           );
           const v = r?.value;
           if (v && v !== "nope") { total = parseFloat(v) || 0; break; }
@@ -1230,7 +1232,11 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
           if (settleMs) await sleep(settleMs);
           // hub.call hits the EXTENSION directly (returns base64); savePath is a server-tool concern, so
           // we write the frame ourselves.
-          const shot = await hub.call("screenshot", { tabId, selector: ".rr-player__frame", scale, format: "png" }, 60_000);
+          const shot = await hub.call(
+            "screenshot",
+            withChrome ? { tabId, scale, format: "png" } : { tabId, selector: ".rr-player__frame", scale, format: "png" },
+            60_000
+          );
           if (!shot?.base64) throw new Error(`empty screenshot at frame ${f} (t=${t}ms)`);
           if (shot.format && shot.format !== "png")
             throw new Error(`frame ${f} came back as ${shot.format}, not png (frame too large at scale ${scale}) - lower scale`);
@@ -1911,17 +1917,21 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
         vw: vw, vh: vh,
         // Enter export framing: hide the bars, fill the window with the frame at recorded aspect, and
         // move the HUD inside the frame so an element-clip screenshot of .rr-player__frame includes it.
-        enterMode: function(){
+        enterMode: function(keepChrome){
           exportMode=true;
+          // Kill the cursor's 50ms slide so goto() snaps it to the exact frame position (else the settle
+          // screenshots it mid-transition and the trail head drifts off the cursor).
+          try{ var mEl=document.querySelector('.replayer-mouse'); if(mEl) mEl.style.transition='none'; }catch(e){}
+          if(keepChrome){ // keep the FRACTURE metabar+bar (video shows the whole player); capture full viewport
+            try{ if(player.triggerResize) player.triggerResize(); }catch(e){}
+            return true;
+          }
           var mb=document.getElementById('bb-meta'), br=document.getElementById('bb-bar');
           if(mb) mb.style.display='none'; if(br) br.style.display='none';
           document.getElementById('bb-player').style.padding='0';
           var s=Math.min(window.innerWidth/vw, window.innerHeight/vh); if(!(s>0)) s=0.1;
           try{ player.$set({width:Math.round(vw*s),height:Math.round(vh*s)}); if(player.triggerResize) player.triggerResize(); }catch(e){}
           try{ var fr=document.querySelector('.rr-player__frame').getBoundingClientRect(); hud.style.bottom=Math.max(8,(window.innerHeight - fr.bottom + Math.round(fr.height*0.03)))+'px'; }catch(e){}
-          // Kill the cursor's 50ms slide so goto() snaps it to the exact frame position (else the settle
-          // screenshots it mid-transition and the trail head drifts off the cursor).
-          try{ var mEl=document.querySelector('.replayer-mouse'); if(mEl) mEl.style.transition='none'; }catch(e){}
           return true;
         },
         // Seek to ms and draw the reconstructed overlay for that instant (call, wait a beat, screenshot).
