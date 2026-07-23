@@ -20,11 +20,20 @@ session_record_stop({ savePath, title?, autoplay? })   → { saved, htmlBytes, e
   (default: the events file with `.html`). Double-click it — it replays offline, no server, no network.
 - **`session_record_status`** lists active recordings (tab, file, events so far).
 
-Options: `allFrames:true` also records **cross-origin iframes**; `maskInputs:true` redacts form values;
-`recordCanvas:true` attempts `<canvas>` (heavier, limited — see caveats).
+Start options: `allFrames:true` also records **cross-origin iframes**; `maskInputs:true` redacts form values;
+`recordCanvas:true` attempts `<canvas>`. Stop options: `inlineAssets` (default **true** — see below), `assetBudgetMB`
+(default 50), `skipInactive` (default **false** — play idle/scroll stretches in real time), `autoplay`.
 
 ## What makes this better than page-level rrweb
 
+- **Truly self-contained / offline-faithful.** On stop, the server fetches **every external asset the capture
+  references — cross-origin stylesheets, fonts, and images — through the extension** (MV3 background `fetch` under
+  `<all_urls>` has no CORS wall and sends your session cookies) and **inlines them** into the file (`_cssText` for
+  sheets, `data:` URIs for images/fonts, `@import` chains flattened). So the replay renders from *captured* data, not
+  by re-fetching the live site — it works offline and won't break when the CDN or site changes. Page-level rrweb
+  cannot read cross-origin CSS at all. It also **strips nodes injected by your *other* extensions**
+  (`chrome-extension://…`). Oversized/over-budget assets (2 MB/asset, 50 MB total by default) are left live and
+  reported in `skipped`.
 - **Cross-origin iframes are actually captured.** Vanilla rrweb needs its script running on the third-party origin
   (which you don't control). The extension injects the recorder into *any* cross-origin child — payment, OAuth, ad,
   embedded-doc frames — via `<all_urls>`, with zero cooperation from the framed site (`allFrames:true`).
@@ -36,12 +45,14 @@ Options: `allFrames:true` also records **cross-origin iframes**; `maskInputs:tru
 
 - **rrweb replays a reconstructed DOM + CSS, not the original JS runtime.** Visual state that isn't expressed as DOM
   or attribute mutations (e.g. raw `requestAnimationFrame` drawing) is lost.
-- **Canvas / WebGL** aren't captured by default (the recorder runs in the isolated world; `recordCanvas` is heavy and
-  lossy). For pixel-perfect canvas/video, the upcoming MP4 export (screencast) is the better tool.
-- **Cross-origin / DRM `<video>`** replays only if the source is reachable and CORS-open at view time.
+- **Canvas / WebGL** aren't captured by default (`recordCanvas` is heavy and lossy). Live `<video>`/`<audio>` **pixels**
+  aren't captured (the poster is inlined; the stream isn't). For pixel-perfect canvas/video, the MP4 export (screencast,
+  roadmap) is the right tool.
 - **Closed shadow roots** and **sandboxed (no-scripts) iframes** can't run the recorder → not captured.
-- **Size.** Streaming solves memory during capture; very long sessions make a large HTML — mouse movement is sampled
-  and a periodic full snapshot bounds it; a gzip-inlined variant is planned for huge sessions.
+- **Assets over budget** (default 2 MB/asset, 50 MB total) are left as live URLs and listed in the `skipped` result —
+  raise `assetBudgetMB` to inline more. Auth-gated assets that 401 for the background fetch are likewise left live.
+- **Size.** Inlining images as `data:` URIs grows the HTML; the per-asset + total budgets bound it (CSS/fonts are cheap
+  and always inlined; images are the bulk). Set `inlineAssets:false` for a small, online-only replay.
 - **Privacy — masking is OFF by default.** The replay HTML contains **cleartext** form inputs and passwords exactly
   as typed. Pass `maskInputs:true` to redact them. Treat a recording as sensitive as the session it captured.
 

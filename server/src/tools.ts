@@ -6,6 +6,7 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import type { ExtensionHub } from "./hub.js";
 import { CaptureSink } from "./capture-sink.js";
+import { inlineAssets } from "./rrweb-inline.js";
 
 const MAX_TEXT_CHARS = 60_000;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -1104,13 +1105,18 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
 
   tool(
     "session_record_stop",
-    "Stop the tab's session recording and assemble a self-contained HTML replay (rrweb-player inlined) at savePath. " +
-      "Open the .html in any browser to replay the interaction with play/pause/scrub/speed. Returns " +
-      "{saved, htmlBytes, eventCount, durationMs}.",
+    "Stop the tab's session recording and assemble a SELF-CONTAINED, offline-faithful HTML replay at savePath. By " +
+      "default it inlines every external asset - cross-origin stylesheets, fonts, images - fetched through the " +
+      "extension (no CORS wall, session cookies), strips other extensions' injected nodes, and inlines rrweb-player. " +
+      "Open the .html in any browser (offline) to replay with play/pause/scrub/speed. Returns {saved, htmlBytes, " +
+      "eventCount, durationMs, inlined, skipped}.",
     {
       savePath: z.string().optional().describe("Absolute path (or ~/…) for the .html replay; default = the events file with .html"),
       title: z.string().optional().describe("Title shown on the replay page"),
       autoplay: z.boolean().optional().describe("Autoplay on open (default false)"),
+      skipInactive: z.boolean().optional().describe("Fast-forward idle/scroll-only stretches in the player (default false = play everything in real time)"),
+      inlineAssets: z.boolean().optional().describe("Inline external CSS/fonts/images for a self-contained offline file (default true)"),
+      assetBudgetMB: z.number().optional().describe("Total inline budget in MB (default 50); oversized/over-budget assets are left live and reported in `skipped`"),
       tabId: tabIdParam,
     },
     async (args) => {
@@ -1122,9 +1128,20 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       if (!eventsPath) throw new Error("no recording was active for this tab");
       const events = parseSessionEvents(readFileSync(eventsPath, "utf8"));
       if (!events.length) throw new Error(`recording had no events (${eventsPath}) - did you interact with the page?`);
+      // Inline external assets so the replay is self-contained/offline-faithful (fetched via the extension).
+      let report: { inlined: number; bytesInlined: number; skipped: any[] } | undefined;
+      if (args.inlineAssets !== false) {
+        const fetchBatch = async (urls: string[]) => {
+          const res = await hub.call("fetch_resources", { urls }, 120_000);
+          const map: Record<string, any> = {};
+          for (const it of res?.resources || []) map[it.url] = it;
+          return map;
+        };
+        report = await inlineAssets(events, fetchBatch, { totalBudgetBytes: (args.assetBudgetMB ?? 50) * 1024 * 1024 });
+      }
       const savePath = expandHome(args.savePath || eventsPath.replace(/\.events\.jsonl$|\.jsonl$/, "") + ".html");
       mkdirSync(dirname(savePath), { recursive: true });
-      const htmlBytes = writeRrwebHtml(savePath, events, { title: args.title, autoplay: !!args.autoplay });
+      const htmlBytes = writeRrwebHtml(savePath, events, { title: args.title, autoplay: !!args.autoplay, skipInactive: !!args.skipInactive });
       let min = Infinity, max = 0;
       for (const e of events) {
         const t = e.timestamp || 0;
@@ -1133,7 +1150,16 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
           if (t > max) max = t;
         }
       }
-      return textResult({ saved: savePath, htmlBytes, eventCount: events.length, durationMs: max > min ? max - min : 0, eventsPath });
+      return textResult({
+        saved: savePath,
+        htmlBytes,
+        eventCount: events.length,
+        durationMs: max > min ? max - min : 0,
+        inlined: report?.inlined ?? 0,
+        inlinedBytes: report?.bytesInlined ?? 0,
+        skipped: report?.skipped ?? [],
+        eventsPath,
+      });
     }
   );
 
@@ -1401,7 +1427,7 @@ try {
 const htmlEsc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
 
 // Write one offline HTML file that inlines the player + events, opening with play/scrub controls.
-function writeRrwebHtml(savePath: string, events: any[], meta: { title?: string; autoplay?: boolean }): number {
+function writeRrwebHtml(savePath: string, events: any[], meta: { title?: string; autoplay?: boolean; skipInactive?: boolean }): number {
   if (!PLAYER_JS) throw new Error("vendored rrweb-player not found in server/vendor/ - build/vendor it first");
   const title = htmlEsc(meta.title || "Session replay");
   // Escape '<' in the events JSON so a captured "</script>" can't close our inline <script> block.
@@ -1421,7 +1447,7 @@ function writeRrwebHtml(savePath: string, events: any[], meta: { title?: string;
   var g = window.rrwebPlayer || {};
   var P = g.default || g.Player || g;
   new P({ target: document.getElementById('bb-player'),
-          props: { events: events, showController: true, autoplay: ${meta.autoplay ? "true" : "false"}, speedOption: [1,2,4,8] } });
+          props: { events: events, showController: true, autoPlay: ${meta.autoplay ? "true" : "false"}, skipInactive: ${meta.skipInactive ? "true" : "false"}, speedOption: [1,2,4,8] } });
 })();
 </script>
 </body></html>`;

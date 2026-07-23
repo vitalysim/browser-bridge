@@ -1268,6 +1268,48 @@ async function doReplay(tab: chrome.tabs.Tab, params: any): Promise<any> {
   }
 }
 
+// Fetch a batch of resources (CSS/fonts/images) from the extension background: no CORS wall under
+// <all_urls>, sends the session cookies, CSP-immune - so it inlines cross-origin assets a page-level
+// recorder can't. Returns base64 + mime for each; enforces a per-asset byte cap.
+async function fetchResources(params: any): Promise<any> {
+  const urls: string[] = Array.isArray(params.urls) ? params.urls : [];
+  const cap: number = params.perAssetMaxBytes ?? 2 * 1024 * 1024;
+  const timeoutMs: number = params.timeoutMs ?? 15_000;
+  const concurrency = 8;
+  const toB64 = (buf: ArrayBuffer) => {
+    const bytes = new Uint8Array(buf);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + 0x8000)));
+    return btoa(bin);
+  };
+  const one = async (url: string) => {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), timeoutMs);
+      let r: Response;
+      try {
+        r = await fetch(url, { credentials: "include", signal: ctrl.signal });
+      } finally {
+        clearTimeout(t);
+      }
+      if (!r.ok) return { url, ok: false, status: r.status, error: `HTTP ${r.status}` };
+      const clen = Number(r.headers.get("content-length") || 0);
+      if (clen && clen > cap) return { url, ok: false, status: r.status, error: "oversized", bytes: clen };
+      const buf = await r.arrayBuffer();
+      if (buf.byteLength > cap) return { url, ok: false, status: r.status, error: "oversized", bytes: buf.byteLength };
+      const mime = (r.headers.get("content-type") || "").split(";")[0].trim();
+      return { url, ok: true, status: r.status, mime, base64: toB64(buf), bytes: buf.byteLength };
+    } catch (e) {
+      return { url, ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  };
+  const out: any[] = [];
+  for (let i = 0; i < urls.length; i += concurrency) {
+    out.push(...(await Promise.all(urls.slice(i, i + concurrency).map(one))));
+  }
+  return { resources: out };
+}
+
 // ---- intercept helpers (CDP Fetch) ----
 
 // UTF-8-safe base64 (btoa alone mangles multibyte chars); CDP wants base64 for postData/body.
@@ -2768,6 +2810,9 @@ async function dispatch(method: string, params: any): Promise<any> {
       const r = await cmd(tab.id!, "Page.captureSnapshot", { format: "mhtml" });
       return { mhtml: r?.data ?? "", url: tab.url, title: tab.title };
     }
+
+    case "fetch_resources":
+      return fetchResources(params);
 
     // ---- session recording (rrweb → HTML replay); banner-free, scripting only ----
     case "session_record_start": {

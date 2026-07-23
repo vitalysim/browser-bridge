@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.10.0-3f3f46?style=flat-square">
+  <img alt="version" src="https://img.shields.io/badge/version-0.11.0-3f3f46?style=flat-square">
   <img alt="tools" src="https://img.shields.io/badge/tools-62-3f3f46?style=flat-square">
   <img alt="protocol" src="https://img.shields.io/badge/MCP-streamable_HTTP-52525b?style=flat-square">
   <img alt="browser" src="https://img.shields.io/badge/Chrome%2FEdge-Manifest_V3-52525b?style=flat-square">
@@ -238,7 +238,7 @@ Record a live interaction and replay it. `session_record_start` captures the DOM
 
 Because the extension injects the recorder into **every frame including cross-origin iframes** (which page-level rrweb can't) and is **CSP-immune**, it records sites and embedded frames a normal recorder can't even load on. Events stream to `~/.browser-bridge/recordings/*.events.jsonl` during capture (surviving long sessions), then get inlined with the rrweb-player into the HTML on stop.
 
-Note: input **masking is OFF by default** - the replay contains cleartext form values/passwords (`maskInputs:true` to redact). Canvas/WebGL and DRM video aren't captured (a `render_recording_video` → MP4 export, which screencasts the replay, is planned for those). **Details: [docs/RECORDING.md](docs/RECORDING.md).**
+The replay is **truly self-contained / offline-faithful**: on stop, the server fetches every external asset the capture references — cross-origin stylesheets, fonts, images — **through the extension** (background `fetch` under `<all_urls>` has no CORS wall + sends your session cookies) and inlines them, and strips nodes injected by your *other* extensions. So it renders from captured data, not by re-fetching the live site (page-level rrweb can't read cross-origin CSS at all). Note: input **masking is OFF by default** (cleartext values; `maskInputs:true` to redact); canvas/WebGL and live video **pixels** still need the MP4 export (roadmap). **Details: [docs/RECORDING.md](docs/RECORDING.md).**
 
 ## Setup
 
@@ -335,7 +335,7 @@ bearer_token_env_var = "BROWSER_BRIDGE_TOKEN"
 
 ## Roadmap
 
-Shipped in v0.10: **session recording** - record a live interaction and replay it as a self-contained HTML timeline (rrweb; `session_record_start`/`stop`/`status`), banner-free, capturing cross-origin iframes; see [docs/RECORDING.md](docs/RECORDING.md). v0.9: **playbooks** - saved, self-healing task recipes (Markdown at `~/.browser-bridge/playbooks/`, record-mode capture via `playbook_record_start`/`stop`/`playbook_save`, agents auto-told the convention); see [docs/PLAYBOOKS.md](docs/PLAYBOOKS.md). v0.8 (from real remote-desktop pentest feedback): **coordinate-level trusted input** (`input`) for canvas/VNC/RDP/DCV targets, `get_page_text(includeHidden)` for collapsed/hidden content, `cdp_eval`/`eval_js` `timeoutMs`, and `screenshot` `dpr`/`visibilityState` surfacing (coordinate mapping + occlusion warning). v0.7: **durable capture persistence** (`net_capture_start(persist)`, `maxEntries`), **copy-as-curl** (`request_to_curl`), **`analyze deep`**, plus reliability fixes (fail-fast on disconnect, no idle-detach of active captures, fast load-wait, off-DOM snapshot refs, single-sourced versioning). v0.6: **self-healing interaction**, **passive recon** (`analyze`) + **`jwt_decode`**, **HAR export**, **fuzz modes** + **`viaAppClient`** replay. v0.5 shipped interception, fuzzing, cookie/storage, console/CSP capture, and MHTML.
+Shipped in v0.11: **offline-faithful session replay** - `session_record_stop` now inlines every external asset (cross-origin CSS/fonts/images fetched through the extension, no CORS wall) + strips foreign-extension nodes + fixes scroll playback, so the HTML is truly self-contained. v0.10: **session recording** - record a live interaction and replay it as a self-contained HTML timeline (rrweb; `session_record_start`/`stop`/`status`), banner-free, capturing cross-origin iframes; see [docs/RECORDING.md](docs/RECORDING.md). v0.9: **playbooks** - saved, self-healing task recipes (Markdown at `~/.browser-bridge/playbooks/`, record-mode capture via `playbook_record_start`/`stop`/`playbook_save`, agents auto-told the convention); see [docs/PLAYBOOKS.md](docs/PLAYBOOKS.md). v0.8 (from real remote-desktop pentest feedback): **coordinate-level trusted input** (`input`) for canvas/VNC/RDP/DCV targets, `get_page_text(includeHidden)` for collapsed/hidden content, `cdp_eval`/`eval_js` `timeoutMs`, and `screenshot` `dpr`/`visibilityState` surfacing (coordinate mapping + occlusion warning). v0.7: **durable capture persistence** (`net_capture_start(persist)`, `maxEntries`), **copy-as-curl** (`request_to_curl`), **`analyze deep`**, plus reliability fixes (fail-fast on disconnect, no idle-detach of active captures, fast load-wait, off-DOM snapshot refs, single-sourced versioning). v0.6: **self-healing interaction**, **passive recon** (`analyze`) + **`jwt_decode`**, **HAR export**, **fuzz modes** + **`viaAppClient`** replay. v0.5 shipped interception, fuzzing, cookie/storage, console/CSP capture, and MHTML.
 
 Ideas explored for future phases: source-map de-minification on downloads, GraphQL introspection helpers, and a client-side DOM-XSS / postMessage / prototype-pollution suite.
 
