@@ -217,6 +217,13 @@ export async function inlineAssets(events: any[], fetchBatch: FetchBatch, opts: 
     if (t === 2 && d?.node) {
       await walkChildren(d.node); // FullSnapshot (document root)
     } else if (t === 3 && d?.source === 0 && Array.isArray(d.adds)) {
+      // Drop foreign-extension nodes injected via mutation. walkChildren only strips at the child
+      // level, so a chrome-extension:// node that is itself an add root (e.g. a <script src> another
+      // extension appends post-load) would otherwise survive.
+      d.adds = d.adds.filter((add: any) => {
+        const a = (add?.node && add.node.attributes) || {};
+        return !(isChromeExt(a.href || "") || isChromeExt(a.src || ""));
+      });
       for (const add of d.adds) {
         if (add?.node) {
           await inlineNode(add.node); // the added node itself
