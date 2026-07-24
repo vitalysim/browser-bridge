@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: build (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18, 20]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: |
+            server/package-lock.json
+            extension/package-lock.json
+
+      - name: Build the server
+        working-directory: server
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+
+      - name: Typecheck and build the extension
+        working-directory: extension
+        run: |
+          npm install --no-audit --no-fund
+          npm run typecheck
+          npm run build

@@ -1,0 +1,50 @@
+name: Bug report
+description: Something in Browser Bridge is broken or behaving wrong.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Please strip anything sensitive (tokens, cookies, logged-in URLs) before posting.
+
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Server + extension version, and which agent (Claude Code or Codex).
+      placeholder: server 0.14.2, extension 0.14.2, Claude Code 2.0.x
+    validations:
+      required: true
+
+  - type: input
+    id: env
+    attributes:
+      label: OS and browser
+      placeholder: macOS 15, Chrome 140
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what actually happened.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Server log (~/.browser-bridge/server.log) or the extension service worker console, if relevant. Redact anything private.
+      render: text

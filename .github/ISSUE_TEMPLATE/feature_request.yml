@@ -1,0 +1,19 @@
+name: Feature request
+description: Suggest something Browser Bridge should do.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do
+      description: The task or workflow you are stuck on. What is missing today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help
+      description: The tool, option, or behavior you have in mind. Rough is fine.
+    validations:
+      required: true
