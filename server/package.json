@@ -2,6 +2,11 @@
   "name": "browser-bridge-server",
   "version": "0.14.2",
   "private": true,
+  "description": "Local MCP server for Browser Bridge - lets AI agents (Claude Code, Codex) drive your real, logged-in Chrome.",
+  "license": "MIT",
+  "author": "Vitaly Simonovich",
+  "repository": { "type": "git", "url": "https://github.com/vitalysim/browser-bridge.git" },
+  "homepage": "https://github.com/vitalysim/browser-bridge#readme",
   "type": "module",
   "scripts": {
     "build": "tsc",

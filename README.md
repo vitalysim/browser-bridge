@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.14.1-3f3f46?style=flat-square">
+  <img alt="version" src="https://img.shields.io/badge/version-0.14.2-3f3f46?style=flat-square">
   <img alt="tools" src="https://img.shields.io/badge/tools-63-3f3f46?style=flat-square">
   <img alt="protocol" src="https://img.shields.io/badge/MCP-streamable_HTTP-52525b?style=flat-square">
   <img alt="browser" src="https://img.shields.io/badge/Chrome%2FEdge-Manifest_V3-52525b?style=flat-square">
@@ -392,7 +392,7 @@ Contributions are welcome - see **[CONTRIBUTING.md](CONTRIBUTING.md)** for the b
 
 ## License
 
-**MIT** - see [LICENSE](LICENSE).
+**MIT** - see [LICENSE](LICENSE). Bundled third-party components (rrweb, rrweb-player - both MIT) are credited in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 ## Disclaimer
 

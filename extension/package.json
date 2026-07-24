@@ -2,6 +2,11 @@
   "name": "browser-bridge-extension",
   "version": "0.14.2",
   "private": true,
+  "description": "Browser Bridge MV3 Chrome extension - connects your real browser to the local Browser Bridge MCP server.",
+  "license": "MIT",
+  "author": "Vitaly Simonovich",
+  "repository": { "type": "git", "url": "https://github.com/vitalysim/browser-bridge.git" },
+  "homepage": "https://github.com/vitalysim/browser-bridge#readme",
   "scripts": {
     "build": "node build.mjs",
     "typecheck": "tsc --noEmit"
