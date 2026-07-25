@@ -1,6 +1,6 @@
 {
   "name": "browser-bridge-server",
-  "version": "0.14.2",
+  "version": "0.14.3",
   "private": true,
   "description": "Local MCP server for Browser Bridge - lets AI agents (Claude Code, Codex) drive your real, logged-in Chrome.",
   "license": "MIT",
@@ -27,5 +27,8 @@
     "@types/ws": "^8.5.13",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
+  },
+  "overrides": {
+    "@hono/node-server": ">=2.0.5"
   }
 }
