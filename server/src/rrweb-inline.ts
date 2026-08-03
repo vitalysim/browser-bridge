@@ -120,26 +120,36 @@ export async function inlineAssets(events: any[], fetchBatch: FetchBatch, opts: 
         if (u) imports.push({ stmt, url: u, media: (media || "").trim() });
         return stmt;
       });
-      for (const imp of imports) {
-        let abs: string;
+      // Resolve every import at THIS level first, then fetch them in one batch. Previously each
+      // import cost its own fetchBatch([one]) round trip to the extension, serially - the dominant
+      // cost of session_record_stop on stylesheet-heavy pages. Nested imports still recurse (each
+      // deeper level batches its own), and cssTextCache still dedupes across the whole run.
+      const resolved = imports.map((imp) => {
+        let abs: string | null = null;
         try {
-          abs = new URL(imp.url, baseUrl || undefined).href;
+          const u = new URL(imp.url, baseUrl || undefined).href;
+          if (isInlineable(u)) abs = u;
         } catch {
-          continue;
+          /* unresolvable relative with no base - skip, as before */
         }
-        if (!isInlineable(abs)) continue;
-        let inner = cssTextCache.get(abs);
-        if (inner === undefined) {
-          const res = await fetchBatch([abs]);
-          const r = res[abs];
-          if (r && r.ok && r.base64) {
-            inner = await rewriteCss(Buffer.from(r.base64, "base64").toString("utf8"), abs, depth + 1);
-          } else {
-            inner = null;
-            skipped.push({ url: abs, reason: r?.error || "import-fetch-failed" });
-          }
-          cssTextCache.set(abs, inner);
+        return { imp, abs };
+      });
+      const toFetch = [...new Set(resolved.map((r) => r.abs).filter((a): a is string => !!a && !cssTextCache.has(a)))];
+      const fetched = toFetch.length ? await fetchBatch(toFetch) : {};
+      for (const abs of toFetch) {
+        if (cssTextCache.has(abs)) continue; // a sibling's recursion already resolved it
+        const r = fetched[abs];
+        if (r && r.ok && r.base64) {
+          // Sequential by necessity: recursion can populate cssTextCache for siblings.
+          cssTextCache.set(abs, await rewriteCss(Buffer.from(r.base64, "base64").toString("utf8"), abs, depth + 1));
+        } else {
+          cssTextCache.set(abs, null);
+          skipped.push({ url: abs, reason: r?.error || "import-fetch-failed" });
         }
+      }
+      for (const { imp, abs } of resolved) {
+        if (!abs) continue;
+        const inner = cssTextCache.get(abs) ?? null;
         css = css.split(imp.stmt).join(inner != null ? (imp.media ? `@media ${imp.media}{${inner}}` : inner) : "");
       }
     }

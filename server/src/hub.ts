@@ -3,7 +3,7 @@ import type { Server as HttpServer, IncomingMessage } from "http";
 import { randomUUID } from "crypto";
 import { CaptureSink } from "./capture-sink.js";
 
-const CALL_TIMEOUT_MS = 30_000;
+export const CALL_TIMEOUT_MS = 30_000;
 
 interface Pending {
   resolve: (v: unknown) => void;
@@ -174,6 +174,17 @@ export class ExtensionHub {
   }
   deleteRecordingPath(tabId: number): boolean {
     return this.recordingPaths.delete(tabId);
+  }
+
+  // Await every live sink's queued writes. Sink writes are async (see CaptureSink), so a graceful
+  // shutdown must drain them or an abrupt exit loses the tail of a capture/recording/playbook draft.
+  async drainSinks(): Promise<void> {
+    const pending = [
+      ...[...this.captureSinks.values()].map((s) => s.drain()),
+      ...[...this.sessionSinks.values()].map((s) => s.drain()),
+      ...(this.recordSink ? [this.recordSink.drain()] : []),
+    ];
+    await Promise.all(pending);
   }
 
   // Route a streamed {type:"capture", stream?, tabId, entries, done} message to the right sink.

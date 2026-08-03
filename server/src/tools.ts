@@ -6,12 +6,75 @@ import { homedir, tmpdir } from "os";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
-import type { ExtensionHub } from "./hub.js";
+import { CALL_TIMEOUT_MS, type ExtensionHub } from "./hub.js";
 import { CaptureSink } from "./capture-sink.js";
 import { inlineAssets } from "./rrweb-inline.js";
 
 const MAX_TEXT_CHARS = 60_000;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+const MAX_BATCH_ACTIONS = 50;
+
+// Parallel same-origin script fetches for `analyze deep:true`. Bounded on purpose - see the call site.
+const DEEP_SCRIPT_CONCURRENCY = 6;
+
+// Tools browser_batch may run. An ALLOWLIST, not a denylist, and deliberately narrow: the MCP client
+// prompts for permission per tool call, so a batch approved once would otherwise run N tools
+// unprompted. The bar for membership is that batching the tool adds no approval surface - it either
+// changes nothing outside the page the caller is already driving, or it changes nothing at all.
+//
+// Deliberately NOT batchable, and each for a reason:
+//   cookies_get / storage_dump      - read HttpOnly cookies and origin storage (data exposure)
+//   cookies_set/delete, storage_*   - mutate credentials and origin state
+//   identity_capture / purge        - snapshot or destroy credential sets
+//   intercept_start/stop/resolve    - can rewrite live traffic
+//   request_to_curl                 - reproduces the real sent Cookie header (see note below)
+//   fuzz, authz_matrix, replay_request, analyze - issue outbound requests to a target
+//   download_resource, file_upload, paste_image, save_page, export_har - cross the disk boundary
+//   playbook_* , session_record_*, render_recording_video - persist artifacts
+//   input, cdp_eval, tab_close, console_start/stop, net_capture_start, debugger_detach
+//                                   - attach/detach the debugger or close tabs (visible side effects)
+const BATCHABLE_TOOLS = new Set([
+  // navigation + interaction: the sequences batching exists to collapse
+  "navigate",
+  "go_back",
+  "go_forward",
+  "tabs_list",
+  "tab_new",
+  "tab_activate",
+  "click",
+  "fill",
+  "hover",
+  "type",
+  "press_key",
+  "scroll",
+  "wait_for",
+  // page reads
+  "snapshot",
+  "get_page_text",
+  "screenshot",
+  "eval_js",
+  // pure computation - no I/O at all
+  "jwt_decode",
+  "response_diff",
+  // status reads - server-local or a trivial extension query; no page state touched
+  "bridge_status",
+  "debugger_status",
+  "identity_list",
+  "session_record_status",
+  // capture-buffer reads. These CAN surface auth headers and cookies, but only for traffic the user
+  // already opted into capturing: each is downstream of a start tool (net_capture_start,
+  // console_start, intercept_start) that is deliberately NOT batchable. So the credential-bearing
+  // read stays gated behind an explicit, separately-approved capture - unlike cookies_get, which
+  // works cold and is therefore excluded. (request_to_curl is excluded for the same reason: with a
+  // requestId it reproduces the real sent Cookie header, and its ad-hoc path is a pure echo that
+  // gains nothing from batching.)
+  "net_get_requests",
+  "net_get_body",
+  "net_get_ws_frames",
+  "console_get",
+  "intercept_pending",
+]);
 
 // Expand a leading ~/ to the home dir (Node fs doesn't do it). For playbook/record paths.
 const expandHome = (p: string) => (p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
@@ -66,13 +129,25 @@ const timeoutMsParam = z
   .optional()
   .describe("Max ms to auto-wait for the element to become actionable (found + visible + enabled). Default 5000. On failure the result is {notActionable, reason: 'not-found-after…'|'hidden'|'disabled'|'covered'}.");
 
+// The extension's own actionability budget (background.ts `interact`, default 5000) is independent of
+// the hub's per-call timer. Without this the hub would fire at CALL_TIMEOUT_MS while the extension is
+// still retrying - the caller gets a timeout error but the browser still acts. Mirrors wait_for's
+// `+5_000` slack. Math.max so the budget can only ever GROW: the default stays exactly CALL_TIMEOUT_MS.
+const actionHubTimeout = (t?: number) => Math.max(CALL_TIMEOUT_MS, (t ?? 5_000) + 5_000);
+
 export function registerTools(server: McpServer, hub: ExtensionHub, version = "0.0.0") {
+  // Every registered tool, so browser_batch can invoke the SAME handler the MCP layer would - no
+  // duplicated dispatch logic to drift. The schema is kept because calling a handler directly
+  // bypasses the SDK's own zod validation, so batch must re-validate each item itself.
+  const registry = new Map<string, { schema: z.ZodRawShape; handler: (args: any) => Promise<any> }>();
+
   const tool = (
     name: string,
     description: string,
     inputSchema: z.ZodRawShape,
     handler: (args: any) => Promise<any>
   ) => {
+    registry.set(name, { schema: inputSchema, handler });
     server.registerTool(name, { description, inputSchema }, async (args: any) => {
       try {
         return await handler(args);
@@ -170,7 +245,9 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     },
     async ({ ref, selector, trusted, autoTrusted, noEscalate, timeoutMs, withSnapshot, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
-      return textResult(await hub.call("click", { ref, selector, trusted, autoTrusted, noEscalate, timeoutMs, withSnapshot, tabId }));
+      return textResult(
+        await hub.call("click", { ref, selector, trusted, autoTrusted, noEscalate, timeoutMs, withSnapshot, tabId }, actionHubTimeout(timeoutMs))
+      );
     }
   );
 
@@ -190,7 +267,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     },
     async ({ value, ref, selector, timeoutMs, withSnapshot, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
-      return textResult(await hub.call("fill", { value, ref, selector, timeoutMs, withSnapshot, tabId }));
+      return textResult(await hub.call("fill", { value, ref, selector, timeoutMs, withSnapshot, tabId }, actionHubTimeout(timeoutMs)));
     }
   );
 
@@ -209,7 +286,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     },
     async ({ ref, selector, trusted, timeoutMs, withSnapshot, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
-      return textResult(await hub.call("hover", { ref, selector, trusted, timeoutMs, withSnapshot, tabId }));
+      return textResult(await hub.call("hover", { ref, selector, trusted, timeoutMs, withSnapshot, tabId }, actionHubTimeout(timeoutMs)));
     }
   );
 
@@ -230,7 +307,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     },
     async ({ text, ref, selector, trusted, timeoutMs, withSnapshot, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
-      return textResult(await hub.call("type", { text, ref, selector, trusted, timeoutMs, withSnapshot, tabId }));
+      return textResult(await hub.call("type", { text, ref, selector, trusted, timeoutMs, withSnapshot, tabId }, actionHubTimeout(timeoutMs)));
     }
   );
 
@@ -944,16 +1021,29 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       let scannedScripts = 0;
       if (deep && typeof resp.body === "string") {
         const scripts = extractSameOriginScripts(resp.body, target).slice(0, 15);
-        for (const src of scripts) {
-          try {
-            const jr = await hub.call("replay_request", { url: src, method: "GET", tabId }, 30_000);
-            if (typeof jr?.body === "string") {
-              scannedScripts++;
-              for (const f of scanSecrets(jr.body)) findings.push({ ...f, detail: `${f.detail} - external script`, evidence: `${f.evidence ?? ""} @ ${src}` });
+        // Fetched with bounded concurrency rather than one-at-a-time. Bounded (not all 15 at once)
+        // because analyze points at a single origin: a burst can trip a WAF or rate limiter and
+        // change the findings. Drop DEEP_SCRIPT_CONCURRENCY to 1 to restore fully serial fetching.
+        const bodies = new Array<string | null>(scripts.length).fill(null);
+        let next = 0;
+        await Promise.all(
+          Array.from({ length: Math.min(DEEP_SCRIPT_CONCURRENCY, scripts.length) }, async () => {
+            for (let i = next++; i < scripts.length; i = next++) {
+              try {
+                const jr = await hub.call("replay_request", { url: scripts[i], method: "GET", tabId }, 30_000);
+                if (typeof jr?.body === "string") bodies[i] = jr.body;
+              } catch {
+                /* unreachable/blocked script - skip */
+              }
             }
-          } catch {
-            /* unreachable/blocked script - skip */
-          }
+          })
+        );
+        // Folded in original script order, so findings stay deterministic regardless of fetch order.
+        for (let i = 0; i < scripts.length; i++) {
+          const body = bodies[i];
+          if (body === null) continue;
+          scannedScripts++;
+          for (const f of scanSecrets(body)) findings.push({ ...f, detail: `${f.detail} - external script`, evidence: `${f.evidence ?? ""} @ ${scripts[i]}` });
         }
       }
       findings.sort((a, b) => sevRank(b.severity) - sevRank(a.severity));
@@ -1257,6 +1347,71 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     "Check whether the Chrome extension is currently connected to the bridge.",
     {},
     async () => textResult({ extensionConnected: hub.connected, recording: hub.recording })
+  );
+
+  // ---- batch (registered LAST: it reads `registry`, which every tool() call above populates) ----
+  tool(
+    "browser_batch",
+    "Run a SEQUENCE of browser tools in ONE call. Each item is {name, input} where input is exactly " +
+      "what you'd pass to that tool standalone. Use this whenever you can predict two or more steps " +
+      "ahead - e.g. navigate → click → fill → press_key → screenshot - because the round trip per " +
+      "tool call, not the browser, is what makes multi-step tasks slow. Actions run SEQUENTIALLY and " +
+      "STOP at the first error; the result reports what completed plus the failing index and message, " +
+      "so a partial run is always legible. Only navigation/interaction/read tools may be batched " +
+      `(${[...BATCHABLE_TOOLS].join(", ")}); anything else must be called directly so it keeps its own ` +
+      "per-call approval. Cannot be nested.",
+    {
+      actions: z
+        .array(
+          z.object({
+            name: z.string().describe("Tool name, e.g. 'click'"),
+            input: z.record(z.any()).optional().describe("That tool's input - the same shape you'd pass calling it directly"),
+          })
+        )
+        .min(1)
+        .max(MAX_BATCH_ACTIONS)
+        .describe(`Tools to run in order (max ${MAX_BATCH_ACTIONS}). Executed sequentially; stops at the first error.`),
+    },
+    async ({ actions }) => {
+      const results: any[] = [];
+      for (let i = 0; i < actions.length; i++) {
+        const { name, input } = actions[i];
+        const fail = (error: string) =>
+          textResult({ executed: results.length, total: actions.length, results, stoppedAt: i, failedTool: name, error });
+
+        if (name === "browser_batch") return fail("browser_batch cannot be nested.");
+        const entry = registry.get(name);
+        if (!entry) return fail(`Unknown tool '${name}'.`);
+        if (!BATCHABLE_TOOLS.has(name)) {
+          return fail(`'${name}' is not batchable - call it directly so it keeps its own per-call approval.`);
+        }
+
+        // The SDK validates args before a normal tool call; invoking the handler directly skips that,
+        // so re-validate here rather than letting a malformed input reach the browser.
+        let args: any;
+        try {
+          args = z.object(entry.schema).parse(input ?? {});
+        } catch (err) {
+          return fail(`Invalid input for '${name}': ${err instanceof Error ? err.message : String(err)}`);
+        }
+
+        let out: any;
+        try {
+          out = await entry.handler(args);
+        } catch (err) {
+          return fail(err instanceof Error ? err.message : String(err));
+        }
+        // Handlers return the MCP content envelope; unwrap to keep the batch result readable. A
+        // handler that returned isError (rather than throwing) still halts the run.
+        const text = out?.content?.[0]?.text ?? "";
+        if (out?.isError) {
+          results.push({ index: i, tool: name, error: text });
+          return fail(text || `'${name}' failed.`);
+        }
+        results.push({ index: i, tool: name, result: text });
+      }
+      return textResult({ executed: results.length, total: actions.length, results });
+    }
   );
 }
 

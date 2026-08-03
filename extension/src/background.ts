@@ -221,21 +221,6 @@ function bbPageText(includeHidden: boolean) {
 function bbSnapshot(refOffset: number) {
   const SEL =
     'a[href], button, input, select, textarea, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [contenteditable="true"]';
-  const all: Element[] = [];
-  const walk = (root: Document | ShadowRoot) => {
-    let els: NodeListOf<Element>;
-    try {
-      els = root.querySelectorAll("*");
-    } catch {
-      return;
-    }
-    for (const el of Array.from(els)) {
-      all.push(el);
-      const sr = (el as HTMLElement).shadowRoot;
-      if (sr) walk(sr);
-    }
-  };
-  walk(document);
   const items: any[] = [];
   // Fresh ref registry each snapshot: ref (number) -> Element, kept on the frame's ISOLATED-world
   // global so a later click/fill/hover/type injection (same world) resolves the ref WITHOUT mutating
@@ -244,16 +229,34 @@ function bbSnapshot(refOffset: number) {
   // different `window` and would miss this registry.
   const bbRefs: Map<number, Element> = ((window as any).__bbRefs = new Map());
   let n = 0;
-  for (const el of all) {
-    const h = el as HTMLElement;
-    let ok = false;
+  // Single fused pass: match-and-emit during the walk instead of materializing EVERY element in the
+  // document into an array and re-looping it. Emission order is identical - the old walk pushed a
+  // host then immediately recursed into its shadow root, which is exactly this traversal order - and
+  // the 400 cap now stops the walk itself rather than only the second loop, so a huge page no longer
+  // traverses tens of thousands of nodes it will never emit. Same elements, same refs, less work.
+  const walk = (root: Document | ShadowRoot) => {
+    if (n >= 400) return;
+    let els: NodeListOf<Element>;
     try {
-      ok = h.matches(SEL);
+      els = root.querySelectorAll("*");
     } catch {
-      ok = false;
+      return;
     }
-    if (!ok) continue;
-    if ((h as any).checkVisibility && !(h as any).checkVisibility()) continue;
+    for (const el of Array.from(els)) {
+      if (n >= 400) return;
+      const h = el as HTMLElement;
+      let ok = false;
+      try {
+        ok = h.matches(SEL);
+      } catch {
+        ok = false;
+      }
+      if (ok && (!(h as any).checkVisibility || (h as any).checkVisibility())) emit(h);
+      const sr = h.shadowRoot;
+      if (sr) walk(sr);
+    }
+  };
+  const emit = (h: HTMLElement) => {
     n++;
     const ref = refOffset + n;
     bbRefs.set(ref, h);
@@ -277,8 +280,8 @@ function bbSnapshot(refOffset: number) {
     const r = h.getBoundingClientRect();
     entry.inViewport = r.bottom > 0 && r.right > 0 && r.top < (window.innerHeight || 0) && r.left < (window.innerWidth || 0);
     items.push(entry);
-    if (n >= 400) break;
-  }
+  };
+  walk(document);
   return { url: location.href, count: items.length, elements: items };
 }
 
@@ -694,6 +697,21 @@ function waitForComplete(tabId: number, timeoutMs = 20_000): Promise<void> {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// chrome.tabs.captureVisibleTab is quota-limited (MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND, ~2/s).
+// The old unconditional 350ms pre-capture sleep spaced calls out incidentally; now that capturing an
+// already-foregrounded tab is near-instant, a burst would trip the quota and hard-fail. Space them
+// explicitly instead, measured from the LAST capture - so an isolated screenshot (the common case)
+// still waits nothing, and only a genuine burst pays. CDP screenshots use Page.captureScreenshot,
+// which is not subject to this quota, so cdpScreenshot deliberately doesn't throttle.
+const MIN_CAPTURE_INTERVAL_MS = 550;
+const lastCaptureAt = new Map<number, number>(); // windowId -> last captureVisibleTab timestamp
+
+async function throttleCapture(windowId: number): Promise<void> {
+  const wait = MIN_CAPTURE_INTERVAL_MS - (Date.now() - (lastCaptureAt.get(windowId) ?? 0));
+  if (wait > 0) await sleep(wait);
+  lastCaptureAt.set(windowId, Date.now());
+}
+
 // Back/forward via the page's own history - chrome.tabs.goBack/goForward fail spuriously
 // ("Cannot find a next page in history") even when history exists. Polls for the URL change
 // so bfcache (instant) restores don't wait on a load-complete event that never fires.
@@ -705,14 +723,16 @@ async function navByHistory(tab: chrome.tabs.Tab, direction: "back" | "forward")
   }, [direction]);
   const deadline = Date.now() + 6_000;
   let navigated = false;
+  // Check BEFORE sleeping: a bfcache restore is effectively instant, and sleeping first charged it a
+  // flat 150ms it never needed.
   while (Date.now() < deadline) {
-    await sleep(150);
     const t = await chrome.tabs.get(tab.id!);
     if (t.url && t.url !== before) {
       navigated = true;
       await sleep(300); // brief settle
       break;
     }
+    await sleep(150);
   }
   const fresh = await chrome.tabs.get(tab.id!);
   return { tabId: fresh.id, title: fresh.title, url: fresh.url, navigated };
@@ -854,41 +874,59 @@ function attach(tabId: number): Promise<void> {
   });
 }
 
+// In-flight attaches, keyed by tab. Without this, two concurrent debugger-backed calls on a COLD tab
+// both see no session and both call chrome.debugger.attach - the loser hits the "already attached"
+// rejection path and fails a call that should have succeeded. Sharing the promise makes the second
+// caller await the first attach instead of racing it.
+const attaching = new Map<number, Promise<Session>>();
+
 async function ensureAttached(tabId: number): Promise<Session> {
-  let s = sessions.get(tabId);
-  if (!s) {
-    await attach(tabId);
-    // If an enable fails AFTER a successful attach, detach so we don't strand an orphaned debugger
-    // (stuck "being debugged" banner + a leaked attach that nothing will ever clean up).
-    try {
-      await Promise.all([cmd(tabId, "DOM.enable"), cmd(tabId, "Page.enable")]);
-    } catch (e) {
-      await detachSession(tabId).catch(() => {});
-      throw e;
-    }
-    s = {
-      attachedAt: Date.now(),
-      lastUsedAt: Date.now(),
-      net: [],
-      netOn: false,
-      netMax: NET_MAX_ENTRIES,
-      persist: false,
-      persistBodies: false,
-      flushQueue: [],
-      flushTimer: null,
-      extra: new Map(),
-      wsUrls: new Map(),
-      wsFrames: [],
-      refNodes: new Map(),
-      deepGen: 0,
-      interceptOn: false,
-      interceptRules: [],
-      paused: new Map(),
-      logOn: false,
-      logs: [],
-    };
-    sessions.set(tabId, s);
+  const existing = sessions.get(tabId);
+  if (existing) {
+    existing.lastUsedAt = Date.now();
+    return existing;
   }
+  let p = attaching.get(tabId);
+  if (!p) {
+    p = (async () => {
+      await attach(tabId);
+      // If an enable fails AFTER a successful attach, detach so we don't strand an orphaned debugger
+      // (stuck "being debugged" banner + a leaked attach that nothing will ever clean up).
+      try {
+        await Promise.all([cmd(tabId, "DOM.enable"), cmd(tabId, "Page.enable")]);
+      } catch (e) {
+        await detachSession(tabId).catch(() => {});
+        throw e;
+      }
+      const s: Session = {
+        attachedAt: Date.now(),
+        lastUsedAt: Date.now(),
+        net: [],
+        netOn: false,
+        netMax: NET_MAX_ENTRIES,
+        persist: false,
+        persistBodies: false,
+        flushQueue: [],
+        flushTimer: null,
+        extra: new Map(),
+        wsUrls: new Map(),
+        wsFrames: [],
+        refNodes: new Map(),
+        deepGen: 0,
+        interceptOn: false,
+        interceptRules: [],
+        paused: new Map(),
+        logOn: false,
+        logs: [],
+      };
+      sessions.set(tabId, s);
+      return s;
+    })();
+    attaching.set(tabId, p);
+    // Clear on settle either way: a failed attach must not be cached, or the tab could never retry.
+    void p.catch(() => {}).then(() => attaching.delete(tabId));
+  }
+  const s = await p;
   s.lastUsedAt = Date.now();
   return s;
 }
@@ -1725,11 +1763,16 @@ async function viewportMeta(tab: chrome.tabs.Tab): Promise<any> {
 // keep output dimensions predictable (= CSS size × scale) and default file sizes reasonable.
 async function cdpScreenshot(tab: chrome.tabs.Tab, params: any): Promise<any> {
   const tabId = tab.id!;
-  // Surface capture requires the tab to be visible/active, else it returns empty.
-  await chrome.tabs.update(tabId, { active: true });
-  await chrome.windows.update(tab.windowId!, { focused: true }).catch(() => {});
+  // Surface capture requires the tab to be visible/active, else it returns empty. Skip the switch
+  // (and its settle) when it's already foregrounded - the common case in an agent loop.
+  const win = await chrome.windows.get(tab.windowId!).catch(() => null);
+  const needsForeground = !tab.active || !win?.focused;
+  if (needsForeground) {
+    await chrome.tabs.update(tabId, { active: true });
+    await chrome.windows.update(tab.windowId!, { focused: true }).catch(() => {});
+  }
   await ensureAttached(tabId);
-  await sleep(250);
+  if (needsForeground) await sleep(250); // let the newly-foregrounded tab paint before capture
 
   const format = params.format === "jpeg" ? "jpeg" : "png";
   const scale = typeof params.scale === "number" && params.scale > 0 ? params.scale : 1;
@@ -2564,11 +2607,35 @@ async function dispatch(method: string, params: any): Promise<any> {
       const tab = await targetTab(params.tabId);
       const rich = params.fullPage || params.selector || params.scale || (params.format && params.format !== "png");
       if (rich) return cdpScreenshot(tab, params);
-      // default: banner-free visible-viewport PNG
-      await chrome.tabs.update(tab.id!, { active: true });
-      await chrome.windows.update(tab.windowId!, { focused: true });
-      await sleep(350);
-      const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId!, { format: "png" });
+      // default: banner-free visible-viewport PNG. captureVisibleTab grabs the ACTIVE tab of the given
+      // window, so what it actually requires is that our tab is active in its own window - not that
+      // Chrome owns OS focus. The two are treated separately on purpose: switching the active tab
+      // needs a real repaint before capture, whereas raising an already-visible window does not, and
+      // gating the settle on window focus meant a multi-window setup (or Chrome simply not being the
+      // frontmost app) paid the full 350ms on every single screenshot.
+      const win = await chrome.windows.get(tab.windowId!);
+      if (!tab.active) {
+        await chrome.tabs.update(tab.id!, { active: true });
+        await sleep(350); // tab switch - let the newly-shown tab paint
+      }
+      if (!win.focused) {
+        await chrome.windows.update(tab.windowId!, { focused: true }).catch(() => {});
+        await sleep(60); // window raise - compositor only, no layout
+      }
+      // The returned meta already reports visibilityState/hidden, so a caller capturing an occluded
+      // or minimized window is still warned that the frame may be throttled or stale.
+      await throttleCapture(tab.windowId!);
+      let dataUrl: string;
+      try {
+        dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId!, { format: "png" });
+      } catch (e) {
+        // Belt-and-braces: the throttle's timestamps live in service-worker memory, so an SW respawn
+        // between captures can still land inside the quota window. One spaced retry covers it.
+        if (!/quota/i.test(e instanceof Error ? e.message : String(e))) throw e;
+        await sleep(MIN_CAPTURE_INTERVAL_MS);
+        lastCaptureAt.set(tab.windowId!, Date.now());
+        dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId!, { format: "png" });
+      }
       const meta = await viewportMeta(tab);
       return { base64: dataUrl.replace(/^data:image\/png;base64,/, ""), format: "png", ...meta };
     }
@@ -2628,7 +2695,8 @@ async function dispatch(method: string, params: any): Promise<any> {
       while (Date.now() < deadline) {
         const found = await inject(tab, (sel: string) => !!document.querySelector(sel), [params.selector]);
         if (found) return { found: true, selector: params.selector };
-        await sleep(250);
+        await sleep(100); // 250ms meant ~125ms of average overshoot past the element appearing
+
       }
       throw new Error(`Timed out after ${timeoutMs}ms waiting for selector: ${params.selector}`);
     }

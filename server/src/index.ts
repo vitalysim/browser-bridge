@@ -127,6 +127,18 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true, extensionConnected: hub.connected });
 });
 
+// Sink writes are async (see CaptureSink), so drain them before exiting or an abrupt kill loses the
+// tail of an in-progress capture / session recording / playbook draft. Guarded against a double
+// signal, and time-boxed so a wedged fsync can't hang the shutdown.
+let shuttingDown = false;
+for (const sig of ["SIGINT", "SIGTERM"] as const) {
+  process.on(sig, () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    void Promise.race([hub.drainSinks(), new Promise((r) => setTimeout(r, 2_000))]).then(() => process.exit(0));
+  });
+}
+
 httpServer.listen(PORT, HOST, () => {
   console.error(`[browser-bridge] listening on http://${HOST}:${PORT}`);
   console.error(`[browser-bridge] MCP endpoint:  http://${HOST}:${PORT}/mcp  (Authorization: Bearer <token>)`);

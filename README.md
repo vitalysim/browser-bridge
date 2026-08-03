@@ -8,8 +8,8 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.14.2-3f3f46?style=flat-square">
-  <img alt="tools" src="https://img.shields.io/badge/tools-63-3f3f46?style=flat-square">
+  <img alt="version" src="https://img.shields.io/badge/version-0.15.0-3f3f46?style=flat-square">
+  <img alt="tools" src="https://img.shields.io/badge/tools-64-3f3f46?style=flat-square">
   <img alt="protocol" src="https://img.shields.io/badge/MCP-streamable_HTTP-52525b?style=flat-square">
   <img alt="browser" src="https://img.shields.io/badge/Chrome%2FEdge-Manifest_V3-52525b?style=flat-square">
   <img alt="language" src="https://img.shields.io/badge/TypeScript-strict-3178c6?style=flat-square">
@@ -19,7 +19,7 @@
 
 Browser Bridge is a local **MCP server + Manifest V3 Chrome extension** that lets AI coding agents - **Claude Code** and **OpenAI Codex CLI** - control the Chrome you use every day. Because it runs *inside* your real profile, the agent inherits your cookies, `HttpOnly` sessions, SSO, and 2FA state automatically. Ask it to *"read my feed and summarize it"* or *"capture the API traffic on this page and show me the responses"* - and it works against the live, authenticated app.
 
-It ships **63 tools** spanning everyday browsing, DevTools-grade network capture, a full web-security testing toolkit, **playbooks** (saved, self-healing recipes), and **session recording** - record an interaction into a self-contained, offline-faithful HTML replay (full-page, custom-designed player, with a smooth mouse-trail / click / keystroke overlay) and **export it to a high-resolution MP4**.
+It ships **64 tools** spanning everyday browsing, DevTools-grade network capture, a full web-security testing toolkit, **playbooks** (saved, self-healing recipes), and **session recording** - record an interaction into a self-contained, offline-faithful HTML replay (full-page, custom-designed player, with a smooth mouse-trail / click / keystroke overlay) and **export it to a high-resolution MP4**.
 
 <p align="center">
   <img src="docs/replay.gif" alt="Session replay: a recorded interaction played back in the self-contained FRACTURE player - a smooth green mouse trail follows the cursor, click ripples fire, and a keystroke HUD shows what was typed, with a play/scrub timeline and speed controls" width="820">
@@ -123,6 +123,7 @@ Both Claude Code and Codex drive the same live browser through the same endpoint
 
 ## Features & tools
 
+- **Batch multi-step work** - `browser_batch` runs a predictable sequence (`navigate → click → fill → press_key → screenshot`) in **one round trip instead of five**. The per-call round trip, not the browser, is what makes multi-step tasks slow, so this is the single largest speedup available.
 - **Browse & interact** - tabs, navigation, and click / fill / hover / type / scroll with **auto-wait actionability** (found + visible + enabled, auto-escalating to a trusted CDP click when a target is overlay-covered), plus file and image upload - all reaching **into iframes (incl. cross-origin) and open shadow DOM** - and **coordinate-level trusted input** (`input`) for `<canvas>` remote desktops (VNC/RDP/Amazon DCV), games, and drawing apps.
 - **Read & inspect** - rendered page text, interactive-element snapshots with stable refs, screenshots (viewport → full-page retina, element clip, save-to-disk), and JavaScript evaluation that **bypasses strict CSP** via CDP.
 - **DevTools-grade capture** - full request/response **bodies**, response headers, `Set-Cookie`, timings, and **WebSocket/SSE frames** - with durable on-disk persistence and **HAR / MHTML** evidence export.
@@ -138,6 +139,7 @@ Both Claude Code and Codex drive the same live browser through the same endpoint
 | `navigate` · `go_back` · `go_forward` · `wait_for` | Navigation |
 | `click` · `fill` · `hover` · `type` · `press_key` · `scroll` | Interaction (iframe + open-shadow aware). **Auto-waits** for the element to be actionable (found + visible + enabled, `timeoutMs`) and returns structured `{notActionable, reason}` on failure. `click` detects overlay-covered targets and **auto-escalates to a trusted CDP click** (`via:"trusted"`); `fill`/`type` register in React inputs (native setter) and rich editors (execCommand). `trusted:true` for real CDP input; `withSnapshot:true` to get a fresh `snapshot` back inline |
 | `input` | **Coordinate-level trusted input** via CDP for targets element selectors can't reach - a `<canvas>` remote desktop (VNC/RDP/**Amazon DCV**), a game, a WebGL app. Actions: `mouse_move`, `left/right/middle_click`, `double_click`, `left_mouse_down/up`, `left_click_drag`, `scroll`, `type` (to the focused element), `key` (combos like `ctrl+c`). Coords are **CSS viewport pixels** (`= screenshotPixel / dpr`, and `screenshot` now returns `dpr`). `activate:true` to foreground the tab so you can observe |
+| `browser_batch` | Run a **sequence of tools in one call** - `navigate → click → fill → press_key → screenshot` as a single round trip instead of five. The per-call round trip, not the browser, is what makes multi-step tasks slow, so batching whenever you can predict two or more steps ahead is the single biggest speedup available. Runs sequentially and **stops at the first error**, reporting what completed plus the failing index and message. Cannot be nested; capped at 50 actions. Allowlisted to tools that add no approval surface when batched: **navigation + interaction** (`navigate`, `go_back`, `go_forward`, `tabs_list`, `tab_new`, `tab_activate`, `click`, `fill`, `hover`, `type`, `press_key`, `scroll`, `wait_for`), **page reads** (`snapshot`, `get_page_text`, `screenshot`, `eval_js`), **pure functions** (`jwt_decode`, `response_diff`) and **inert status/buffer reads** (`bridge_status`, `debugger_status`, `identity_list`, `session_record_status`, `net_get_*`, `console_get`, `intercept_pending` - each gated behind a start tool that is itself not batchable). Everything that mutates state, reads credentials, issues outbound requests or touches disk stays a direct call so it keeps its own per-call approval - including `cookies_get`, `storage_dump`, `input`, `cdp_eval`, `tab_close` and `request_to_curl` |
 | `file_upload` | Set a file input via base64 or a local `path` (`DOM.setFileInputFiles`) |
 | `paste_image` | Paste a local image into a rich-text / contenteditable field; `trusted:true` uses the real OS clipboard + a genuine Cmd/Ctrl+V for strict editors (e.g. YesWeHack) that ignore synthetic events |
 </details>
@@ -343,12 +345,14 @@ bearer_token_env_var = "BROWSER_BRIDGE_TOKEN"
 - The capture buffer is in-memory (a ring of `maxEntries` requests/tab, default 500, ~512 KB/body). An active capture is not torn down by the idle sweep; for a durable record beyond the ring cap use `net_capture_start(persist:true, savePath:…)`, which streams to disk. Persistence is **durability, not continuity** - if the service worker dies the debugger detaches and capture stops until restarted; the file holds what was captured before that.
 - One extension connection at a time (last connect wins); multiple MCP clients can share it concurrently. A call in flight when the extension disconnects fails fast instead of waiting out the timeout.
 - `input` coordinates are **CSS viewport pixels**, but screenshots are **device pixels** - map with the `dpr` the screenshot returns (`coord = screenshotPixel / dpr`). `input` is delivered even to a backgrounded tab, but a hidden tab's frame is throttled, so you can't *observe* the result until it's foregrounded (`activate:true` / `tab_activate`); `screenshot` flags this via `visibilityState`.
+- The default `screenshot` uses `chrome.tabs.captureVisibleTab`, which Chrome rate-limits to roughly **2 captures/second**. Back-to-back screenshots are therefore spaced automatically (~550 ms apart) rather than failing on the quota; an isolated screenshot - the normal case - waits nothing. The `fullPage`/`scale`/`selector` path uses CDP `Page.captureScreenshot` and is not subject to this limit.
 - `download_resource` always uses the browser's live session - it can't download as a captured `identity`. `Cookie`/`Host`/`Origin`/`Referer`/`Content-Length` in its `headers` param are browser-forbidden and silently ignored. If Chrome's "Ask where to save each file" setting is enabled, downloads may prompt for a location instead of completing automatically.
 
 ## Roadmap
 
 **Shipped** (newest first):
 
+- **v0.15 · Batching & latency** - **`browser_batch`** collapses a predictable tool sequence into **one round trip** (allowlisted to tools that add no approval surface when batched). Plus a latency pass: screenshots no longer pay a flat 350 ms when the tab is already foregrounded (**407 ms → 100 ms** median, with explicit throttling so bursts can't trip Chrome's capture quota), `snapshot` walks the DOM once instead of twice and caps the walk itself, and `analyze deep` / `session_record_stop` batch what were serial per-item round trips. Three latent fixes: `timeoutMs` now reaches the hub timer, the capture sink no longer blocks the event loop on `fsync`, and concurrent debugger attaches on a cold tab share one attach.
 - **v0.14 · MP4 export** - `render_recording_video` renders a saved replay to a high-resolution, frame-exact **H.264 MP4** (deterministic seek + lossless-PNG frames → ffmpeg); the mouse-trail / click / keystroke motion matches the live playback. `chrome:true` includes the player UI.
 - **v0.13 · Designed replay player** - a custom **FRACTURE**-styled player with **full-page fit-to-viewport** rendering and a toggleable **interaction overlay**: smooth mouse trail, click ripples, and a keystroke HUD (typed text + physical keys).
 - **v0.12 · Correctness & reliability** - an audit-driven pass (56-agent review): a silent capture-loss guard on socket replacement, MV3 memory-leak caps, cross-session recording, and robust `allFrames` injection.
@@ -374,7 +378,7 @@ server/                 MCP server (TypeScript · @modelcontextprotocol/sdk · w
   src/index.ts            HTTP MCP endpoint + auth + session management
   src/hub.ts              single extension socket, request/response correlation, capture sinks
   src/capture-sink.ts     durable on-disk JSON-Lines sink for persist captures
-  src/tools.ts            the 63 MCP tools
+  src/tools.ts            the 64 MCP tools
 extension/              Manifest V3 extension (bundled with esbuild via build.mjs)
   manifest.json
   src/background.ts       service worker: WS client, injection, chrome.debugger (CDP) layer
