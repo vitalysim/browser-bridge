@@ -221,21 +221,6 @@ function bbPageText(includeHidden: boolean) {
 function bbSnapshot(refOffset: number) {
   const SEL =
     'a[href], button, input, select, textarea, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [contenteditable="true"]';
-  const all: Element[] = [];
-  const walk = (root: Document | ShadowRoot) => {
-    let els: NodeListOf<Element>;
-    try {
-      els = root.querySelectorAll("*");
-    } catch {
-      return;
-    }
-    for (const el of Array.from(els)) {
-      all.push(el);
-      const sr = (el as HTMLElement).shadowRoot;
-      if (sr) walk(sr);
-    }
-  };
-  walk(document);
   const items: any[] = [];
   // Fresh ref registry each snapshot: ref (number) -> Element, kept on the frame's ISOLATED-world
   // global so a later click/fill/hover/type injection (same world) resolves the ref WITHOUT mutating
@@ -244,16 +229,34 @@ function bbSnapshot(refOffset: number) {
   // different `window` and would miss this registry.
   const bbRefs: Map<number, Element> = ((window as any).__bbRefs = new Map());
   let n = 0;
-  for (const el of all) {
-    const h = el as HTMLElement;
-    let ok = false;
+  // Single fused pass: match-and-emit during the walk instead of materializing EVERY element in the
+  // document into an array and re-looping it. Emission order is identical - the old walk pushed a
+  // host then immediately recursed into its shadow root, which is exactly this traversal order - and
+  // the 400 cap now stops the walk itself rather than only the second loop, so a huge page no longer
+  // traverses tens of thousands of nodes it will never emit. Same elements, same refs, less work.
+  const walk = (root: Document | ShadowRoot) => {
+    if (n >= 400) return;
+    let els: NodeListOf<Element>;
     try {
-      ok = h.matches(SEL);
+      els = root.querySelectorAll("*");
     } catch {
-      ok = false;
+      return;
     }
-    if (!ok) continue;
-    if ((h as any).checkVisibility && !(h as any).checkVisibility()) continue;
+    for (const el of Array.from(els)) {
+      if (n >= 400) return;
+      const h = el as HTMLElement;
+      let ok = false;
+      try {
+        ok = h.matches(SEL);
+      } catch {
+        ok = false;
+      }
+      if (ok && (!(h as any).checkVisibility || (h as any).checkVisibility())) emit(h);
+      const sr = h.shadowRoot;
+      if (sr) walk(sr);
+    }
+  };
+  const emit = (h: HTMLElement) => {
     n++;
     const ref = refOffset + n;
     bbRefs.set(ref, h);
@@ -277,8 +280,8 @@ function bbSnapshot(refOffset: number) {
     const r = h.getBoundingClientRect();
     entry.inViewport = r.bottom > 0 && r.right > 0 && r.top < (window.innerHeight || 0) && r.left < (window.innerWidth || 0);
     items.push(entry);
-    if (n >= 400) break;
-  }
+  };
+  walk(document);
   return { url: location.href, count: items.length, elements: items };
 }
 
@@ -705,14 +708,16 @@ async function navByHistory(tab: chrome.tabs.Tab, direction: "back" | "forward")
   }, [direction]);
   const deadline = Date.now() + 6_000;
   let navigated = false;
+  // Check BEFORE sleeping: a bfcache restore is effectively instant, and sleeping first charged it a
+  // flat 150ms it never needed.
   while (Date.now() < deadline) {
-    await sleep(150);
     const t = await chrome.tabs.get(tab.id!);
     if (t.url && t.url !== before) {
       navigated = true;
       await sleep(300); // brief settle
       break;
     }
+    await sleep(150);
   }
   const fresh = await chrome.tabs.get(tab.id!);
   return { tabId: fresh.id, title: fresh.title, url: fresh.url, navigated };
@@ -1743,11 +1748,16 @@ async function viewportMeta(tab: chrome.tabs.Tab): Promise<any> {
 // keep output dimensions predictable (= CSS size × scale) and default file sizes reasonable.
 async function cdpScreenshot(tab: chrome.tabs.Tab, params: any): Promise<any> {
   const tabId = tab.id!;
-  // Surface capture requires the tab to be visible/active, else it returns empty.
-  await chrome.tabs.update(tabId, { active: true });
-  await chrome.windows.update(tab.windowId!, { focused: true }).catch(() => {});
+  // Surface capture requires the tab to be visible/active, else it returns empty. Skip the switch
+  // (and its settle) when it's already foregrounded - the common case in an agent loop.
+  const win = await chrome.windows.get(tab.windowId!).catch(() => null);
+  const needsForeground = !tab.active || !win?.focused;
+  if (needsForeground) {
+    await chrome.tabs.update(tabId, { active: true });
+    await chrome.windows.update(tab.windowId!, { focused: true }).catch(() => {});
+  }
   await ensureAttached(tabId);
-  await sleep(250);
+  if (needsForeground) await sleep(250); // let the newly-foregrounded tab paint before capture
 
   const format = params.format === "jpeg" ? "jpeg" : "png";
   const scale = typeof params.scale === "number" && params.scale > 0 ? params.scale : 1;
@@ -2582,10 +2592,15 @@ async function dispatch(method: string, params: any): Promise<any> {
       const tab = await targetTab(params.tabId);
       const rich = params.fullPage || params.selector || params.scale || (params.format && params.format !== "png");
       if (rich) return cdpScreenshot(tab, params);
-      // default: banner-free visible-viewport PNG
-      await chrome.tabs.update(tab.id!, { active: true });
-      await chrome.windows.update(tab.windowId!, { focused: true });
-      await sleep(350);
+      // default: banner-free visible-viewport PNG. captureVisibleTab needs the tab foregrounded, but
+      // in an agent loop it almost always already is - and the settle only buys anything when we
+      // actually switched. Checking first turns a flat 350ms per screenshot into ~0 for the common case.
+      const win = await chrome.windows.get(tab.windowId!);
+      if (!tab.active || !win.focused) {
+        await chrome.tabs.update(tab.id!, { active: true });
+        await chrome.windows.update(tab.windowId!, { focused: true });
+        await sleep(350); // let the newly-foregrounded tab paint before capture
+      }
       const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId!, { format: "png" });
       const meta = await viewportMeta(tab);
       return { base64: dataUrl.replace(/^data:image\/png;base64,/, ""), format: "png", ...meta };
@@ -2646,7 +2661,8 @@ async function dispatch(method: string, params: any): Promise<any> {
       while (Date.now() < deadline) {
         const found = await inject(tab, (sel: string) => !!document.querySelector(sel), [params.selector]);
         if (found) return { found: true, selector: params.selector };
-        await sleep(250);
+        await sleep(100); // 250ms meant ~125ms of average overshoot past the element appearing
+
       }
       throw new Error(`Timed out after ${timeoutMs}ms waiting for selector: ${params.selector}`);
     }
