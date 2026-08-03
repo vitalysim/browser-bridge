@@ -13,6 +13,34 @@ import { inlineAssets } from "./rrweb-inline.js";
 const MAX_TEXT_CHARS = 60_000;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+const MAX_BATCH_ACTIONS = 50;
+
+// Tools browser_batch may run. An ALLOWLIST, not a denylist, and deliberately narrow: the MCP client
+// prompts for permission per tool call, so a batch approved once would otherwise run N tools
+// unprompted. Navigation/interaction/read tools are where every bit of the round-trip win lives, and
+// they're the ones already safe to approve in bulk. Everything else - cookies_*, storage_*,
+// identity_*, intercept_*, fuzz, authz_matrix, replay_request, download_resource, file_upload,
+// playbook_save, session_record_* - stays a direct call so it keeps its own approval gate.
+const BATCHABLE_TOOLS = new Set([
+  "navigate",
+  "go_back",
+  "go_forward",
+  "tabs_list",
+  "tab_new",
+  "tab_activate",
+  "click",
+  "fill",
+  "hover",
+  "type",
+  "press_key",
+  "scroll",
+  "wait_for",
+  "snapshot",
+  "get_page_text",
+  "screenshot",
+  "eval_js",
+]);
+
 // Expand a leading ~/ to the home dir (Node fs doesn't do it). For playbook/record paths.
 const expandHome = (p: string) => (p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
 
@@ -73,12 +101,18 @@ const timeoutMsParam = z
 const actionHubTimeout = (t?: number) => Math.max(CALL_TIMEOUT_MS, (t ?? 5_000) + 5_000);
 
 export function registerTools(server: McpServer, hub: ExtensionHub, version = "0.0.0") {
+  // Every registered tool, so browser_batch can invoke the SAME handler the MCP layer would - no
+  // duplicated dispatch logic to drift. The schema is kept because calling a handler directly
+  // bypasses the SDK's own zod validation, so batch must re-validate each item itself.
+  const registry = new Map<string, { schema: z.ZodRawShape; handler: (args: any) => Promise<any> }>();
+
   const tool = (
     name: string,
     description: string,
     inputSchema: z.ZodRawShape,
     handler: (args: any) => Promise<any>
   ) => {
+    registry.set(name, { schema: inputSchema, handler });
     server.registerTool(name, { description, inputSchema }, async (args: any) => {
       try {
         return await handler(args);
@@ -1265,6 +1299,71 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     "Check whether the Chrome extension is currently connected to the bridge.",
     {},
     async () => textResult({ extensionConnected: hub.connected, recording: hub.recording })
+  );
+
+  // ---- batch (registered LAST: it reads `registry`, which every tool() call above populates) ----
+  tool(
+    "browser_batch",
+    "Run a SEQUENCE of browser tools in ONE call. Each item is {name, input} where input is exactly " +
+      "what you'd pass to that tool standalone. Use this whenever you can predict two or more steps " +
+      "ahead - e.g. navigate → click → fill → press_key → screenshot - because the round trip per " +
+      "tool call, not the browser, is what makes multi-step tasks slow. Actions run SEQUENTIALLY and " +
+      "STOP at the first error; the result reports what completed plus the failing index and message, " +
+      "so a partial run is always legible. Only navigation/interaction/read tools may be batched " +
+      `(${[...BATCHABLE_TOOLS].join(", ")}); anything else must be called directly so it keeps its own ` +
+      "per-call approval. Cannot be nested.",
+    {
+      actions: z
+        .array(
+          z.object({
+            name: z.string().describe("Tool name, e.g. 'click'"),
+            input: z.record(z.any()).optional().describe("That tool's input - the same shape you'd pass calling it directly"),
+          })
+        )
+        .min(1)
+        .max(MAX_BATCH_ACTIONS)
+        .describe(`Tools to run in order (max ${MAX_BATCH_ACTIONS}). Executed sequentially; stops at the first error.`),
+    },
+    async ({ actions }) => {
+      const results: any[] = [];
+      for (let i = 0; i < actions.length; i++) {
+        const { name, input } = actions[i];
+        const fail = (error: string) =>
+          textResult({ executed: results.length, total: actions.length, results, stoppedAt: i, failedTool: name, error });
+
+        if (name === "browser_batch") return fail("browser_batch cannot be nested.");
+        const entry = registry.get(name);
+        if (!entry) return fail(`Unknown tool '${name}'.`);
+        if (!BATCHABLE_TOOLS.has(name)) {
+          return fail(`'${name}' is not batchable - call it directly so it keeps its own per-call approval.`);
+        }
+
+        // The SDK validates args before a normal tool call; invoking the handler directly skips that,
+        // so re-validate here rather than letting a malformed input reach the browser.
+        let args: any;
+        try {
+          args = z.object(entry.schema).parse(input ?? {});
+        } catch (err) {
+          return fail(`Invalid input for '${name}': ${err instanceof Error ? err.message : String(err)}`);
+        }
+
+        let out: any;
+        try {
+          out = await entry.handler(args);
+        } catch (err) {
+          return fail(err instanceof Error ? err.message : String(err));
+        }
+        // Handlers return the MCP content envelope; unwrap to keep the batch result readable. A
+        // handler that returned isError (rather than throwing) still halts the run.
+        const text = out?.content?.[0]?.text ?? "";
+        if (out?.isError) {
+          results.push({ index: i, tool: name, error: text });
+          return fail(text || `'${name}' failed.`);
+        }
+        results.push({ index: i, tool: name, result: text });
+      }
+      return textResult({ executed: results.length, total: actions.length, results });
+    }
   );
 }
 
