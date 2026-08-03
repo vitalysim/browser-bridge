@@ -2607,15 +2607,23 @@ async function dispatch(method: string, params: any): Promise<any> {
       const tab = await targetTab(params.tabId);
       const rich = params.fullPage || params.selector || params.scale || (params.format && params.format !== "png");
       if (rich) return cdpScreenshot(tab, params);
-      // default: banner-free visible-viewport PNG. captureVisibleTab needs the tab foregrounded, but
-      // in an agent loop it almost always already is - and the settle only buys anything when we
-      // actually switched. Checking first turns a flat 350ms per screenshot into ~0 for the common case.
+      // default: banner-free visible-viewport PNG. captureVisibleTab grabs the ACTIVE tab of the given
+      // window, so what it actually requires is that our tab is active in its own window - not that
+      // Chrome owns OS focus. The two are treated separately on purpose: switching the active tab
+      // needs a real repaint before capture, whereas raising an already-visible window does not, and
+      // gating the settle on window focus meant a multi-window setup (or Chrome simply not being the
+      // frontmost app) paid the full 350ms on every single screenshot.
       const win = await chrome.windows.get(tab.windowId!);
-      if (!tab.active || !win.focused) {
+      if (!tab.active) {
         await chrome.tabs.update(tab.id!, { active: true });
-        await chrome.windows.update(tab.windowId!, { focused: true });
-        await sleep(350); // let the newly-foregrounded tab paint before capture
+        await sleep(350); // tab switch - let the newly-shown tab paint
       }
+      if (!win.focused) {
+        await chrome.windows.update(tab.windowId!, { focused: true }).catch(() => {});
+        await sleep(60); // window raise - compositor only, no layout
+      }
+      // The returned meta already reports visibilityState/hidden, so a caller capturing an occluded
+      // or minimized window is still warned that the frame may be throttled or stale.
       await throttleCapture(tab.windowId!);
       let dataUrl: string;
       try {
