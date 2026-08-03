@@ -15,6 +15,9 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const MAX_BATCH_ACTIONS = 50;
 
+// Parallel same-origin script fetches for `analyze deep:true`. Bounded on purpose - see the call site.
+const DEEP_SCRIPT_CONCURRENCY = 6;
+
 // Tools browser_batch may run. An ALLOWLIST, not a denylist, and deliberately narrow: the MCP client
 // prompts for permission per tool call, so a batch approved once would otherwise run N tools
 // unprompted. Navigation/interaction/read tools are where every bit of the round-trip win lives, and
@@ -986,16 +989,29 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       let scannedScripts = 0;
       if (deep && typeof resp.body === "string") {
         const scripts = extractSameOriginScripts(resp.body, target).slice(0, 15);
-        for (const src of scripts) {
-          try {
-            const jr = await hub.call("replay_request", { url: src, method: "GET", tabId }, 30_000);
-            if (typeof jr?.body === "string") {
-              scannedScripts++;
-              for (const f of scanSecrets(jr.body)) findings.push({ ...f, detail: `${f.detail} - external script`, evidence: `${f.evidence ?? ""} @ ${src}` });
+        // Fetched with bounded concurrency rather than one-at-a-time. Bounded (not all 15 at once)
+        // because analyze points at a single origin: a burst can trip a WAF or rate limiter and
+        // change the findings. Drop DEEP_SCRIPT_CONCURRENCY to 1 to restore fully serial fetching.
+        const bodies = new Array<string | null>(scripts.length).fill(null);
+        let next = 0;
+        await Promise.all(
+          Array.from({ length: Math.min(DEEP_SCRIPT_CONCURRENCY, scripts.length) }, async () => {
+            for (let i = next++; i < scripts.length; i = next++) {
+              try {
+                const jr = await hub.call("replay_request", { url: scripts[i], method: "GET", tabId }, 30_000);
+                if (typeof jr?.body === "string") bodies[i] = jr.body;
+              } catch {
+                /* unreachable/blocked script - skip */
+              }
             }
-          } catch {
-            /* unreachable/blocked script - skip */
-          }
+          })
+        );
+        // Folded in original script order, so findings stay deterministic regardless of fetch order.
+        for (let i = 0; i < scripts.length; i++) {
+          const body = bodies[i];
+          if (body === null) continue;
+          scannedScripts++;
+          for (const f of scanSecrets(body)) findings.push({ ...f, detail: `${f.detail} - external script`, evidence: `${f.evidence ?? ""} @ ${scripts[i]}` });
         }
       }
       findings.sort((a, b) => sevRank(b.severity) - sevRank(a.severity));
