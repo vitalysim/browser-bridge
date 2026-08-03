@@ -697,6 +697,21 @@ function waitForComplete(tabId: number, timeoutMs = 20_000): Promise<void> {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// chrome.tabs.captureVisibleTab is quota-limited (MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND, ~2/s).
+// The old unconditional 350ms pre-capture sleep spaced calls out incidentally; now that capturing an
+// already-foregrounded tab is near-instant, a burst would trip the quota and hard-fail. Space them
+// explicitly instead, measured from the LAST capture - so an isolated screenshot (the common case)
+// still waits nothing, and only a genuine burst pays. CDP screenshots use Page.captureScreenshot,
+// which is not subject to this quota, so cdpScreenshot deliberately doesn't throttle.
+const MIN_CAPTURE_INTERVAL_MS = 550;
+const lastCaptureAt = new Map<number, number>(); // windowId -> last captureVisibleTab timestamp
+
+async function throttleCapture(windowId: number): Promise<void> {
+  const wait = MIN_CAPTURE_INTERVAL_MS - (Date.now() - (lastCaptureAt.get(windowId) ?? 0));
+  if (wait > 0) await sleep(wait);
+  lastCaptureAt.set(windowId, Date.now());
+}
+
 // Back/forward via the page's own history - chrome.tabs.goBack/goForward fail spuriously
 // ("Cannot find a next page in history") even when history exists. Polls for the URL change
 // so bfcache (instant) restores don't wait on a load-complete event that never fires.
@@ -2601,7 +2616,18 @@ async function dispatch(method: string, params: any): Promise<any> {
         await chrome.windows.update(tab.windowId!, { focused: true });
         await sleep(350); // let the newly-foregrounded tab paint before capture
       }
-      const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId!, { format: "png" });
+      await throttleCapture(tab.windowId!);
+      let dataUrl: string;
+      try {
+        dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId!, { format: "png" });
+      } catch (e) {
+        // Belt-and-braces: the throttle's timestamps live in service-worker memory, so an SW respawn
+        // between captures can still land inside the quota window. One spaced retry covers it.
+        if (!/quota/i.test(e instanceof Error ? e.message : String(e))) throw e;
+        await sleep(MIN_CAPTURE_INTERVAL_MS);
+        lastCaptureAt.set(tab.windowId!, Date.now());
+        dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId!, { format: "png" });
+      }
       const meta = await viewportMeta(tab);
       return { base64: dataUrl.replace(/^data:image\/png;base64,/, ""), format: "png", ...meta };
     }

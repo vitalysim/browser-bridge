@@ -20,11 +20,22 @@ const DEEP_SCRIPT_CONCURRENCY = 6;
 
 // Tools browser_batch may run. An ALLOWLIST, not a denylist, and deliberately narrow: the MCP client
 // prompts for permission per tool call, so a batch approved once would otherwise run N tools
-// unprompted. Navigation/interaction/read tools are where every bit of the round-trip win lives, and
-// they're the ones already safe to approve in bulk. Everything else - cookies_*, storage_*,
-// identity_*, intercept_*, fuzz, authz_matrix, replay_request, download_resource, file_upload,
-// playbook_save, session_record_* - stays a direct call so it keeps its own approval gate.
+// unprompted. The bar for membership is that batching the tool adds no approval surface - it either
+// changes nothing outside the page the caller is already driving, or it changes nothing at all.
+//
+// Deliberately NOT batchable, and each for a reason:
+//   cookies_get / storage_dump      - read HttpOnly cookies and origin storage (data exposure)
+//   cookies_set/delete, storage_*   - mutate credentials and origin state
+//   identity_capture / purge        - snapshot or destroy credential sets
+//   intercept_start/stop/resolve    - can rewrite live traffic
+//   request_to_curl                 - reproduces the real sent Cookie header (see note below)
+//   fuzz, authz_matrix, replay_request, analyze - issue outbound requests to a target
+//   download_resource, file_upload, paste_image, save_page, export_har - cross the disk boundary
+//   playbook_* , session_record_*, render_recording_video - persist artifacts
+//   input, cdp_eval, tab_close, console_start/stop, net_capture_start, debugger_detach
+//                                   - attach/detach the debugger or close tabs (visible side effects)
 const BATCHABLE_TOOLS = new Set([
+  // navigation + interaction: the sequences batching exists to collapse
   "navigate",
   "go_back",
   "go_forward",
@@ -38,10 +49,31 @@ const BATCHABLE_TOOLS = new Set([
   "press_key",
   "scroll",
   "wait_for",
+  // page reads
   "snapshot",
   "get_page_text",
   "screenshot",
   "eval_js",
+  // pure computation - no I/O at all
+  "jwt_decode",
+  "response_diff",
+  // status reads - server-local or a trivial extension query; no page state touched
+  "bridge_status",
+  "debugger_status",
+  "identity_list",
+  "session_record_status",
+  // capture-buffer reads. These CAN surface auth headers and cookies, but only for traffic the user
+  // already opted into capturing: each is downstream of a start tool (net_capture_start,
+  // console_start, intercept_start) that is deliberately NOT batchable. So the credential-bearing
+  // read stays gated behind an explicit, separately-approved capture - unlike cookies_get, which
+  // works cold and is therefore excluded. (request_to_curl is excluded for the same reason: with a
+  // requestId it reproduces the real sent Cookie header, and its ad-hoc path is a pure echo that
+  // gains nothing from batching.)
+  "net_get_requests",
+  "net_get_body",
+  "net_get_ws_frames",
+  "console_get",
+  "intercept_pending",
 ]);
 
 // Expand a leading ~/ to the home dir (Node fs doesn't do it). For playbook/record paths.
