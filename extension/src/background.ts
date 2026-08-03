@@ -854,41 +854,59 @@ function attach(tabId: number): Promise<void> {
   });
 }
 
+// In-flight attaches, keyed by tab. Without this, two concurrent debugger-backed calls on a COLD tab
+// both see no session and both call chrome.debugger.attach - the loser hits the "already attached"
+// rejection path and fails a call that should have succeeded. Sharing the promise makes the second
+// caller await the first attach instead of racing it.
+const attaching = new Map<number, Promise<Session>>();
+
 async function ensureAttached(tabId: number): Promise<Session> {
-  let s = sessions.get(tabId);
-  if (!s) {
-    await attach(tabId);
-    // If an enable fails AFTER a successful attach, detach so we don't strand an orphaned debugger
-    // (stuck "being debugged" banner + a leaked attach that nothing will ever clean up).
-    try {
-      await Promise.all([cmd(tabId, "DOM.enable"), cmd(tabId, "Page.enable")]);
-    } catch (e) {
-      await detachSession(tabId).catch(() => {});
-      throw e;
-    }
-    s = {
-      attachedAt: Date.now(),
-      lastUsedAt: Date.now(),
-      net: [],
-      netOn: false,
-      netMax: NET_MAX_ENTRIES,
-      persist: false,
-      persistBodies: false,
-      flushQueue: [],
-      flushTimer: null,
-      extra: new Map(),
-      wsUrls: new Map(),
-      wsFrames: [],
-      refNodes: new Map(),
-      deepGen: 0,
-      interceptOn: false,
-      interceptRules: [],
-      paused: new Map(),
-      logOn: false,
-      logs: [],
-    };
-    sessions.set(tabId, s);
+  const existing = sessions.get(tabId);
+  if (existing) {
+    existing.lastUsedAt = Date.now();
+    return existing;
   }
+  let p = attaching.get(tabId);
+  if (!p) {
+    p = (async () => {
+      await attach(tabId);
+      // If an enable fails AFTER a successful attach, detach so we don't strand an orphaned debugger
+      // (stuck "being debugged" banner + a leaked attach that nothing will ever clean up).
+      try {
+        await Promise.all([cmd(tabId, "DOM.enable"), cmd(tabId, "Page.enable")]);
+      } catch (e) {
+        await detachSession(tabId).catch(() => {});
+        throw e;
+      }
+      const s: Session = {
+        attachedAt: Date.now(),
+        lastUsedAt: Date.now(),
+        net: [],
+        netOn: false,
+        netMax: NET_MAX_ENTRIES,
+        persist: false,
+        persistBodies: false,
+        flushQueue: [],
+        flushTimer: null,
+        extra: new Map(),
+        wsUrls: new Map(),
+        wsFrames: [],
+        refNodes: new Map(),
+        deepGen: 0,
+        interceptOn: false,
+        interceptRules: [],
+        paused: new Map(),
+        logOn: false,
+        logs: [],
+      };
+      sessions.set(tabId, s);
+      return s;
+    })();
+    attaching.set(tabId, p);
+    // Clear on settle either way: a failed attach must not be cached, or the tab could never retry.
+    void p.catch(() => {}).then(() => attaching.delete(tabId));
+  }
+  const s = await p;
   s.lastUsedAt = Date.now();
   return s;
 }

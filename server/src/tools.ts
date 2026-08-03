@@ -6,7 +6,7 @@ import { homedir, tmpdir } from "os";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
-import type { ExtensionHub } from "./hub.js";
+import { CALL_TIMEOUT_MS, type ExtensionHub } from "./hub.js";
 import { CaptureSink } from "./capture-sink.js";
 import { inlineAssets } from "./rrweb-inline.js";
 
@@ -65,6 +65,12 @@ const timeoutMsParam = z
   .number()
   .optional()
   .describe("Max ms to auto-wait for the element to become actionable (found + visible + enabled). Default 5000. On failure the result is {notActionable, reason: 'not-found-after…'|'hidden'|'disabled'|'covered'}.");
+
+// The extension's own actionability budget (background.ts `interact`, default 5000) is independent of
+// the hub's per-call timer. Without this the hub would fire at CALL_TIMEOUT_MS while the extension is
+// still retrying - the caller gets a timeout error but the browser still acts. Mirrors wait_for's
+// `+5_000` slack. Math.max so the budget can only ever GROW: the default stays exactly CALL_TIMEOUT_MS.
+const actionHubTimeout = (t?: number) => Math.max(CALL_TIMEOUT_MS, (t ?? 5_000) + 5_000);
 
 export function registerTools(server: McpServer, hub: ExtensionHub, version = "0.0.0") {
   const tool = (
@@ -170,7 +176,9 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     },
     async ({ ref, selector, trusted, autoTrusted, noEscalate, timeoutMs, withSnapshot, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
-      return textResult(await hub.call("click", { ref, selector, trusted, autoTrusted, noEscalate, timeoutMs, withSnapshot, tabId }));
+      return textResult(
+        await hub.call("click", { ref, selector, trusted, autoTrusted, noEscalate, timeoutMs, withSnapshot, tabId }, actionHubTimeout(timeoutMs))
+      );
     }
   );
 
@@ -190,7 +198,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     },
     async ({ value, ref, selector, timeoutMs, withSnapshot, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
-      return textResult(await hub.call("fill", { value, ref, selector, timeoutMs, withSnapshot, tabId }));
+      return textResult(await hub.call("fill", { value, ref, selector, timeoutMs, withSnapshot, tabId }, actionHubTimeout(timeoutMs)));
     }
   );
 
@@ -209,7 +217,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     },
     async ({ ref, selector, trusted, timeoutMs, withSnapshot, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
-      return textResult(await hub.call("hover", { ref, selector, trusted, timeoutMs, withSnapshot, tabId }));
+      return textResult(await hub.call("hover", { ref, selector, trusted, timeoutMs, withSnapshot, tabId }, actionHubTimeout(timeoutMs)));
     }
   );
 
@@ -230,7 +238,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     },
     async ({ text, ref, selector, trusted, timeoutMs, withSnapshot, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
-      return textResult(await hub.call("type", { text, ref, selector, trusted, timeoutMs, withSnapshot, tabId }));
+      return textResult(await hub.call("type", { text, ref, selector, trusted, timeoutMs, withSnapshot, tabId }, actionHubTimeout(timeoutMs)));
     }
   );
 
