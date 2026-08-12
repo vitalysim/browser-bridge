@@ -359,10 +359,11 @@
   w.__bbWatch = {
     v: V,
     status: () => ({ v: V, armed, dormant, buffered: buf.length, dropped, url: nav() }),
-    arm: (on: boolean) => {
+    arm: (on: boolean, mode?: string) => {
       if (on) {
         armed = true;
         dormant = false;
+        void mode; // the MAIN-world shim receives the mode directly as an injection argument
         // The initial navigation is the timeline's first entry, so the agent knows where we started.
         push({ t: now(), k: "nav", url: nav(), via: "load", title: document.title });
         flush();
@@ -376,7 +377,7 @@
   try {
     chrome.runtime.sendMessage({ cmd: "bb-watch-hello", v: V, url: nav() }, (res?: any) => {
       void chrome.runtime.lastError;
-      if (res && res.armed) w.__bbWatch.arm(true);
+      if (res && res.armed) w.__bbWatch.arm(true, res.consoleMode);
       else disarm();
     });
   } catch {

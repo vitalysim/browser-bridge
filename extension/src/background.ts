@@ -3,7 +3,9 @@
 // Injected at build time by build.mjs (esbuild define) from extension/package.json - single
 // source of truth shared with manifest.json, so the version can't drift.
 declare const __BB_VERSION__: string;
+declare const __BB_BUILD__: string;
 const VERSION = __BB_VERSION__;
+const BUILD_AT = __BB_BUILD__;
 const PING_INTERVAL_MS = 20_000; // WS traffic resets the MV3 service-worker idle timer (Chrome 116+)
 const RECONNECT_MAX_MS = 30_000;
 
@@ -38,6 +40,7 @@ async function connect() {
       JSON.stringify({
         type: "hello",
         version: VERSION,
+        build: BUILD_AT,
         watch: {
           groups: serializeWatch().map((g) => ({
             watchId: g.watchId,
@@ -175,7 +178,9 @@ interface WatchTab {
 interface WatchGroup {
   watchId: string;
   rootTabId: number;
-  console: boolean;
+  /** Only "calls" registers the MAIN-world console wrapper. Passive error capture needs nothing:
+   *  it lives in the isolated content script and touches no page global. */
+  consoleMode: "off" | "passive" | "calls";
   startedAt: number;
   tabs: Map<number, WatchTab>;
 }
@@ -185,6 +190,8 @@ const tabToWatch = new Map<number, string>();
 /** Why the debugger last detached from a tab, so a capture that died is legible instead of silent.
  *  "canceled_by_user" means the human dismissed the banner - never auto-reattach over that. */
 const lastDetach = new Map<number, { reason: string; at: number }>();
+/** Result of the last watch-script injection per tab, surfaced through watch_start / watch_status. */
+const lastInject = new Map<number, { isolated: string; main: string; at: number }>();
 let swStartedAt = Date.now();
 let lastAliveAt = 0;
 
@@ -197,7 +204,7 @@ function serializeWatch() {
   return [...watchGroups.values()].map((g) => ({
     watchId: g.watchId,
     rootTabId: g.rootTabId,
-    console: g.console,
+    consoleMode: g.consoleMode,
     startedAt: g.startedAt,
     tabs: [...g.tabs.values()],
   }));
@@ -232,7 +239,7 @@ async function hydrate(): Promise<void> {
       const grp: WatchGroup = {
         watchId: g.watchId,
         rootTabId: g.rootTabId,
-        console: !!g.console,
+        consoleMode: g.consoleMode ?? "passive",
         startedAt: g.startedAt,
         tabs: new Map((g.tabs ?? []).map((t: WatchTab) => [t.tabId, t])),
       };
@@ -257,13 +264,13 @@ async function hydrate(): Promise<void> {
             tabToWatch.delete(tabId);
             continue;
           }
-          void injectWatchNow(tabId, g.console).catch(() => undefined);
+          void injectWatchNow(tabId, g.consoleMode).catch(() => undefined);
         }
         if (!g.tabs.size) {
           watchGroups.delete(g.watchId);
         }
       }
-      await registerWatchScripts([...watchGroups.values()].some((g) => g.console));
+      await registerWatchScripts([...watchGroups.values()].some((g) => g.consoleMode !== "off"));
       void persistWatch();
     }
   } catch {
@@ -286,6 +293,9 @@ const WATCH_SCRIPT_ID = "bb-watch";
 const WATCH_MAIN_SCRIPT_ID = "bb-watch-main";
 
 async function registerWatchScripts(withConsole: boolean): Promise<void> {
+  // `withConsole` means "any error capture at all" - the MAIN-world shim is required even for the
+  // passive listeners, because an isolated-world listener never sees page errors. Whether it also
+  // WRAPS console is decided at runtime via arm(mode), not by registering a different bundle.
   const want: chrome.scripting.RegisteredContentScript[] = [
     {
       id: WATCH_SCRIPT_ID,
@@ -296,17 +306,9 @@ async function registerWatchScripts(withConsole: boolean): Promise<void> {
       persistAcrossSessions: true,
     },
   ];
-  if (withConsole) {
-    want.push({
-      id: WATCH_MAIN_SCRIPT_ID,
-      js: ["vendor/bb-watch-main.js"],
-      matches: ["<all_urls>"],
-      allFrames: true,
-      runAt: "document_start",
-      world: "MAIN",
-      persistAcrossSessions: true,
-    } as chrome.scripting.RegisteredContentScript);
-  }
+  // The MAIN-world shim is NOT registered here: it is injected per-document as an inline function
+  // (see bbWatchMainShim), which is why watched tabs re-inject it on every commit.
+  void withConsole;
   let existing: chrome.scripting.RegisteredContentScript[] = [];
   try {
     existing = await chrome.scripting.getRegisteredContentScripts();
@@ -330,20 +332,108 @@ async function unregisterWatchScripts(): Promise<void> {
 
 /** Registration only covers FUTURE document loads. Sweep the tabs already open so watch mode starts
  *  working on the page the human is looking at, without asking them to reload it. */
-async function injectWatchNow(tabId: number, withConsole: boolean): Promise<void> {
+
+/**
+ * MAIN-world page-error shim, injected as an INLINE FUNCTION rather than a file.
+ *
+ * It has to run in the page's own JS world: an isolated-world listener does not receive page script
+ * errors (verified - CDP saw an uncaught throw, a rejection and a console.error while an isolated
+ * listener saw none). But injecting a FILE into the MAIN world proved unreliable here even with
+ * web_accessible_resources set, so this is passed as `func`, which needs no web-accessible resource,
+ * no second bundle and no runtime handshake to carry the mode.
+ *
+ * Must be fully self-contained: it is serialized and evaluated in the page.
+ *
+ * PASSIVE (always): error / unhandledrejection listeners observe an error AFTER it has unwound, so
+ * they add no frame to the page's own stack traces.
+ * WRAPPING (mode === "calls" only): replacing console.error/warn DOES sit in the page's call path and
+ * puts this extension in the page's stack traces - observed on a real target whose error reporter
+ * shipped our filename. Opt-in by name for that reason.
+ */
+function bbWatchMainShim(mode: string) {
+  const w = window as any;
+  const relay = (obj: any) => {
+    try {
+      window.dispatchEvent(new CustomEvent("bb-watch-main", { detail: JSON.stringify(obj) }));
+    } catch {
+      /* unserializable - drop rather than throw inside the page */
+    }
+  };
+  const fmt = (args: any[]): string =>
+    args
+      .map((a: any) => {
+        if (typeof a === "string") return a;
+        if (a instanceof Error) return a.stack || a.message;
+        try {
+          return JSON.stringify(a);
+        } catch {
+          return String(a);
+        }
+      })
+      .join(" ")
+      .slice(0, 500);
+  const wrapConsole = () => {
+    if (w.__bbWatchWrapped) return;
+    w.__bbWatchWrapped = 1;
+    for (const level of ["error", "warn"]) {
+      const orig = (console as any)[level]?.bind(console);
+      if (!orig) continue;
+      (console as any)[level] = (...args: any[]) => {
+        try {
+          relay({ kind: "console", level, text: fmt(args) });
+        } catch {
+          /* never break the page's own logging */
+        }
+        return orig(...args);
+      };
+    }
+  };
+  if (w.__bbWatchMain) {
+    if (mode === "calls") wrapConsole();
+    return true;
+  }
+  window.addEventListener("error", (e: any) => {
+    relay({ kind: "console", level: "error", text: String(e.message ?? "").slice(0, 500), src: e.filename, line: e.lineno });
+  });
+  window.addEventListener("unhandledrejection", (e: any) => {
+    relay({ kind: "console", level: "error", text: "Unhandled rejection: " + fmt([e?.reason]) });
+  });
+  if (mode === "calls") wrapConsole();
+  w.__bbWatchMain = 1;
+  return true;
+}
+
+async function injectWatchNow(tabId: number, consoleMode: "off" | "passive" | "calls"): Promise<void> {
   const jobs: Promise<unknown>[] = [
     chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ["vendor/bb-watch.js"] }),
   ];
-  if (withConsole) {
+  if (consoleMode !== "off") {
     jobs.push(
       chrome.scripting.executeScript({
         target: { tabId, allFrames: true },
-        files: ["vendor/bb-watch-main.js"],
+        func: bbWatchMainShim,
+        args: [consoleMode],
         world: "MAIN",
       } as chrome.scripting.ScriptInjection<any, any>)
     );
   }
-  await Promise.all(jobs.map((p) => p.catch(() => undefined))); // a restricted or wedged frame must not fail the start
+  // Report what failed rather than swallowing it. A silently-failed injection looks exactly like a
+  // quiet user, which is the failure mode this whole feature is built to avoid.
+  const [isolated, main] = await Promise.all(
+    jobs.map((p) => p.then(() => "ok").catch((e) => String(e?.message ?? e).slice(0, 200)))
+  );
+  lastInject.set(tabId, { isolated, main: consoleMode === "off" ? "skipped" : main ?? "ok", at: Date.now() });
+  // Arm EXPLICITLY. The content script is registered on <all_urls> and persists, so on any tab that
+  // loaded before this watch existed it already ran its hello handshake, was told "not armed", and
+  // went dormant. Re-injecting does not revive it - the idempotence guard makes that a no-op - so
+  // without this, watch_start silently captures nothing on every already-open tab.
+  await chrome.scripting
+    .executeScript({
+      target: { tabId, allFrames: true },
+      func: (mode: string) => (window as any).__bbWatch?.arm(true, mode),
+      args: [consoleMode],
+    } as chrome.scripting.ScriptInjection<any, any>)
+    .catch(() => undefined);
 }
 
 function watchForTab(tabId: number): WatchGroup | undefined {
@@ -358,6 +448,9 @@ function addTabToGroup(g: WatchGroup, tabId: number, openerTabId?: number): void
   tabToWatch.set(tabId, g.watchId);
   shipOrQueue({ type: "watch", watchId: g.watchId, tabId, entries: [{ t: Date.now(), k: "opened" }] }, false);
   void persistWatch();
+  // The new tab's content script may have run its hello handshake before this membership existed
+  // (onCreated and the first document load race), in which case it is sitting dormant. Arm it.
+  void injectWatchNow(tabId, g.consoleMode).catch(() => undefined);
 }
 
 // ---------- command handlers ----------
@@ -3317,22 +3410,35 @@ async function dispatch(method: string, params: any): Promise<any> {
       assertScriptable(tab);
       const tabId = tab.id!;
       const existing = watchForTab(tabId);
-      if (existing) return { watching: true, watchId: existing.watchId, tabId, url: tab.url, resumed: true };
+      if (existing) {
+        // Re-arm on resume. Returning early without injecting means a tab whose listener went dormant
+        // (extension reloaded, or the page loaded before this group existed) stays dormant forever,
+        // and watch_start reports success while capturing nothing.
+        await injectWatchNow(tabId, existing.consoleMode);
+        return {
+          watching: true,
+          watchId: existing.watchId,
+          tabId,
+          url: tab.url,
+          resumed: true,
+          inject: lastInject.get(tabId),
+        };
+      }
 
       const watchId = `w${Date.now().toString(36)}`;
       const group: WatchGroup = {
         watchId,
         rootTabId: tabId,
-        console: !!params.console,
+        consoleMode: params.console === "calls" ? "calls" : params.console === false ? "off" : "passive",
         startedAt: Date.now(),
         tabs: new Map([[tabId, { tabId, addedAt: Date.now() }]]),
       };
       watchGroups.set(watchId, group);
       tabToWatch.set(tabId, watchId);
-      await registerWatchScripts(group.console);
-      await injectWatchNow(tabId, group.console);
+      await registerWatchScripts(group.consoleMode !== "off");
+      await injectWatchNow(tabId, group.consoleMode);
       await persistWatch();
-      return { watching: true, watchId, tabId, url: tab.url };
+      return { watching: true, watchId, tabId, url: tab.url, inject: lastInject.get(tabId) };
     }
 
     case "watch_stop": {
@@ -3384,9 +3490,10 @@ async function dispatch(method: string, params: any): Promise<any> {
             title,
             listener: armed,
             unscriptable: url ? RESTRICTED.test(url) : undefined,
+            inject: lastInject.get(tabId),
           });
         }
-        groups.push({ watchId: g.watchId, rootTabId: g.rootTabId, console: g.console, startedAt: g.startedAt, tabs });
+        groups.push({ watchId: g.watchId, rootTabId: g.rootTabId, consoleMode: g.consoleMode, startedAt: g.startedAt, tabs });
       }
       let registered: string[] = [];
       try {
@@ -3509,6 +3616,22 @@ chrome.tabs.onActivated.addListener((info) => {
 });
 // SPA route changes seen from the browser side, belt-and-braces with the page's own history patch
 // (which only exists when console:true registered the MAIN-world script).
+chrome.webNavigation.onCommitted.addListener((d) => {
+  if (d.frameId !== 0) return;
+  void ready().then(() => {
+    const g = watchForTab(d.tabId);
+    if (!g || g.consoleMode === "off") return;
+    // A fresh document has no shim: it is injected as an inline function, not a registered script.
+    chrome.scripting
+      .executeScript({
+        target: { tabId: d.tabId, allFrames: true },
+        func: bbWatchMainShim,
+        args: [g.consoleMode],
+        world: "MAIN",
+      } as chrome.scripting.ScriptInjection<any, any>)
+      .catch(() => undefined);
+  });
+});
 chrome.webNavigation.onHistoryStateUpdated.addListener((d) => {
   if (d.frameId !== 0) return;
   void ready().then(() => {
@@ -3553,7 +3676,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const tabId = sender.tab?.id;
     void ready().then(() => {
       const g = tabId != null ? watchForTab(tabId) : undefined;
-      sendResponse({ ok: true, armed: !!g, watchId: g?.watchId });
+      sendResponse({ ok: true, armed: !!g, watchId: g?.watchId, consoleMode: g?.consoleMode });
     });
     return true; // async: hydration may still be in flight right after an SW restart
   }

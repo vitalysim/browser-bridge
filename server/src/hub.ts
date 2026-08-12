@@ -37,6 +37,9 @@ export class ExtensionHub {
   private taps = new Set<StreamTap>();
   private connWatchers = new Set<(connected: boolean) => void>();
   private helloWatchers = new Set<(hello: any) => void>();
+  /** What the connected extension announced. Its `build` stamp is the only reliable way to tell
+   *  whether Chrome picked up a rebuild - reloading an unpacked extension gives no feedback. */
+  lastHello: { version?: string; build?: string; at: number } | null = null;
   // Active on-disk capture sinks (persist:true captures), keyed by the tab being captured.
   private captureSinks = new Map<number, CaptureSink>();
   // Active session-recording sinks (rrweb events), keyed by tab. Separate map + a stream:"session"
@@ -94,7 +97,8 @@ export class ExtensionHub {
         return;
       }
       if (msg.type === "hello") {
-        console.error(`[hub] extension hello: v${msg.version}`);
+        this.lastHello = { version: msg.version, build: msg.build, at: Date.now() };
+        console.error(`[hub] extension hello: v${msg.version} (build ${msg.build ?? "unknown"})`);
         // The extension re-announces its live watch state on every connect, so a server restart or a
         // service-worker respawn is recoverable without the agent doing anything.
         for (const w of this.helloWatchers) {

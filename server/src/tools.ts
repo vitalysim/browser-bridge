@@ -1434,7 +1434,15 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     "bridge_status",
     "Check whether the Chrome extension is currently connected to the bridge.",
     {},
-    async () => textResult({ extensionConnected: hub.connected, recording: hub.recording })
+    async () =>
+      textResult({
+        extensionConnected: hub.connected,
+        recording: hub.recording,
+        // Which extension bundle is actually loaded. If this build stamp is older than your last
+        // `npm run build`, Chrome is still running the previous code - reload it at chrome://extensions.
+        extension: hub.lastHello ?? undefined,
+        serverVersion: version,
+      })
   );
 
   // ---- watch mode (the human browses; the agent reads a live semantic timeline) ----
@@ -1470,7 +1478,17 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         .string()
         .optional()
         .describe("Base path (or ~/…) for the network JSONL; one file per tab as <base>.net.<tabId>.jsonl. Default alongside the digest."),
-      console: z.boolean().optional().describe("Also fold console errors and uncaught exceptions (default false, banner-free)"),
+      console: z
+        .union([z.boolean(), z.literal("calls")])
+        .optional()
+        .describe(
+          "Fold page errors into the timeline, banner-free. true (default when watching): uncaught errors and " +
+            "unhandled rejections, captured passively from an isolated world - touches no page global and is " +
+            "invisible to the page. \"calls\": ALSO wraps console.error/warn to catch explicit calls - this modifies " +
+            "the page's console, so this extension's file appears in the page's own stack traces and in any error " +
+            "telemetry the site ships. Avoid it on targets you'd rather not tell you're instrumented; the CDP path " +
+            "(console_start, or network:true) captures console calls passively instead. false: no error capture."
+        ),
       redact: z
         .enum(["auto", "all", "none"])
         .optional()
@@ -1493,11 +1511,11 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         redact: args.redact ?? "auto",
         include,
         network: !!args.network,
-        console: !!args.console,
+        console: args.console !== false,
         ringCount: Math.max(100, Math.min(args.ringSize ?? 5000, 50_000)),
       });
 
-      const r = await hub.call("watch_start", { tabId: args.tabId, console: !!args.console });
+      const r = await hub.call("watch_start", { tabId: args.tabId, console: args.console ?? true });
       if (r?.tabId == null || !r?.watchId) throw new Error("extension did not return the watch id/tab");
       // Already watching this tab (e.g. after a server restart): adopt the existing browser-side
       // group rather than starting a second one on top of it.
@@ -1510,6 +1528,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
           url: r.url,
           cursor: existing.cursorAt,
           resumed: true,
+          inject: r.inject,
           digestPath: existing.digestPath ?? undefined,
         });
       }
@@ -1555,6 +1574,9 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         url: r.url,
         cursor: session.cursorAt,
         banner,
+        // What actually happened when the listener was injected. Surfaced because a failed injection
+        // is otherwise indistinguishable from a quiet user.
+        inject: r.inject,
         digestPath: session.digestPath ?? undefined,
         networkPath,
         redact: opts.redact,

@@ -161,10 +161,24 @@ recorded as `sw-restarted`.
 The service worker forwards batches verbatim over the existing WebSocket (`{type:"watch"}`); the
 server folds them in `server/src/watch.ts` — coalescing, causality, the ring, and the cursor.
 
-With `console:true`, a second script runs in the **MAIN world** to patch `console.error/warn`,
-`window.onerror`, `unhandledrejection` and `history.pushState/replaceState` (the page's console and
-history are invisible from an isolated world), relaying over a `CustomEvent`. This is the only part of
-watch mode that touches page globals, which is why it is opt-in.
+### Error capture and the one intrusive option
+
+`console: true` (the default while watching) captures **uncaught errors and unhandled rejections**
+from the isolated world. It touches no page global and is invisible to the page.
+
+`console: "calls"` additionally wraps `console.error/warn` in the **MAIN world** to catch explicit
+calls. That is genuinely intrusive and it shows: every console call the page makes routes through our
+function, so **this extension's file appears in the page's own stack traces** — and therefore in any
+error telemetry the site ships. Observed in the wild on a pentest target, whose error reporter
+recorded `vendor/bb-watch-main.js` as the top frame of one of its own errors, effectively logging that
+the browser was instrumented. On a security-testing tool that is a real cost.
+
+Prefer `console: true`. If you need explicit `console.*` calls, the CDP path (`console_start`, or
+anything that already attached the debugger via `network:true`) captures them passively — it costs the
+banner instead of a page-visible modification.
+
+SPA routes need no page patching either: `webNavigation.onHistoryStateUpdated` in the service worker
+reports them, which is what wins the race in practice anyway.
 
 ### Why not rrweb?
 
