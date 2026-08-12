@@ -8,8 +8,8 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.15.0-3f3f46?style=flat-square">
-  <img alt="tools" src="https://img.shields.io/badge/tools-64-3f3f46?style=flat-square">
+  <img alt="version" src="https://img.shields.io/badge/version-0.16.0-3f3f46?style=flat-square">
+  <img alt="tools" src="https://img.shields.io/badge/tools-68-3f3f46?style=flat-square">
   <img alt="protocol" src="https://img.shields.io/badge/MCP-streamable_HTTP-52525b?style=flat-square">
   <img alt="browser" src="https://img.shields.io/badge/Chrome%2FEdge-Manifest_V3-52525b?style=flat-square">
   <img alt="language" src="https://img.shields.io/badge/TypeScript-strict-3178c6?style=flat-square">
@@ -19,7 +19,7 @@
 
 Browser Bridge is a local **MCP server + Manifest V3 Chrome extension** that lets AI coding agents - **Claude Code** and **OpenAI Codex CLI** - control the Chrome you use every day. Because it runs *inside* your real profile, the agent inherits your cookies, `HttpOnly` sessions, SSO, and 2FA state automatically. Ask it to *"read my feed and summarize it"* or *"capture the API traffic on this page and show me the responses"* - and it works against the live, authenticated app.
 
-It ships **64 tools** spanning everyday browsing, DevTools-grade network capture, a full web-security testing toolkit, **playbooks** (saved, self-healing recipes), and **session recording** - record an interaction into a self-contained, offline-faithful HTML replay (full-page, custom-designed player, with a smooth mouse-trail / click / keystroke overlay) and **export it to a high-resolution MP4**.
+It ships **68 tools** spanning everyday browsing, DevTools-grade network capture, a full web-security testing toolkit, **playbooks** (saved, self-healing recipes), **session recording** - record an interaction into a self-contained, offline-faithful HTML replay (full-page, custom-designed player, with a smooth mouse-trail / click / keystroke overlay) and **export it to a high-resolution MP4** - and **watch mode**, which runs the whole thing in reverse: *you* browse, and the agent reads a live, labeled timeline of what you did and what the page sent.
 
 <p align="center">
   <img src="docs/replay.gif" alt="Session replay: a recorded interaction played back in the self-contained FRACTURE player - a smooth green mouse trail follows the cursor, click ripples fire, and a keystroke HUD shows what was typed, with a play/scrub timeline and speed controls" width="820">
@@ -36,6 +36,7 @@ It ships **64 tools** spanning everyday browsing, DevTools-grade network capture
 - [Features & tools](#features--tools)
 - [Playbooks](#playbooks)
 - [Recording](#recording)
+- [Watch mode](#watch-mode)
 - [Setup](#setup)
 - [Security & responsible use](#security--responsible-use)
 - [Limitations](#limitations)
@@ -111,6 +112,11 @@ replay the invoices request as A, B and anon and show me the authz_matrix
 
 # Remote desktop / canvas (e.g. a CTF AttackBox)
 screenshot the DCV desktop, click the terminal, type "id" and press Enter, then screenshot the output
+
+# Watch mode - you drive, the agent follows
+watch what I do on this site, with network capture
+...browse normally...
+what did I just do? what did that "Publish" click actually send?
 ```
 
 Both Claude Code and Codex drive the same live browser through the same endpoint.
@@ -129,6 +135,7 @@ Both Claude Code and Codex drive the same live browser through the same endpoint
 - **DevTools-grade capture** - full request/response **bodies**, response headers, `Set-Cookie`, timings, and **WebSocket/SSE frames** - with durable on-disk persistence and **HAR / MHTML** evidence export.
 - **Web-security toolkit** - named **identities**, an in-session request **replayer**, **BOLA/IDOR/BFLA** access-control diffing (`authz_matrix`), **Burp-style live interception**, an **intruder-style fuzzer** (sniper/pitchfork/clusterbomb/race), passive header/CORS/**secret** analysis, **JWT** decode, and **copy-as-curl**.
 - **Session & storage** - read/write the **real cookie jar** (incl. `HttpOnly`), `localStorage` / `sessionStorage`, and console + CSP + exception logs.
+- **Watch mode (copilot)** - the inverse of everything above: **you** browse and the agent follows along. A content script emits already-labeled events (`click <button#publish> "Publish"`, typed text, **SPA route changes**) into a cursor-addressable timeline you read with `watch_read({since})` - with requests and console errors folded in and **attributed to the action that caused them**.
 
 <details open>
 <summary><b>Browsing &amp; interaction</b></summary>
@@ -139,7 +146,7 @@ Both Claude Code and Codex drive the same live browser through the same endpoint
 | `navigate` · `go_back` · `go_forward` · `wait_for` | Navigation |
 | `click` · `fill` · `hover` · `type` · `press_key` · `scroll` | Interaction (iframe + open-shadow aware). **Auto-waits** for the element to be actionable (found + visible + enabled, `timeoutMs`) and returns structured `{notActionable, reason}` on failure. `click` detects overlay-covered targets and **auto-escalates to a trusted CDP click** (`via:"trusted"`); `fill`/`type` register in React inputs (native setter) and rich editors (execCommand). `trusted:true` for real CDP input; `withSnapshot:true` to get a fresh `snapshot` back inline |
 | `input` | **Coordinate-level trusted input** via CDP for targets element selectors can't reach - a `<canvas>` remote desktop (VNC/RDP/**Amazon DCV**), a game, a WebGL app. Actions: `mouse_move`, `left/right/middle_click`, `double_click`, `left_mouse_down/up`, `left_click_drag`, `scroll`, `type` (to the focused element), `key` (combos like `ctrl+c`). Coords are **CSS viewport pixels** (`= screenshotPixel / dpr`, and `screenshot` now returns `dpr`). `activate:true` to foreground the tab so you can observe |
-| `browser_batch` | Run a **sequence of tools in one call** - `navigate → click → fill → press_key → screenshot` as a single round trip instead of five. The per-call round trip, not the browser, is what makes multi-step tasks slow, so batching whenever you can predict two or more steps ahead is the single biggest speedup available. Runs sequentially and **stops at the first error**, reporting what completed plus the failing index and message. Cannot be nested; capped at 50 actions. Allowlisted to tools that add no approval surface when batched: **navigation + interaction** (`navigate`, `go_back`, `go_forward`, `tabs_list`, `tab_new`, `tab_activate`, `click`, `fill`, `hover`, `type`, `press_key`, `scroll`, `wait_for`), **page reads** (`snapshot`, `get_page_text`, `screenshot`, `eval_js`), **pure functions** (`jwt_decode`, `response_diff`) and **inert status/buffer reads** (`bridge_status`, `debugger_status`, `identity_list`, `session_record_status`, `net_get_*`, `console_get`, `intercept_pending` - each gated behind a start tool that is itself not batchable). Everything that mutates state, reads credentials, issues outbound requests or touches disk stays a direct call so it keeps its own per-call approval - including `cookies_get`, `storage_dump`, `input`, `cdp_eval`, `tab_close` and `request_to_curl` |
+| `browser_batch` | Run a **sequence of tools in one call** - `navigate → click → fill → press_key → screenshot` as a single round trip instead of five. The per-call round trip, not the browser, is what makes multi-step tasks slow, so batching whenever you can predict two or more steps ahead is the single biggest speedup available. Runs sequentially and **stops at the first error**, reporting what completed plus the failing index and message. Cannot be nested; capped at 50 actions. Allowlisted to tools that add no approval surface when batched: **navigation + interaction** (`navigate`, `go_back`, `go_forward`, `tabs_list`, `tab_new`, `tab_activate`, `click`, `fill`, `hover`, `type`, `press_key`, `scroll`, `wait_for`), **page reads** (`snapshot`, `get_page_text`, `screenshot`, `eval_js`), **pure functions** (`jwt_decode`, `response_diff`) and **inert status/buffer reads** (`bridge_status`, `debugger_status`, `identity_list`, `session_record_status`, `watch_status`, `net_get_*`, `console_get`, `intercept_pending`, `watch_read` - each gated behind a start tool that is itself not batchable; a batched `watch_read` has its `waitMs` forced to 0 so it can never stall the sequence). Everything that mutates state, reads credentials, issues outbound requests or touches disk stays a direct call so it keeps its own per-call approval - including `cookies_get`, `storage_dump`, `input`, `cdp_eval`, `tab_close` and `request_to_curl` |
 | `file_upload` | Set a file input via base64 or a local `path` (`DOM.setFileInputFiles`) |
 | `paste_image` | Paste a local image into a rich-text / contenteditable field; `trusted:true` uses the real OS clipboard + a genuine Cmd/Ctrl+V for strict editors (e.g. YesWeHack) that ignore synthetic events |
 </details>
@@ -163,7 +170,7 @@ Both Claude Code and Codex drive the same live browser through the same endpoint
 
 | Tool | Description |
 |---|---|
-| `net_capture_start` | Begin capturing; then navigate/reload to record load traffic. `maxEntries` sizes the in-memory ring (default 500, max 5000); `persist:true` + `savePath` also **streams** each finished request/WS frame to a JSON-Lines file on disk (durable - survives the ring cap and, up to the last batch, a service-worker crash; `persistBodies:true` includes bodies) |
+| `net_capture_start` | Begin capturing; then navigate/reload to record load traffic. `excludeExtensionTraffic:true` drops non-http(s) requests - your OTHER installed extensions inject scripts and fonts into every page and can outnumber the page's own requests 20:1. `maxEntries` sizes the in-memory ring (default 500, max 5000); `persist:true` + `savePath` also **streams** each finished request/WS frame to a JSON-Lines file on disk (durable - survives the ring cap and, up to the last batch, a service-worker crash; `persistBodies:true` includes bodies) |
 | `net_get_requests` | Requests with headers, `Set-Cookie`, timings, and (opt-in) response **bodies** |
 | `net_get_body` | Fetch one response body on demand |
 | `net_get_ws_frames` | Captured WebSocket / EventSource frames |
@@ -199,6 +206,18 @@ Both Claude Code and Codex drive the same live browser through the same endpoint
 </details>
 
 <details>
+<summary><b>Watch mode</b> - the human browses, the agent follows (banner-free)</summary>
+
+| Tool | Description |
+|---|---|
+| `watch_start` | Begin watching a tab: a content script (`<all_urls>`, `document_start`, all frames, **persists across service-worker restarts**) emits **already-labeled** semantic events - navigations incl. **SPA route changes**, clicks with the element's real label *and a selector `click`/`fill` can reuse*, coalesced typed text, special keystrokes, form submits, copy/paste, tab open/close/focus. **Follows tabs the watched tab opens** (`target=_blank`, `window.open`, OAuth popups). `network:true` captures traffic (**attaches `chrome.debugger` → shows the banner**): requests appear in the timeline *and* the full record - request/response headers, request body, **response bodies** - streams to disk per tab, surviving navigation (Chrome evicts a response body once its document is replaced, so bodies are fetched eagerly at load-finish). Other extensions' traffic is excluded - on one ordinary page load it was 66 of 69 captured requests. `console:true` folds in console errors banner-free via a MAIN-world shim. `redact` (`auto` default / `all` / `none`) controls masking of typed values |
+| `watch_read` | Read the timeline. `since` is an opaque cursor - pass it back verbatim; it carries the watch id, so a cursor from an earlier server process is **detected** (`reset:true`) instead of silently reinterpreted. `waitMs` (max 25000) blocks until something happens. Returns one compact line per action plus `{nextCursor, dropped, more, health}`. Requests and errors carry `← #seq` **causality** that **chains through navigations**, so a page load doesn't hang 80 requests off one click. `file:` re-reads a saved digest |
+| `watch_status` · `watch_stop` | Is capture actually live (per-tab listener state, ring occupancy, unscriptable tabs)? / stop, flush the in-progress typing burst, close the digest |
+
+Blindness is a **first-class timeline entry**: `gap` actions (`extension-disconnected`, `sw-restarted`, `watch-lost`, `ring-evicted`, `unscriptable`) and `health.state` distinguish *"you were idle"* from *"capture was down"* - including the case where the socket is connected but the extension no longer holds the watch, which otherwise reads as perfectly healthy. Also exposed over plain HTTP at `GET /watch` so a Claude Code `UserPromptSubmit` hook can prepend recent activity to every message - continuous awareness with no tool call and no approval prompt. **Details: [docs/WATCH.md](docs/WATCH.md).**
+</details>
+
+<details>
 <summary><b>Playbooks</b> (saved, self-healing task recipes)</summary>
 
 | Tool | Description |
@@ -214,7 +233,7 @@ Both Claude Code and Codex drive the same live browser through the same endpoint
 |---|---|
 | `session_record_start` | Start recording the tab as a session replay (rrweb) - DOM + mutations + input/scroll/mouse (~60 fps), **banner-free**. `allFrames:true` also records cross-origin iframes (best-effort, per-frame with a timeout); `maskInputs:true` redacts form values (default off) |
 | `session_record_stop` | Stop and assemble a **self-contained, offline-faithful HTML** replay: inlines every external asset (cross-origin CSS/fonts/images/lazy-images) through the extension, strips other extensions' nodes, and renders **full-page** (fits the viewer at the recorded viewport's exact aspect). A custom **FRACTURE**-styled player (play/scrub, speed, skip-idle, fullscreen) with a live **interaction overlay** - smooth mouse trail, click ripples, keystroke HUD - toggleable on. Opens offline in any browser. Options: `inlineAssets`, `assetBudgetMB`, `perAssetMB`, `skipInactive`, `autoplay` |
-| `session_record_status` | List active recordings (tab, events file, events so far) |
+| `session_record_status` | List active recordings (tab, events file, events so far) - now including whether the recorder is **actually alive in the page**, probed live, so a recording that died in the browser can't keep reporting as healthy from server-side bookkeeping |
 | `render_recording_video` | Render a saved replay `.html` into a **high-resolution MP4** (`fps`, `scale` up to 4× ≈ retina/4K, `crf`). Deterministic + frame-exact: seeks the player per frame, captures lossless PNGs, then ffmpeg → H.264. Video = the recorded page + the interaction overlay, matching the live playback |
 </details>
 
@@ -253,6 +272,29 @@ Because the extension injects the recorder into **every frame including cross-or
 The replay is **truly self-contained / offline-faithful**: on stop, the server fetches every external asset the capture references — cross-origin stylesheets, fonts, images, and lazy-loaded images — **through the extension** (background `fetch` under `<all_urls>` has no CORS wall + sends your session cookies) and inlines them, and strips nodes injected by your *other* extensions. So it renders from captured data, not by re-fetching the live site (page-level rrweb can't read cross-origin CSS at all).
 
 The player is a custom **FRACTURE**-styled UI: the replay **fills the window at the recorded page's exact aspect ratio** (rescaling on resize), with a play/scrub timeline, speed, skip-idle, and fullscreen. A toggleable **interaction overlay** annotates the playback with a **smooth mouse trail**, **click ripples**, and a **keystroke HUD** (typed text, plus physical keys like `Enter` / `⌘C` on new recordings). Then **`render_recording_video`** turns a saved `.html` into a **high-resolution MP4** (`fps`, `scale` up to 4× ≈ retina/4K) - a deterministic, frame-exact render (seek + lossless PNG per frame → ffmpeg H.264) whose motion matches the live playback. Note: input **masking is OFF by default** (cleartext values; `maskInputs:true` to redact); canvas/WebGL and live video **pixels** aren't captured by DOM replay. **Details: [docs/RECORDING.md](docs/RECORDING.md).**
+
+## Watch mode
+
+Everything else in Browser Bridge is agent-driven. Watch mode is the inverse: **you** browse and the agent follows along, so you can ask *"what did I just do?"*, *"what did that click actually send?"*, or *"where did I get logged out?"* at any moment.
+
+```
+watch_start({ tabId })          →  { watchId, cursor, banner:false }
+   …you browse normally…
+watch_read({ since: cursor })   →  the timeline + the next cursor
+```
+
+```
+WATCH  live  tabs=5  actions=6  dropped=0  more=false
+12:04:39.8  #411 click    <input#user_login> "Username or Email Address"
+12:04:41.0  #412 input    <input#user_login> = "attacker"   (8 keys / 1.2s)
+12:04:41.3  #413 key      ↵
+12:04:41.4  #414 net      POST /wp-login.php → 302 (91ms)      ← #412
+12:04:41.9  #415 console  error "Uncaught TypeError: x is undefined"  ← #414
+```
+
+Events are labeled **in the page**, where the DOM is, so a click arrives as `<button#publish> "Publish"` with a selector `click`/`fill` can reuse - not as an opaque node id. Typing is coalesced into one action with the final value. Requests and errors are attributed to the action that caused them, and the attribution **chains through navigations** so a page load doesn't hang eighty requests off one click.
+
+This is deliberately **not** derived from the rrweb recording stream. That was measured first and rejected: rrweb node ids restart at 1 in every document (one missed batch mislabels every later click), SPA routes go up to 30s stale or never appear, a click that navigates in under 300ms is lost to the recorder's batching, and an 8-hour session costs ~910MB against ~120KB. The two are independent and compose - run `session_record_start` on the same tab when you also want the visual replay. **Details: [docs/WATCH.md](docs/WATCH.md).**
 
 ## Setup
 
@@ -346,12 +388,14 @@ bearer_token_env_var = "BROWSER_BRIDGE_TOKEN"
 - One extension connection at a time (last connect wins); multiple MCP clients can share it concurrently. A call in flight when the extension disconnects fails fast instead of waiting out the timeout.
 - `input` coordinates are **CSS viewport pixels**, but screenshots are **device pixels** - map with the `dpr` the screenshot returns (`coord = screenshotPixel / dpr`). `input` is delivered even to a backgrounded tab, but a hidden tab's frame is throttled, so you can't *observe* the result until it's foregrounded (`activate:true` / `tab_activate`); `screenshot` flags this via `visibilityState`.
 - The default `screenshot` uses `chrome.tabs.captureVisibleTab`, which Chrome rate-limits to roughly **2 captures/second**. Back-to-back screenshots are therefore spaced automatically (~550 ms apart) rather than failing on the quota; an isolated screenshot - the normal case - waits nothing. The `fullPage`/`scale`/`selector` path uses CDP `Page.captureScreenshot` and is not subject to this limit.
+- **Watch mode** cannot see pages content scripts can't run on (`chrome://`, the Web Store, `view-source:`, other extensions' pages) - `watch_status` reports those tabs as `unscriptable`, and the timeline records a `gap` rather than letting a blind spot look like idleness. Typed values are captured in **cleartext** unless redacted (`redact:"auto"` is the default and masks password/secret-looking fields; `redact:"none"` disables it). `network:true` needs `chrome.debugger` and therefore shows the banner for the whole session; everything else in watch mode is banner-free. Selectors on hash-heavy CSS frameworks may not be re-queryable.
 - `download_resource` always uses the browser's live session - it can't download as a captured `identity`. `Cookie`/`Host`/`Origin`/`Referer`/`Content-Length` in its `headers` param are browser-forbidden and silently ignored. If Chrome's "Ask where to save each file" setting is enabled, downloads may prompt for a location instead of completing automatically.
 
 ## Roadmap
 
 **Shipped** (newest first):
 
+- **v0.16 · Watch mode (copilot)** - the inverse of agent-driven browsing: **you** browse, the agent follows. A persistent content script emits **already-labeled** events (click targets with real labels *and* reusable selectors, coalesced typing, instant SPA route changes) into a **cursor-addressable** timeline (`watch_start` / `watch_read` / `watch_status` / `watch_stop`), with network + console folded in and **causality that chains through navigations**. Blindness is a first-class entry, so silence never reads as inactivity. Also on `GET /watch` for a prompt hook. Plus five fixes to shipped capture code: `flushRecord`/`flushCapture` no longer discard batches when the socket is down, tab close keeps the recorder's last batch, `debugger.onDetach` reasons are surfaced, abandoned intercepts can no longer hang a page forever, and captured requests carry a real timestamp (fixing `export_har`'s waterfall). `net_capture_start` also gains `excludeExtensionTraffic` - on one ordinary page load, 66 of 69 captured requests were other installed extensions injecting scripts and font blobs. First automated tests in the repo (24, via `node --test`). → [docs/WATCH.md](docs/WATCH.md)
 - **v0.15 · Batching & latency** - **`browser_batch`** collapses a predictable tool sequence into **one round trip** (allowlisted to tools that add no approval surface when batched). Plus a latency pass: screenshots no longer pay a flat 350 ms when the tab is already foregrounded (**407 ms → 100 ms** median, with explicit throttling so bursts can't trip Chrome's capture quota), `snapshot` walks the DOM once instead of twice and caps the walk itself, and `analyze deep` / `session_record_stop` batch what were serial per-item round trips. Three latent fixes: `timeoutMs` now reaches the hub timer, the capture sink no longer blocks the event loop on `fsync`, and concurrent debugger attaches on a cold tab share one attach.
 - **v0.14 · MP4 export** - `render_recording_video` renders a saved replay to a high-resolution, frame-exact **H.264 MP4** (deterministic seek + lossless-PNG frames → ffmpeg); the mouse-trail / click / keystroke motion matches the live playback. `chrome:true` includes the player UI.
 - **v0.13 · Designed replay player** - a custom **FRACTURE**-styled player with **full-page fit-to-viewport** rendering and a toggleable **interaction overlay**: smooth mouse trail, click ripples, and a keystroke HUD (typed text + physical keys).
@@ -378,16 +422,20 @@ server/                 MCP server (TypeScript · @modelcontextprotocol/sdk · w
   src/index.ts            HTTP MCP endpoint + auth + session management
   src/hub.ts              single extension socket, request/response correlation, capture sinks
   src/capture-sink.ts     durable on-disk JSON-Lines sink for persist captures
-  src/tools.ts            the 64 MCP tools
+  src/tools.ts            the 68 MCP tools
+  src/watch.ts            watch mode: fold, action ring, cursor, causality, renderer
+  test/                   node --test suites (run with `npm test`)
 extension/              Manifest V3 extension (bundled with esbuild via build.mjs)
   manifest.json
   src/background.ts       service worker: WS client, injection, chrome.debugger (CDP) layer
+  src/watch-entry.ts      watch-mode activity listener (ISOLATED world content script)
+  src/watch-main.ts       watch-mode console + history shim (MAIN world, opt-in)
   src/options.ts          token + connection UI
   icons/                  generated app icons
 scripts/                install-service.mjs / uninstall-service.mjs (systemd or launchd)
-docs/                   PLAYBOOKS.md · RECORDING.md · banner.svg · architecture.svg
+docs/                   PLAYBOOKS.md · RECORDING.md · WATCH.md · WATCH-SELFTEST.md · banner.svg · architecture.svg
   server/vendor/          rrweb-player (inlined into session-replay HTML)
-  extension/vendor/       rrweb-record.js (injected recorder; built by build.mjs)
+  extension/vendor/       rrweb-record.js · bb-watch.js · bb-watch-main.js (injected; built by build.mjs)
 ```
 
 ## Contributing
