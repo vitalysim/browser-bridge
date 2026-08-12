@@ -26,7 +26,9 @@ await build({
   format: "iife",
   outdir: dir,
   target: "chrome116",
-  define: { __BB_VERSION__: JSON.stringify(version) },
+  // Build stamp so `bridge_status` can prove which bundle Chrome is actually running - reloading an
+  // unpacked extension is silent, and a stale service worker is indistinguishable from a code bug.
+  define: { __BB_VERSION__: JSON.stringify(version), __BB_BUILD__: JSON.stringify(new Date().toISOString()) },
 });
 console.log(`built extension v${version}`);
 
@@ -41,3 +43,20 @@ await build({
   legalComments: "none",
 });
 console.log("built vendor/rrweb-record.js");
+
+// Watch-mode activity listener — a standalone IIFE registered via chrome.scripting.registerContentScripts
+// by watch_start, so it must not import anything from the service-worker bundle. It runs in the
+// ISOLATED world (it needs chrome.runtime). The MAIN-world error shim is NOT built here: it is
+// injected as an inline function from background.ts (bbWatchMainShim), which avoids needing a
+// web-accessible resource.
+for (const name of ["watch-entry"]) {
+  await build({
+    entryPoints: [join(dir, `src/${name}.ts`)],
+    bundle: true,
+    format: "iife",
+    outfile: join(dir, `vendor/bb-${name.replace("-entry", "")}.js`),
+    target: "chrome116",
+    legalComments: "none",
+  });
+  console.log(`built vendor/bb-${name.replace("-entry", "")}.js`);
+}

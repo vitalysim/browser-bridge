@@ -3,7 +3,9 @@
 // Injected at build time by build.mjs (esbuild define) from extension/package.json - single
 // source of truth shared with manifest.json, so the version can't drift.
 declare const __BB_VERSION__: string;
+declare const __BB_BUILD__: string;
 const VERSION = __BB_VERSION__;
+const BUILD_AT = __BB_BUILD__;
 const PING_INTERVAL_MS = 20_000; // WS traffic resets the MV3 service-worker idle timer (Chrome 116+)
 const RECONNECT_MAX_MS = 30_000;
 
@@ -27,10 +29,30 @@ async function connect() {
   const socket = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`);
   ws = socket;
 
-  socket.onopen = () => {
+  socket.onopen = async () => {
     reconnectDelay = 1_000;
     setStatus("connected");
-    socket.send(JSON.stringify({ type: "hello", version: VERSION }));
+    // Re-announce live watch state on every connect. One mechanism covers both a server restart and
+    // a service-worker respawn: the server rebinds its sessions instead of capturing into nothing.
+    await ready();
+    const gapMs = lastAliveAt ? Date.now() - lastAliveAt : 0;
+    socket.send(
+      JSON.stringify({
+        type: "hello",
+        version: VERSION,
+        build: BUILD_AT,
+        watch: {
+          groups: serializeWatch().map((g) => ({
+            watchId: g.watchId,
+            tabs: g.tabs.map((t: WatchTab) => t.tabId),
+            swRestarted: gapMs > 45_000,
+            gapMs,
+          })),
+        },
+      })
+    );
+    pumpOutbox(); // whatever was held while the socket was down
+    void markAlive();
     if (pingTimer) clearInterval(pingTimer);
     pingTimer = setInterval(() => {
       if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "ping" }));
@@ -76,6 +98,359 @@ function scheduleReconnect() {
     connect();
   }, reconnectDelay);
   reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
+}
+
+// ---------- outbox ----------
+// Every streamed batch goes out through here. The point is the ORDER of operations: the old
+// flushRecord/flushCapture emptied their queue into a local and only then checked ws.readyState, so
+// a socket blip (server restart, laptop sleep) silently ate the batch. Reconnect backs off to 30s,
+// so that was up to 30s of capture lost with no trace. Now a closed socket means the batch is held.
+
+const OUTBOX_MAX_ENVELOPES = 1_500;
+const OUTBOX_MAX_BYTES = 4 * 1024 * 1024;
+
+let outbox: { json: string; bytes: number }[] = [];
+let outboxBytes = 0;
+let outboxDropped = 0;
+
+/**
+ * Send now if the socket is up, otherwise hold in the outbox. Returns whether it reached the wire.
+ *
+ * `queue:false` means "send or tell me you didn't" - used for watch events, where the PAGE holds the
+ * only copy until it is acked. Queueing those here too would deliver every event twice: once from the
+ * outbox on reconnect and once from the page's own retry. There is exactly one buffer of record per
+ * stream, and for watch mode it lives in the page.
+ */
+function shipOrQueue(obj: any, queue = true): boolean {
+  let json: string;
+  try {
+    json = JSON.stringify(obj);
+  } catch {
+    return false; // unserializable payload - nothing to hold
+  }
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try {
+      ws.send(json);
+      return true;
+    } catch {
+      /* fall through and hold it */
+    }
+  }
+  if (!queue) return false;
+  outbox.push({ json, bytes: json.length });
+  outboxBytes += json.length;
+  // Bounded, and drops are COUNTED. An unbounded backlog would OOM the service worker on a long
+  // outage, which is a worse failure than a reported gap.
+  while (outbox.length > OUTBOX_MAX_ENVELOPES || outboxBytes > OUTBOX_MAX_BYTES) {
+    const o = outbox.shift();
+    if (!o) break;
+    outboxBytes -= o.bytes;
+    outboxDropped++;
+  }
+  return false;
+}
+
+function pumpOutbox(): void {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  while (outbox.length) {
+    const o = outbox[0];
+    try {
+      ws.send(o.json);
+    } catch {
+      return; // socket went away mid-drain; keep the rest for the next open
+    }
+    outbox.shift();
+    outboxBytes -= o.bytes;
+  }
+}
+
+// ---------- watch mode ----------
+// The content script is registered on <all_urls> and is therefore present everywhere, including on
+// tabs opened while the service worker was dead. Scope is enforced by ARMING (the hello handshake
+// below), not by injection - which is what makes watch mode survive SW eviction with no rehydration
+// race: the page keeps its own buffer and re-asks.
+
+interface WatchTab {
+  tabId: number;
+  openerTabId?: number;
+  addedAt: number;
+}
+interface WatchGroup {
+  watchId: string;
+  rootTabId: number;
+  /** Only "calls" registers the MAIN-world console wrapper. Passive error capture needs nothing:
+   *  it lives in the isolated content script and touches no page global. */
+  consoleMode: "off" | "passive" | "calls";
+  startedAt: number;
+  tabs: Map<number, WatchTab>;
+}
+
+const watchGroups = new Map<string, WatchGroup>();
+const tabToWatch = new Map<number, string>();
+/** Why the debugger last detached from a tab, so a capture that died is legible instead of silent.
+ *  "canceled_by_user" means the human dismissed the banner - never auto-reattach over that. */
+const lastDetach = new Map<number, { reason: string; at: number }>();
+/** Result of the last watch-script injection per tab, surfaced through watch_start / watch_status. */
+const lastInject = new Map<number, { isolated: string; main: string; at: number }>();
+let swStartedAt = Date.now();
+let lastAliveAt = 0;
+
+const WATCH_KEY = "bb.watch.v1";
+// A persisted watch older than this is treated as abandoned on the next service-worker start.
+const WATCH_MAX_AGE_MS = 12 * 60 * 60_000;
+const HEALTH_KEY = "bb.health.v1";
+
+function serializeWatch() {
+  return [...watchGroups.values()].map((g) => ({
+    watchId: g.watchId,
+    rootTabId: g.rootTabId,
+    consoleMode: g.consoleMode,
+    startedAt: g.startedAt,
+    tabs: [...g.tabs.values()],
+  }));
+}
+
+// storage.LOCAL, not .session: session storage is wiped when the extension is reloaded or toggled,
+// which is precisely when the watch group most needs to survive. Verified the hard way - after an
+// off/on toggle the group vanished, every page disarmed itself on the hello handshake, and capture
+// was dead while the server still reported "live". Local storage survives that and a browser restart;
+// hydrate() expires anything stale so a forgotten group can't linger forever.
+async function persistWatch(): Promise<void> {
+  try {
+    await chrome.storage.local.set({ [WATCH_KEY]: serializeWatch() });
+  } catch {
+    /* best-effort; the page-side buffer is the real durability */
+  }
+}
+
+// Hydration gate. Module top-level, NOT onStartup: onStartup fires once per browser launch and never
+// after an eviction, which is exactly the case that matters.
+let hydrateP: Promise<void> | null = null;
+const ready = (): Promise<void> => (hydrateP ??= hydrate());
+
+async function hydrate(): Promise<void> {
+  try {
+    const got = await chrome.storage.local.get({ [WATCH_KEY]: [], [HEALTH_KEY]: { starts: 0, lastAliveAt: 0 } });
+    const groups = got[WATCH_KEY] as any[];
+    const now = Date.now();
+    for (const g of groups ?? []) {
+      // A watch nobody stopped shouldn't outlive the browsing session it belonged to.
+      if (now - (g.startedAt ?? 0) > WATCH_MAX_AGE_MS) continue;
+      const grp: WatchGroup = {
+        watchId: g.watchId,
+        rootTabId: g.rootTabId,
+        consoleMode: g.consoleMode ?? "passive",
+        startedAt: g.startedAt,
+        tabs: new Map((g.tabs ?? []).map((t: WatchTab) => [t.tabId, t])),
+      };
+      watchGroups.set(grp.watchId, grp);
+      for (const tabId of grp.tabs.keys()) tabToWatch.set(tabId, grp.watchId);
+    }
+    const health = got[HEALTH_KEY] as any;
+    lastAliveAt = health?.lastAliveAt ?? 0;
+    const starts = (health?.starts ?? 0) + 1;
+    await chrome.storage.local.set({ [HEALTH_KEY]: { starts, lastAliveAt: Date.now() } });
+    if (watchGroups.size) {
+      console.log(`[bb] watch rehydrated: ${watchGroups.size} group(s), ${tabToWatch.size} tab(s)`);
+      // Drop tabs that are gone, and RE-INJECT into the ones still open. Registration only covers
+      // future document loads, so without this an already-open page stays dormant until it happens
+      // to navigate - which after an extension reload means indefinitely.
+      for (const g of [...watchGroups.values()]) {
+        for (const tabId of [...g.tabs.keys()]) {
+          try {
+            await chrome.tabs.get(tabId);
+          } catch {
+            g.tabs.delete(tabId);
+            tabToWatch.delete(tabId);
+            continue;
+          }
+          void injectWatchNow(tabId, g.consoleMode).catch(() => undefined);
+        }
+        if (!g.tabs.size) {
+          watchGroups.delete(g.watchId);
+        }
+      }
+      await registerWatchScripts([...watchGroups.values()].some((g) => g.consoleMode !== "off"));
+      void persistWatch();
+    }
+  } catch {
+    /* first run / storage unavailable */
+  }
+}
+void ready();
+
+async function markAlive(): Promise<void> {
+  lastAliveAt = Date.now();
+  try {
+    const got = await chrome.storage.local.get({ [HEALTH_KEY]: { starts: 1 } });
+    await chrome.storage.local.set({ [HEALTH_KEY]: { ...(got[HEALTH_KEY] as any), lastAliveAt } });
+  } catch {
+    /* best-effort */
+  }
+}
+
+const WATCH_SCRIPT_ID = "bb-watch";
+const WATCH_MAIN_SCRIPT_ID = "bb-watch-main";
+
+async function registerWatchScripts(withConsole: boolean): Promise<void> {
+  // `withConsole` means "any error capture at all" - the MAIN-world shim is required even for the
+  // passive listeners, because an isolated-world listener never sees page errors. Whether it also
+  // WRAPS console is decided at runtime via arm(mode), not by registering a different bundle.
+  const want: chrome.scripting.RegisteredContentScript[] = [
+    {
+      id: WATCH_SCRIPT_ID,
+      js: ["vendor/bb-watch.js"],
+      matches: ["<all_urls>"],
+      allFrames: true,
+      runAt: "document_start",
+      persistAcrossSessions: true,
+    },
+  ];
+  // The MAIN-world shim is NOT registered here: it is injected per-document as an inline function
+  // (see bbWatchMainShim), which is why watched tabs re-inject it on every commit.
+  void withConsole;
+  let existing: chrome.scripting.RegisteredContentScript[] = [];
+  try {
+    existing = await chrome.scripting.getRegisteredContentScripts();
+  } catch {
+    /* none registered yet */
+  }
+  const have = new Set(existing.map((s) => s.id));
+  const add = want.filter((s) => !have.has(s.id));
+  if (add.length) await chrome.scripting.registerContentScripts(add);
+}
+
+async function unregisterWatchScripts(): Promise<void> {
+  try {
+    const existing = await chrome.scripting.getRegisteredContentScripts();
+    const ids = existing.filter((s) => s.id === WATCH_SCRIPT_ID || s.id === WATCH_MAIN_SCRIPT_ID).map((s) => s.id);
+    if (ids.length) await chrome.scripting.unregisterContentScripts({ ids });
+  } catch {
+    /* already gone */
+  }
+}
+
+/** Registration only covers FUTURE document loads. Sweep the tabs already open so watch mode starts
+ *  working on the page the human is looking at, without asking them to reload it. */
+
+/**
+ * MAIN-world page-error shim, injected as an INLINE FUNCTION rather than a file.
+ *
+ * It has to run in the page's own JS world: an isolated-world listener does not receive page script
+ * errors (verified - CDP saw an uncaught throw, a rejection and a console.error while an isolated
+ * listener saw none). But injecting a FILE into the MAIN world proved unreliable here even with
+ * web_accessible_resources set, so this is passed as `func`, which needs no web-accessible resource,
+ * no second bundle and no runtime handshake to carry the mode.
+ *
+ * Must be fully self-contained: it is serialized and evaluated in the page.
+ *
+ * PASSIVE (always): error / unhandledrejection listeners observe an error AFTER it has unwound, so
+ * they add no frame to the page's own stack traces.
+ * WRAPPING (mode === "calls" only): replacing console.error/warn DOES sit in the page's call path and
+ * puts this extension in the page's stack traces - observed on a real target whose error reporter
+ * shipped our filename. Opt-in by name for that reason.
+ */
+function bbWatchMainShim(mode: string) {
+  const w = window as any;
+  const relay = (obj: any) => {
+    try {
+      window.dispatchEvent(new CustomEvent("bb-watch-main", { detail: JSON.stringify(obj) }));
+    } catch {
+      /* unserializable - drop rather than throw inside the page */
+    }
+  };
+  const fmt = (args: any[]): string =>
+    args
+      .map((a: any) => {
+        if (typeof a === "string") return a;
+        if (a instanceof Error) return a.stack || a.message;
+        try {
+          return JSON.stringify(a);
+        } catch {
+          return String(a);
+        }
+      })
+      .join(" ")
+      .slice(0, 500);
+  const wrapConsole = () => {
+    if (w.__bbWatchWrapped) return;
+    w.__bbWatchWrapped = 1;
+    for (const level of ["error", "warn"]) {
+      const orig = (console as any)[level]?.bind(console);
+      if (!orig) continue;
+      (console as any)[level] = (...args: any[]) => {
+        try {
+          relay({ kind: "console", level, text: fmt(args) });
+        } catch {
+          /* never break the page's own logging */
+        }
+        return orig(...args);
+      };
+    }
+  };
+  if (w.__bbWatchMain) {
+    if (mode === "calls") wrapConsole();
+    return true;
+  }
+  window.addEventListener("error", (e: any) => {
+    relay({ kind: "console", level: "error", text: String(e.message ?? "").slice(0, 500), src: e.filename, line: e.lineno });
+  });
+  window.addEventListener("unhandledrejection", (e: any) => {
+    relay({ kind: "console", level: "error", text: "Unhandled rejection: " + fmt([e?.reason]) });
+  });
+  if (mode === "calls") wrapConsole();
+  w.__bbWatchMain = 1;
+  return true;
+}
+
+async function injectWatchNow(tabId: number, consoleMode: "off" | "passive" | "calls"): Promise<void> {
+  const jobs: Promise<unknown>[] = [
+    chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ["vendor/bb-watch.js"] }),
+  ];
+  if (consoleMode !== "off") {
+    jobs.push(
+      chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        func: bbWatchMainShim,
+        args: [consoleMode],
+        world: "MAIN",
+      } as chrome.scripting.ScriptInjection<any, any>)
+    );
+  }
+  // Report what failed rather than swallowing it. A silently-failed injection looks exactly like a
+  // quiet user, which is the failure mode this whole feature is built to avoid.
+  const [isolated, main] = await Promise.all(
+    jobs.map((p) => p.then(() => "ok").catch((e) => String(e?.message ?? e).slice(0, 200)))
+  );
+  lastInject.set(tabId, { isolated, main: consoleMode === "off" ? "skipped" : main ?? "ok", at: Date.now() });
+  // Arm EXPLICITLY. The content script is registered on <all_urls> and persists, so on any tab that
+  // loaded before this watch existed it already ran its hello handshake, was told "not armed", and
+  // went dormant. Re-injecting does not revive it - the idempotence guard makes that a no-op - so
+  // without this, watch_start silently captures nothing on every already-open tab.
+  await chrome.scripting
+    .executeScript({
+      target: { tabId, allFrames: true },
+      func: (mode: string) => (window as any).__bbWatch?.arm(true, mode),
+      args: [consoleMode],
+    } as chrome.scripting.ScriptInjection<any, any>)
+    .catch(() => undefined);
+}
+
+function watchForTab(tabId: number): WatchGroup | undefined {
+  const id = tabToWatch.get(tabId);
+  return id ? watchGroups.get(id) : undefined;
+}
+
+/** Add a tab to a group and tell the server, so the timeline shows the new tab appearing. */
+function addTabToGroup(g: WatchGroup, tabId: number, openerTabId?: number): void {
+  if (g.tabs.has(tabId)) return;
+  g.tabs.set(tabId, { tabId, openerTabId, addedAt: Date.now() });
+  tabToWatch.set(tabId, g.watchId);
+  shipOrQueue({ type: "watch", watchId: g.watchId, tabId, entries: [{ t: Date.now(), k: "opened" }] }, false);
+  void persistWatch();
+  // The new tab's content script may have run its hello handshake before this membership existed
+  // (onCreated and the first document load race), in which case it is sitting dormant. Arm it.
+  void injectWatchNow(tabId, g.consoleMode).catch(() => undefined);
 }
 
 // ---------- command handlers ----------
@@ -817,6 +1192,7 @@ interface Session {
   net: NetEntry[];
   netOn: boolean;
   netFilter?: string; // if set, only buffer requests whose URL contains this
+  excludeExtensionTraffic?: boolean; // drop non-http(s) requests (other extensions' own traffic)
   netMax: number; // in-memory ring cap for `net` (overridable via net_capture_start maxEntries)
   persist: boolean; // stream finished entries to the server's on-disk sink
   persistBodies: boolean; // include response bodies in the persisted stream
@@ -830,6 +1206,7 @@ interface Session {
   interceptOn: boolean; // CDP Fetch interception active
   interceptRules: InterceptRule[]; // auto-apply rules for paused requests
   paused: Map<string, PausedEntry>; // requestId -> request/response held for the agent to resolve
+  pausedAutoContinued?: number; // requests released by the TTL sweep rather than by the agent
   logOn: boolean; // console/log capture active
   logs: LogEntry[];
 }
@@ -948,6 +1325,9 @@ function idleSweep() {
     // session bumps lastUsedAt only on tool calls, so it would otherwise be torn down (banner
     // gone, buffer lost) after 5 min of no calls. One-shot debugger use (trusted click, deep
     // snapshot, screenshot) leaves these flags off, so its banner still auto-cleans.
+    // Release paused requests the agent has abandoned FIRST, so a forgotten intercept can't hold the
+    // tab (and the banner) open forever via the paused.size check below.
+    if (s.paused.size > 0) sweepPaused(tabId, s);
     if (s.netOn || s.interceptOn || s.logOn || s.paused.size > 0) continue;
     if (now - s.lastUsedAt > IDLE_DETACH_MS) void detachSession(tabId);
   }
@@ -979,6 +1359,11 @@ function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, param
   if (method === "Network.requestWillBeSent") {
     const url = params.request?.url ?? "";
     if (s.netFilter && !url.includes(s.netFilter)) return;
+    // Other installed extensions inject scripts, fonts and fetches into every page the user visits.
+    // Measured on one ordinary page load: 69 captured requests, 3 of them the user's - the rest were
+    // Acrobat/Pocket/etc bundles and base64 font blobs. With persistBodies on, that noise dominates
+    // the capture file. Excluded at the source so it never reaches the ring, the JSONL, or a HAR.
+    if (s.excludeExtensionTraffic && !/^https?:/i.test(url)) return;
     // Evict the oldest ring entry AND its side data together, or s.extra grows unbounded past the
     // ring cap and eventually OOM-kills the MV3 service worker (silently ending a long capture).
     if (s.net.length >= s.netMax) {
@@ -1111,6 +1496,10 @@ function captureNetRow(s: Session, e: NetEntry): any {
   const row: any = {
     kind: "net",
     requestId: e.requestId,
+    // Request-start wall clock. It was omitted even though NetEntry carries it, which is why
+    // export_har had to stamp every entry with the export time - and why watch mode could not order
+    // requests against page events without it.
+    ts: e.ts,
     method: e.method,
     url: e.url,
     type: e.type,
@@ -1137,13 +1526,7 @@ function flushCapture(s: Session, tabId: number, done = false) {
   }
   const entries = s.flushQueue;
   s.flushQueue = [];
-  if ((entries.length || done) && ws && ws.readyState === WebSocket.OPEN) {
-    try {
-      ws.send(JSON.stringify({ type: "capture", tabId, entries, done }));
-    } catch {
-      /* socket write failed - entries dropped (best-effort durability) */
-    }
-  }
+  if (entries.length || done) shipOrQueue({ type: "capture", tabId, entries, done });
 }
 // Flush the remaining queue and tell the server to close the sink; call before a persist session
 // is torn down (detach / tab removed). Idempotent: no-op once persist is cleared.
@@ -1180,13 +1563,7 @@ function flushRecord(rec: RecState, tabId: number, done = false) {
   }
   const entries = rec.queue;
   rec.queue = [];
-  if ((entries.length || done) && ws && ws.readyState === WebSocket.OPEN) {
-    try {
-      ws.send(JSON.stringify({ type: "capture", stream: "session", tabId, entries, done }));
-    } catch {
-      /* socket write failed - best-effort */
-    }
-  }
+  if (entries.length || done) shipOrQueue({ type: "capture", stream: "session", tabId, entries, done });
 }
 // Inject + start the recorder in ONE frame, bounded by a timeout. A single allFrames:true
 // executeScript blocks on a wedged cross-origin child (ad/embed that never settles) and can hang the
@@ -1495,6 +1872,30 @@ function onFetchPaused(s: Session, tabId: number, params: any) {
     return;
   }
   s.paused.set(params.requestId, entry);
+  sweepPaused(tabId, s);
+}
+
+// Bound the paused-request map. It was the one uncapped structure left: an agent that starts an
+// intercept and never resolves a request leaves the page's fetch hanging FOREVER (the tab just spins)
+// and pins the debugger banner, because idleSweep skips any tab with paused.size > 0. Eviction must
+// actually continue the request - silently forgetting it is what hangs the page.
+const PAUSED_MAX = 200;
+const PAUSED_TTL_MS = 60_000;
+
+function sweepPaused(tabId: number, s: Session): number {
+  const now = Date.now();
+  let freed = 0;
+  for (const [id, e] of [...s.paused]) {
+    const expired = now - e.ts > PAUSED_TTL_MS;
+    if (!expired && s.paused.size <= PAUSED_MAX) break; // insertion-ordered: the rest are newer
+    s.paused.delete(id);
+    freed++;
+    void cmd(tabId, e.stage === "Response" ? "Fetch.continueResponse" : "Fetch.continueRequest", { requestId: id }).catch(
+      () => {}
+    );
+  }
+  if (freed) s.pausedAutoContinued = (s.pausedAutoContinued ?? 0) + freed;
+  return freed;
 }
 
 // ---- console/log capture ----
@@ -2342,6 +2743,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       s.wsFrames = [];
       s.netOn = true;
       s.netFilter = params.urlFilter || undefined;
+      s.excludeExtensionTraffic = !!params.excludeExtensionTraffic;
       s.netMax = Math.max(1, Math.min(params.maxEntries ?? NET_MAX_ENTRIES, 5000));
       if (s.flushTimer) {
         clearTimeout(s.flushTimer);
@@ -2367,6 +2769,7 @@ async function dispatch(method: string, params: any): Promise<any> {
         const x = s.extra.get(e.requestId);
         const row: any = {
           requestId: e.requestId,
+          ts: e.ts, // request-start wall clock; export_har needs it for a real waterfall
           method: e.method,
           url: e.url,
           type: e.type,
@@ -2550,9 +2953,10 @@ async function dispatch(method: string, params: any): Promise<any> {
     case "debugger_status": {
       if (params.tabId !== undefined) {
         const s = sessions.get(params.tabId);
+        const detach = lastDetach.get(params.tabId);
         return s
           ? { tabId: params.tabId, attached: true, capturing: s.netOn, bufferedRequests: s.net.length, deepRefs: s.refNodes.size, idleMs: Date.now() - s.lastUsedAt }
-          : { tabId: params.tabId, attached: false };
+          : { tabId: params.tabId, attached: false, lastDetach: detach };
       }
       return {
         sessions: [...sessions.entries()].map(([tabId, s]) => ({
@@ -2561,6 +2965,9 @@ async function dispatch(method: string, params: any): Promise<any> {
           bufferedRequests: s.net.length,
           idleMs: Date.now() - s.lastUsedAt,
         })),
+        // Why a capture stopped, when it stopped on its own. "canceled_by_user" = the human dismissed
+        // the debugging banner; "replaced_with_devtools" = they opened DevTools on that tab.
+        lastDetach: [...lastDetach.entries()].map(([tabId, d]) => ({ tabId, ...d })),
       };
     }
 
@@ -2973,6 +3380,136 @@ async function dispatch(method: string, params: any): Promise<any> {
       return { stopped: true, tabId, wasRecording: !!rec };
     }
 
+    // Ground truth for session_record_status. The server can answer from its own sink bookkeeping,
+    // but that happily reports a recording that is dead in the browser (e.g. after an SW eviction).
+    case "session_record_status": {
+      const out: any[] = [];
+      for (const [tabId, rec] of sessionRecordings) {
+        let alive: boolean | null = null;
+        let url: string | undefined;
+        try {
+          const tab = await chrome.tabs.get(tabId);
+          url = tab.url;
+          const [res] = await chrome.scripting.executeScript({
+            target: { tabId },
+            func: () => !!(window as any).__bbRec?.recording,
+          });
+          alive = !!res?.result;
+        } catch {
+          alive = null; // tab gone or not scriptable
+        }
+        out.push({ tabId, url, allFrames: rec.allFrames, queued: rec.queue.length, recorderAlive: alive });
+      }
+      return { recordings: out };
+    }
+
+    // ---- watch mode ----
+    case "watch_start": {
+      await ready();
+      const tab = await targetTab(params.tabId);
+      assertScriptable(tab);
+      const tabId = tab.id!;
+      const existing = watchForTab(tabId);
+      if (existing) {
+        // Re-arm on resume. Returning early without injecting means a tab whose listener went dormant
+        // (extension reloaded, or the page loaded before this group existed) stays dormant forever,
+        // and watch_start reports success while capturing nothing.
+        await injectWatchNow(tabId, existing.consoleMode);
+        return {
+          watching: true,
+          watchId: existing.watchId,
+          tabId,
+          url: tab.url,
+          resumed: true,
+          inject: lastInject.get(tabId),
+        };
+      }
+
+      const watchId = `w${Date.now().toString(36)}`;
+      const group: WatchGroup = {
+        watchId,
+        rootTabId: tabId,
+        consoleMode: params.console === "calls" ? "calls" : params.console === false ? "off" : "passive",
+        startedAt: Date.now(),
+        tabs: new Map([[tabId, { tabId, addedAt: Date.now() }]]),
+      };
+      watchGroups.set(watchId, group);
+      tabToWatch.set(tabId, watchId);
+      await registerWatchScripts(group.consoleMode !== "off");
+      await injectWatchNow(tabId, group.consoleMode);
+      await persistWatch();
+      return { watching: true, watchId, tabId, url: tab.url, inject: lastInject.get(tabId) };
+    }
+
+    case "watch_stop": {
+      await ready();
+      const ids: string[] = params.watchId ? [params.watchId] : [...watchGroups.keys()];
+      const stopped: string[] = [];
+      for (const id of ids) {
+        const g = watchGroups.get(id);
+        if (!g) continue;
+        for (const tabId of g.tabs.keys()) {
+          tabToWatch.delete(tabId);
+          // Tell any live page to stop buffering. Best-effort: a closed tab needs no telling.
+          chrome.scripting
+            .executeScript({ target: { tabId, allFrames: true }, func: () => (window as any).__bbWatch?.arm(false) })
+            .catch(() => undefined);
+        }
+        watchGroups.delete(id);
+        stopped.push(id);
+      }
+      if (!watchGroups.size) await unregisterWatchScripts();
+      await persistWatch();
+      return { stopped, remaining: watchGroups.size };
+    }
+
+    case "watch_status": {
+      await ready();
+      const groups: any[] = [];
+      for (const g of watchGroups.values()) {
+        const tabs: any[] = [];
+        for (const tabId of g.tabs.keys()) {
+          let armed: any = null;
+          let url: string | undefined;
+          let title: string | undefined;
+          try {
+            const tab = await chrome.tabs.get(tabId);
+            url = tab.url;
+            title = tab.title;
+            const [res] = await chrome.scripting.executeScript({
+              target: { tabId },
+              func: () => (window as any).__bbWatch?.status?.() ?? null,
+            });
+            armed = res?.result ?? null;
+          } catch {
+            armed = null; // gone, or a page content scripts cannot run on
+          }
+          tabs.push({
+            tabId,
+            url,
+            title,
+            listener: armed,
+            unscriptable: url ? RESTRICTED.test(url) : undefined,
+            inject: lastInject.get(tabId),
+          });
+        }
+        groups.push({ watchId: g.watchId, rootTabId: g.rootTabId, consoleMode: g.consoleMode, startedAt: g.startedAt, tabs });
+      }
+      let registered: string[] = [];
+      try {
+        registered = (await chrome.scripting.getRegisteredContentScripts()).map((s) => s.id);
+      } catch {
+        /* ignore */
+      }
+      return {
+        groups,
+        registeredScripts: registered,
+        sw: { startedAt: swStartedAt, uptimeMs: Date.now() - swStartedAt },
+        outbox: { envelopes: outbox.length, bytes: outboxBytes, dropped: outboxDropped },
+        wsConnected: !!ws && ws.readyState === WebSocket.OPEN,
+      };
+    }
+
     default:
       throw new Error(`Unknown method: ${method}`);
   }
@@ -2997,20 +3534,114 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 // Debugger listeners must be registered synchronously at top level (MV3).
 chrome.debugger.onEvent.addListener(onDebuggerEvent);
-chrome.debugger.onDetach.addListener((source) => {
-  if (source.tabId != null) {
-    finalizeCapture(source.tabId); // flush + close the sink (user closed banner / DevTools opened / tab gone)
-    sessions.delete(source.tabId);
-  }
+// The `reason` argument was previously discarded, so a user dismissing the "being debugged" banner
+// killed the capture silently - the next net_get_requests just threw "Not capturing". Now it is
+// recorded and surfaced through debugger_status / watch_status.
+chrome.debugger.onDetach.addListener((source, reason) => {
+  if (source.tabId == null) return;
+  lastDetach.set(source.tabId, { reason: String(reason ?? "unknown"), at: Date.now() });
+  finalizeCapture(source.tabId); // flush + close the sink (user closed banner / DevTools opened / tab gone)
+  sessions.delete(source.tabId);
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
   finalizeCapture(tabId);
   sessions.delete(tabId);
   const rec = sessionRecordings.get(tabId);
   if (rec) {
-    flushRecord(rec, tabId, true); // flush + close the session sink (final `done`)
     sessionRecordings.delete(tabId);
+    // The recorder's final batch is relayed via sendMessage, a separate task. Closing the sink
+    // immediately (as this did) discards it. session_record_stop already allows this grace; a tab
+    // being closed is exactly when the last events matter most.
+    setTimeout(() => flushRecord(rec, tabId, true), 300);
   }
+  const g = watchForTab(tabId);
+  if (g) {
+    g.tabs.delete(tabId);
+    tabToWatch.delete(tabId);
+    shipOrQueue({ type: "watch", watchId: g.watchId, tabId, entries: [{ t: Date.now(), k: "closed" }] }, false);
+    void persistWatch();
+  }
+});
+
+// ---- watch mode: follow the human across tabs ----
+// A link opened in a new tab is a new tabId with zero state. Without this, watch mode keeps
+// confidently describing the OLD tab while the human works in the new one - silently wrong, which is
+// worse than not covering it at all. openerTabId covers target=_blank, middle-click, "open in new
+// tab" and window.open; onCreatedNavigationTarget covers the rel=noopener cases where it is absent.
+chrome.tabs.onCreated.addListener((tab) => {
+  if (tab.id == null || tab.openerTabId == null) return;
+  void ready().then(() => {
+    const g = watchForTab(tab.openerTabId!);
+    if (g) addTabToGroup(g, tab.id!, tab.openerTabId);
+  });
+});
+chrome.webNavigation.onCreatedNavigationTarget.addListener((d) => {
+  void ready().then(() => {
+    const g = watchForTab(d.sourceTabId);
+    if (g) addTabToGroup(g, d.tabId, d.sourceTabId);
+  });
+});
+// Prerender activation and some back/forward navigations swap the tabId. Without this the tab
+// silently drops out of the group mid-session.
+chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
+  void ready().then(() => {
+    const g = watchForTab(removedTabId);
+    if (!g) return;
+    const old = g.tabs.get(removedTabId);
+    g.tabs.delete(removedTabId);
+    tabToWatch.delete(removedTabId);
+    g.tabs.set(addedTabId, { tabId: addedTabId, openerTabId: old?.openerTabId, addedAt: Date.now() });
+    tabToWatch.set(addedTabId, g.watchId);
+    void persistWatch();
+  });
+});
+// Which tab the human is actually looking at - the difference between "activity across 6 tabs" and
+// "they are on the checkout page". Nearly free, and it also marks unscriptable pages as blind rather
+// than letting them look like idleness.
+chrome.tabs.onActivated.addListener((info) => {
+  void ready().then(async () => {
+    const g = watchForTab(info.tabId);
+    if (!g) return;
+    let url = "";
+    try {
+      url = (await chrome.tabs.get(info.tabId)).url ?? "";
+    } catch {
+      /* gone */
+    }
+    shipOrQueue(
+      { type: "watch", watchId: g.watchId, tabId: info.tabId, entries: [{ t: Date.now(), k: "visible", url }] },
+      false
+    );
+  });
+});
+// SPA route changes seen from the browser side, belt-and-braces with the page's own history patch
+// (which only exists when console:true registered the MAIN-world script).
+chrome.webNavigation.onCommitted.addListener((d) => {
+  if (d.frameId !== 0) return;
+  void ready().then(() => {
+    const g = watchForTab(d.tabId);
+    if (!g || g.consoleMode === "off") return;
+    // A fresh document has no shim: it is injected as an inline function, not a registered script.
+    chrome.scripting
+      .executeScript({
+        target: { tabId: d.tabId, allFrames: true },
+        func: bbWatchMainShim,
+        args: [g.consoleMode],
+        world: "MAIN",
+      } as chrome.scripting.ScriptInjection<any, any>)
+      .catch(() => undefined);
+  });
+});
+chrome.webNavigation.onHistoryStateUpdated.addListener((d) => {
+  if (d.frameId !== 0) return;
+  void ready().then(() => {
+    const g = watchForTab(d.tabId);
+    if (!g) return;
+    shipOrQueue(
+      { type: "watch", watchId: g.watchId, tabId: d.tabId, entries: [{ t: Date.now(), k: "nav", url: d.url, via: "hint" }] },
+      false
+    );
+  });
 });
 chrome.downloads.onDeterminingFilename.addListener((_item, suggest) => {
   suggest(); // accept Chrome's tentative filename; avoids an interactive save-location prompt
@@ -3038,6 +3669,40 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (rec) queueRecord(rec, tabId, msg.events || []);
     }
     return false;
+  }
+
+  // ---- watch mode: the content script asking whether this tab is in scope ----
+  if (msg?.cmd === "bb-watch-hello") {
+    const tabId = sender.tab?.id;
+    void ready().then(() => {
+      const g = tabId != null ? watchForTab(tabId) : undefined;
+      sendResponse({ ok: true, armed: !!g, watchId: g?.watchId, consoleMode: g?.consoleMode });
+    });
+    return true; // async: hydration may still be in flight right after an SW restart
+  }
+
+  // ---- watch mode: a batch of labeled page events ----
+  // The reply is the ACK the page waits for before dropping its own copy. Answering "not shipped"
+  // (rather than staying silent) is what keeps custody in the page while the socket is down.
+  if (msg?.cmd === "bb-watch") {
+    const tabId = sender.tab?.id;
+    void ready().then(() => {
+      const g = tabId != null ? watchForTab(tabId) : undefined;
+      if (!g) return sendResponse({ ok: true, shipped: false, armed: false });
+      const shipped = shipOrQueue(
+        {
+          type: "watch",
+          watchId: g.watchId,
+          tabId,
+          frameId: sender.frameId,
+          entries: msg.events || [],
+          dropped: msg.dropped || 0,
+        },
+        false // the page keeps custody until this returns true
+      );
+      sendResponse({ ok: true, shipped, armed: true });
+    });
+    return true;
   }
   return false;
 });

@@ -1,6 +1,6 @@
 {
   "name": "browser-bridge-extension",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "private": true,
   "description": "Browser Bridge MV3 Chrome extension - connects your real browser to the local Browser Bridge MCP server.",
   "license": "MIT",
