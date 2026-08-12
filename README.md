@@ -340,6 +340,8 @@ Verify: `curl -s http://127.0.0.1:8765/health` → `{"ok":true,"extensionConnect
 
 Verify: `curl -s http://127.0.0.1:8765/health` → `{"ok":true,"extensionConnected":true}`.
 
+**Which build is actually running?** `bridge_status` reports the server version and the loaded extension's build stamp. Reloading an unpacked extension gives no feedback, and a stale bundle is indistinguishable from a code bug - if the stamp predates your last `npm run build`, reload at `chrome://extensions`. Likewise, if a rebuilt server seems to have no effect, check that only one instance is running: `launchctl list | grep browser-bridge` (macOS) should show exactly one job, and `lsof -nP -iTCP:8765 -sTCP:LISTEN` exactly one listener. A second, older service that loses the port race will keep serving stale code while restarts appear to succeed - `npm run uninstall-service && npm run install-service` resolves it.
+
 > Reloading the extension after an update may prompt for new permissions (e.g. `webNavigation`, `debugger`, `downloads`) - re-enable it if Chrome disables it.
 
 ### 4 · Connect your agent
