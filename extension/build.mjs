@@ -41,3 +41,19 @@ await build({
   legalComments: "none",
 });
 console.log("built vendor/rrweb-record.js");
+
+// Watch-mode content scripts — standalone IIFEs registered via chrome.scripting.registerContentScripts
+// by watch_start (not injected per-navigation), so they must not import anything from the SW bundle.
+// bb-watch.js runs in the ISOLATED world (it needs chrome.runtime); bb-watch-main.js runs in the MAIN
+// world (it patches the page's own console and history).
+for (const name of ["watch-entry", "watch-main"]) {
+  await build({
+    entryPoints: [join(dir, `src/${name}.ts`)],
+    bundle: true,
+    format: "iife",
+    outfile: join(dir, `vendor/bb-${name.replace("-entry", "")}.js`),
+    target: "chrome116",
+    legalComments: "none",
+  });
+  console.log(`built vendor/bb-${name.replace("-entry", "")}.js`);
+}

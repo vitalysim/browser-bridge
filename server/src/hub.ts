@@ -16,9 +16,27 @@ interface Pending {
  * Holds the single WebSocket connection from the Chrome extension and
  * correlates request/response messages by id.
  */
+/** A streamed capture batch: rrweb events, net rows, or watch-mode page events. */
+export interface StreamMsg {
+  type: "capture" | "watch";
+  stream?: "session";
+  watchId?: string;
+  tabId: number;
+  frameId?: number;
+  entries: any[];
+  done?: boolean;
+}
+export type StreamTap = (msg: StreamMsg, receivedAt: number) => void;
+
 export class ExtensionHub {
   private ws: WebSocket | null = null;
   private pending = new Map<string, Pending>();
+  // Consumers of the raw inbound stream (watch mode). Taps run BEFORE sink routing and independently
+  // of it: watch has no CaptureSink, so anything downstream of the `if (!sink) return` guard in
+  // onCapture would never see an event.
+  private taps = new Set<StreamTap>();
+  private connWatchers = new Set<(connected: boolean) => void>();
+  private helloWatchers = new Set<(hello: any) => void>();
   // Active on-disk capture sinks (persist:true captures), keyed by the tab being captured.
   private captureSinks = new Map<number, CaptureSink>();
   // Active session-recording sinks (rrweb events), keyed by tab. Separate map + a stream:"session"
@@ -62,6 +80,7 @@ export class ExtensionHub {
     }
     this.ws = ws;
     console.error(`[hub] extension connected (${req.headers.origin})`);
+    this.notifyConn(true);
 
     ws.on("message", (data) => {
       let msg: any;
@@ -76,12 +95,26 @@ export class ExtensionHub {
       }
       if (msg.type === "hello") {
         console.error(`[hub] extension hello: v${msg.version}`);
+        // The extension re-announces its live watch state on every connect, so a server restart or a
+        // service-worker respawn is recoverable without the agent doing anything.
+        for (const w of this.helloWatchers) {
+          try {
+            w(msg);
+          } catch {
+            /* a watcher must never break the connection */
+          }
+        }
         return;
       }
       // Unsolicited streamed capture entries (persist captures) - routed to the tab's on-disk sink.
       // Handled before the id-correlation path; capture messages carry no `id`.
       if (msg.type === "capture") {
         this.onCapture(msg);
+        return;
+      }
+      // Watch-mode page events. No sink, no disk - straight to the taps.
+      if (msg.type === "watch") {
+        this.emitTaps(msg);
         return;
       }
       const p = this.pending.get(msg.id);
@@ -109,6 +142,7 @@ export class ExtensionHub {
       if (this.ws === ws) {
         this.ws = null;
         console.error("[hub] extension disconnected");
+        this.notifyConn(false);
         for (const sink of this.captureSinks.values()) sink.close();
         this.captureSinks.clear();
         for (const sink of this.sessionSinks.values()) sink.close();
@@ -120,6 +154,47 @@ export class ExtensionHub {
 
   get connected(): boolean {
     return this.ws?.readyState === WebSocket.OPEN;
+  }
+
+  // ---- stream taps + connection lifecycle (watch mode) ----
+
+  registerTap(fn: StreamTap): () => void {
+    this.taps.add(fn);
+    return () => {
+      this.taps.delete(fn);
+    };
+  }
+  onConnectionChange(fn: (connected: boolean) => void): () => void {
+    this.connWatchers.add(fn);
+    return () => {
+      this.connWatchers.delete(fn);
+    };
+  }
+  onHello(fn: (hello: any) => void): () => void {
+    this.helloWatchers.add(fn);
+    return () => {
+      this.helloWatchers.delete(fn);
+    };
+  }
+  private emitTaps(msg: any): void {
+    if (!this.taps.size) return;
+    const now = Date.now();
+    for (const t of this.taps) {
+      try {
+        t(msg, now);
+      } catch {
+        /* a tap must never break sink routing or the socket */
+      }
+    }
+  }
+  private notifyConn(connected: boolean): void {
+    for (const w of this.connWatchers) {
+      try {
+        w(connected);
+      } catch {
+        /* ignore */
+      }
+    }
   }
 
   // ---- on-disk capture sinks (persist:true captures) ----
@@ -189,6 +264,9 @@ export class ExtensionHub {
 
   // Route a streamed {type:"capture", stream?, tabId, entries, done} message to the right sink.
   private onCapture(msg: any): void {
+    // Taps first, and unconditionally: watch mode registers no sink, so anything after the `if
+    // (!sink) return` below would never reach it.
+    this.emitTaps(msg);
     const tabId = msg.tabId;
     const sinks = msg.stream === "session" ? this.sessionSinks : this.captureSinks;
     const sink = sinks.get(tabId);

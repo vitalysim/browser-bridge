@@ -9,8 +9,24 @@ import { spawn } from "child_process";
 import { CALL_TIMEOUT_MS, type ExtensionHub } from "./hub.js";
 import { CaptureSink } from "./capture-sink.js";
 import { inlineAssets } from "./rrweb-inline.js";
+import {
+  DEFAULT_INCLUDE,
+  defaultWatchOpts,
+  renderActions,
+  watchRegistry,
+  type Action,
+  type ActionKind,
+  type WatchSession,
+} from "./watch.js";
 
 const MAX_TEXT_CHARS = 60_000;
+
+// watch_read budgets itself well under MAX_TEXT_CHARS and stops at an action boundary. textResult
+// truncates with a blind slice and returns no cursor, which would corrupt a paging stream.
+const WATCH_CHAR_BUDGET = 40_000;
+// After the first matching action, wait this long for the rest of the burst so a flurry of activity
+// returns as one batch instead of one action per round trip.
+const WATCH_SETTLE_MS = 300;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const MAX_BATCH_ACTIONS = 50;
@@ -32,6 +48,7 @@ const DEEP_SCRIPT_CONCURRENCY = 6;
 //   fuzz, authz_matrix, replay_request, analyze - issue outbound requests to a target
 //   download_resource, file_upload, paste_image, save_page, export_har - cross the disk boundary
 //   playbook_* , session_record_*, render_recording_video - persist artifacts
+//   watch_start / watch_stop        - register content scripts, may attach the debugger, write artifacts
 //   input, cdp_eval, tab_close, console_start/stop, net_capture_start, debugger_detach
 //                                   - attach/detach the debugger or close tabs (visible side effects)
 const BATCHABLE_TOOLS = new Set([
@@ -74,10 +91,75 @@ const BATCHABLE_TOOLS = new Set([
   "net_get_ws_frames",
   "console_get",
   "intercept_pending",
+  // watch_read is the same shape of read: a server-local buffer downstream of watch_start, which is
+  // itself not batchable. Its waitMs is forced to 0 inside a batch so it can never stall the sequence.
+  "watch_read",
+  "watch_status",
 ]);
 
 // Expand a leading ~/ to the home dir (Node fs doesn't do it). For playbook/record paths.
 const expandHome = (p: string) => (p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
+
+// Watch cursors are "<watchId>.<epoch>:<seq>" and opaque to the caller. The epoch identifies the
+// server-side INCARNATION: the extension keeps its watch group across a server restart, so the
+// watchId alone is stable while the seq counter restarts at 0 - and a pre-restart cursor would then
+// be accepted as current and silently point past the head (0 actions, dropped:0, while the human is
+// actively browsing). The epoch makes that stale cursor detectable instead.
+function parseCursor(cursor?: string): { watchId: string | null; epoch: string | null; seq: number } {
+  if (!cursor) return { watchId: null, epoch: null, seq: 0 };
+  const i = cursor.lastIndexOf(":");
+  if (i < 0) return { watchId: null, epoch: null, seq: Number(cursor) || 0 };
+  const head = cursor.slice(0, i);
+  const seq = Number(cursor.slice(i + 1)) || 0;
+  const dot = head.lastIndexOf(".");
+  if (dot < 0) return { watchId: head || null, epoch: null, seq };
+  return { watchId: head.slice(0, dot) || null, epoch: head.slice(dot + 1) || null, seq };
+}
+
+/** True when the cursor came from a different watch, or from a previous incarnation of this one. */
+function cursorIsStale(c: { watchId: string | null; epoch: string | null }, s: { watchId: string; epoch: string }) {
+  if (!c.watchId) return false;
+  return c.watchId !== s.watchId || c.epoch !== s.epoch;
+}
+
+const multiTab = (actions: Action[]) => new Set(actions.map((a) => a.tabId)).size > 1;
+
+/**
+ * Attach a durable network capture to one tab of a watch.
+ *
+ * One file per tab (`<base>.net.<tabId>.jsonl`) because CaptureSink is keyed by tab and a tab's
+ * capture is torn down independently. `persistBodies` fetches each response body eagerly at
+ * load-finish, which is the only way to keep it: Chrome evicts a body once its document is replaced,
+ * so an on-demand net_get_body after a navigation returns "No resource with given identifier found".
+ *
+ * Exported because index.ts calls it when a NEW tab joins a network-enabled watch.
+ */
+export async function startWatchNetCapture(hub: ExtensionHub, session: WatchSession, tabId: number): Promise<string | null> {
+  const cfg = session.netCapture;
+  if (!cfg || session.netTabs.has(tabId)) return null;
+  session.netTabs.add(tabId); // claim it first: a burst of events must not race two attaches
+  const path = `${cfg.basePath}.net.${tabId}.jsonl`;
+  if (hub.captureSinkPathInUse(path)) return path;
+  mkdirSync(dirname(path), { recursive: true });
+  const sink = new CaptureSink(path);
+  try {
+    const r = await hub.call("net_capture_start", {
+      tabId,
+      persist: true,
+      persistBodies: cfg.bodies,
+      maxEntries: cfg.maxEntries,
+      // A watch timeline is about the human's browsing, so other extensions' traffic is pure noise.
+      excludeExtensionTraffic: true,
+    });
+    if (r?.tabId == null) throw new Error("extension did not return the captured tabId");
+    hub.registerCaptureSink(r.tabId, sink);
+    return path;
+  } catch (e) {
+    sink.close();
+    session.netTabs.delete(tabId);
+    throw e;
+  }
+}
 
 // Parse pixel dimensions from a PNG or JPEG buffer (header only).
 function imageDims(buf: Buffer): { width: number; height: number } | null {
@@ -141,16 +223,18 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
   // bypasses the SDK's own zod validation, so batch must re-validate each item itself.
   const registry = new Map<string, { schema: z.ZodRawShape; handler: (args: any) => Promise<any> }>();
 
+  // `extra` carries the SDK's per-request context, notably an AbortSignal. Only watch_read uses it
+  // (to end a long poll when the client cancels); every other handler ignores the second argument.
   const tool = (
     name: string,
     description: string,
     inputSchema: z.ZodRawShape,
-    handler: (args: any) => Promise<any>
+    handler: (args: any, extra?: any) => Promise<any>
   ) => {
     registry.set(name, { schema: inputSchema, handler });
-    server.registerTool(name, { description, inputSchema }, async (args: any) => {
+    server.registerTool(name, { description, inputSchema }, async (args: any, extra: any) => {
       try {
-        return await handler(args);
+        return await handler(args, extra);
       } catch (err) {
         return errorResult(err);
       }
@@ -597,21 +681,25 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       "what was captured before that. persistBodies:true also writes response bodies (heavier).",
     {
       urlFilter: z.string().optional().describe("Only buffer requests whose URL contains this substring"),
+      excludeExtensionTraffic: z
+        .boolean()
+        .optional()
+        .describe("Drop non-http(s) requests - i.e. traffic from your OTHER installed extensions, which inject scripts and fonts into every page and can outnumber the page's own requests 20:1. Default false (capture everything)."),
       persist: z.boolean().optional().describe("Also stream finished requests/frames to savePath as JSON Lines (durable, survives ring cap + SW crash)"),
       savePath: z.string().optional().describe("Absolute path for the persist JSONL file (required when persist:true)"),
       persistBodies: z.boolean().optional().describe("Include response bodies in the persisted stream (heavier; fetched eagerly at load-finish)"),
       maxEntries: z.number().optional().describe("In-memory ring cap for requests (default 500, max 5000)"),
       tabId: tabIdParam,
     },
-    async ({ urlFilter, persist, savePath, persistBodies, maxEntries, tabId }) => {
+    async ({ urlFilter, persist, savePath, persistBodies, maxEntries, tabId, excludeExtensionTraffic }) => {
       if (!persist) {
-        return textResult(await hub.call("net_capture_start", { urlFilter, maxEntries, tabId }));
+        return textResult(await hub.call("net_capture_start", { urlFilter, maxEntries, tabId, excludeExtensionTraffic }));
       }
       if (!savePath) throw new Error("persist:true requires savePath");
       if (hub.captureSinkPathInUse(savePath)) throw new Error(`another active capture is already writing ${savePath}`);
       const sink = new CaptureSink(savePath); // opens the file now → a bad path fails THIS call, not mid-stream
       try {
-        const r = await hub.call("net_capture_start", { urlFilter, persist: true, persistBodies: !!persistBodies, maxEntries, tabId });
+        const r = await hub.call("net_capture_start", { urlFilter, persist: true, persistBodies: !!persistBodies, maxEntries, tabId, excludeExtensionTraffic });
         if (r?.tabId == null) throw new Error("extension did not return the captured tabId");
         hub.registerCaptureSink(r.tabId, sink);
         return textResult({ ...r, persist: true, savePath });
@@ -1349,6 +1437,299 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     async () => textResult({ extensionConnected: hub.connected, recording: hub.recording })
   );
 
+  // ---- watch mode (the human browses; the agent reads a live semantic timeline) ----
+  // The extension's content script emits already-labeled events; watch.ts folds them. Session state
+  // is a MODULE singleton (watchRegistry), not a closure here, because registerTools runs once per
+  // MCP session - two clients (Claude Code + Codex) share one watch with independent cursors.
+
+  tool(
+    "watch_start",
+    "Start WATCH MODE: the human browses normally and every action is folded into a live, semantic " +
+      "timeline the agent can read at any moment - navigations, clicks (with the element's real label " +
+      "and a usable selector), typed text, keystrokes, form submits. Follows tabs the watched tab " +
+      "opens (target=_blank, window.open, OAuth popups). Banner-free by default. `network:true` also " +
+      "folds in requests so you get 'clicked Publish → POST /save → 302', but it attaches " +
+      "chrome.debugger and SHOWS CHROME'S DEBUGGING BANNER for the whole session. Read the timeline " +
+      "with watch_read({since}) and stop with watch_stop. Returns {watchId, cursor, tabId, banner}.",
+    {
+      tabId: tabIdParam,
+      network: z
+        .boolean()
+        .optional()
+        .describe(
+          "Also capture network traffic (default false). Attaches chrome.debugger - SHOWS THE DEBUGGING BANNER. " +
+            "Requests appear in the timeline (method/url/status/ms, attributed to the action that caused them) AND " +
+            "the FULL traffic - request+response headers, request body, response bodies - is streamed to disk, " +
+            "surviving navigation and the in-memory ring. Also attaches to tabs the watch later follows."
+        ),
+      networkBodies: z
+        .boolean()
+        .optional()
+        .describe("Capture response BODIES durably (default true when network:true). Bodies are fetched eagerly at load-finish because Chrome evicts them once the document is replaced. Set false for a lighter capture."),
+      networkSavePath: z
+        .string()
+        .optional()
+        .describe("Base path (or ~/…) for the network JSONL; one file per tab as <base>.net.<tabId>.jsonl. Default alongside the digest."),
+      console: z.boolean().optional().describe("Also fold console errors and uncaught exceptions (default false, banner-free)"),
+      redact: z
+        .enum(["auto", "all", "none"])
+        .optional()
+        .describe("auto (default): mask values in password/secret-looking fields. all: mask every typed value. none: raw cleartext."),
+      include: z
+        .array(z.enum(["nav", "click", "input", "submit", "key", "copy", "paste", "scroll", "console", "net", "tab", "gap"]))
+        .optional()
+        .describe("Action kinds to record. Default: everything except scroll (which is mostly noise)."),
+      retain: z
+        .enum(["digest", "none"])
+        .optional()
+        .describe("digest (default): also append the timeline to a JSONL on disk (~KB/hour) so it survives the in-memory ring. none: memory only."),
+      digestPath: z.string().optional().describe("Absolute path (or ~/…) for the digest JSONL; default ~/.browser-bridge/watch/watch-<ts>.jsonl"),
+      ringSize: z.number().optional().describe("In-memory action ring size (default 5000, max 50000)"),
+    },
+    async (args) => {
+      const now = Date.now();
+      const include = new Set<ActionKind>((args.include as ActionKind[]) ?? DEFAULT_INCLUDE.filter((k) => k !== "scroll"));
+      const opts = defaultWatchOpts({
+        redact: args.redact ?? "auto",
+        include,
+        network: !!args.network,
+        console: !!args.console,
+        ringCount: Math.max(100, Math.min(args.ringSize ?? 5000, 50_000)),
+      });
+
+      const r = await hub.call("watch_start", { tabId: args.tabId, console: !!args.console });
+      if (r?.tabId == null || !r?.watchId) throw new Error("extension did not return the watch id/tab");
+      // Already watching this tab (e.g. after a server restart): adopt the existing browser-side
+      // group rather than starting a second one on top of it.
+      const existing = watchRegistry.get(r.watchId);
+      if (existing && !existing.isStopped) {
+        return textResult({
+          watching: true,
+          watchId: existing.watchId,
+          tabId: r.tabId,
+          url: r.url,
+          cursor: existing.cursorAt,
+          resumed: true,
+          digestPath: existing.digestPath ?? undefined,
+        });
+      }
+
+      const session = watchRegistry.create(r.watchId, r.tabId, opts, now);
+      const defaultBase = join(
+        homedir(),
+        ".browser-bridge",
+        "watch",
+        `watch-${new Date(now).toISOString().replace(/[:.]/g, "-")}`
+      );
+
+      if ((args.retain ?? "digest") !== "none") {
+        const digestPath = expandHome(args.digestPath || `${defaultBase}.jsonl`);
+        mkdirSync(dirname(digestPath), { recursive: true });
+        const sink = new CaptureSink(digestPath); // opens now - a bad path fails THIS call, not mid-stream
+        sink.append([{ kind: "watch-header", watchId: session.watchId, startedAt: now, rootTabId: r.tabId, version }]);
+        session.setSink(sink);
+      }
+
+      // Network capture serves BOTH consumers off one stream: the hub tap folds each row into the
+      // timeline, and the CaptureSink writes the full row (headers + bodies) to disk. The tap runs
+      // before the sink lookup in hub.onCapture, so neither depends on the other.
+      let banner = false;
+      let networkPath: string | undefined;
+      if (args.network) {
+        const base = expandHome(args.networkSavePath || (session.digestPath ?? defaultBase).replace(/\.jsonl$/, ""));
+        session.netCapture = {
+          basePath: base,
+          bodies: args.networkBodies !== false,
+          // A watch runs for hours; the default 500-entry ring would evict the recent window that
+          // net_get_requests serves. The JSONL is the complete record either way.
+          maxEntries: 2000,
+        };
+        networkPath = (await startWatchNetCapture(hub, session, r.tabId)) ?? undefined;
+        banner = true;
+      }
+
+      return textResult({
+        watching: true,
+        watchId: session.watchId,
+        tabId: r.tabId,
+        url: r.url,
+        cursor: session.cursorAt,
+        banner,
+        digestPath: session.digestPath ?? undefined,
+        networkPath,
+        redact: opts.redact,
+        note: "Browse normally, then call watch_read({since: cursor}) - it returns everything new plus the next cursor.",
+      });
+    }
+  );
+
+  tool(
+    "watch_read",
+    "Read the watch-mode timeline. Pass `since` (the cursor from watch_start or the previous read) to " +
+      "get only what is new; omit it for the recent tail. Returns a compact one-line-per-action " +
+      "timeline plus {nextCursor, dropped, more, health}. `waitMs` blocks up to that long for new " +
+      "activity so you see an action the moment it happens (max 25000; forced to 0 inside " +
+      "browser_batch). `health.state` tells you whether capture is live or blind - trust it rather " +
+      "than reading silence as inactivity.",
+    {
+      since: z.string().optional().describe("Opaque cursor from a previous call. Pass it back verbatim."),
+      waitMs: z.number().optional().describe("Block up to this long (max 25000) until new matching activity arrives. 0 = return immediately (default)."),
+      limit: z.number().optional().describe("Max actions to return (default 200, max 1000)"),
+      tabId: z.number().optional().describe("Only actions from this tab"),
+      include: z
+        .array(z.enum(["nav", "click", "input", "submit", "key", "copy", "paste", "scroll", "console", "net", "tab", "gap"]))
+        .optional()
+        .describe("Only these action kinds"),
+      format: z.enum(["text", "json"]).optional().describe("text (default): compact timeline. json: structured actions."),
+      file: z.string().optional().describe("Read a saved watch digest JSONL instead of the live session"),
+      watchId: z.string().optional().describe("Which watch to read (default: the current one)"),
+    },
+    async (args, extra) => {
+      const limit = Math.max(1, Math.min(args.limit ?? 200, 1000));
+      const include = args.include ? new Set<ActionKind>(args.include as ActionKind[]) : undefined;
+
+      // Offline: fold a saved digest. Same renderer, so a retro-read looks exactly like a live one.
+      if (args.file) {
+        const path = expandHome(args.file);
+        if (!existsSync(path)) throw new Error(`watch digest not found: ${path}`);
+        const rows = readFileSync(path, "utf8")
+          .split("\n")
+          .filter((l) => l.trim())
+          .map((l) => {
+            try {
+              return JSON.parse(l);
+            } catch {
+              return null; // torn last line - the sink fsyncs per batch, so only the tail can be partial
+            }
+          })
+          .filter((r: any) => r && r.kind !== "watch-header") as Action[];
+        const sinceSeq = parseCursor(args.since).seq;
+        const picked = rows.filter(
+          (a) => a.seq > sinceSeq && (args.tabId === undefined || a.tabId === args.tabId) && (!include || include.has(a.kind))
+        );
+        const page = picked.slice(0, limit);
+        if (args.format === "json") {
+          return textResult({ file: path, actions: page, more: picked.length > page.length, total: rows.length });
+        }
+        const header = `WATCH  file  ${path}  actions=${page.length}/${rows.length}`;
+        return textResult(renderActions(page, { multiTab: multiTab(page), header }));
+      }
+
+      const session = args.watchId ? watchRegistry.get(args.watchId) : watchRegistry.sole();
+      if (!session) throw new Error("No watch session. Call watch_start first.");
+
+      const cursor = parseCursor(args.since);
+      // A cursor from a previous watch, or a previous incarnation of this one, cannot be honored -
+      // say so instead of silently pointing past the head.
+      const reset = cursorIsStale(cursor, session);
+      let sinceSeq = reset ? 0 : cursor.seq;
+      // No cursor at all: serve the recent tail rather than replaying the whole session.
+      if (!args.since) sinceSeq = Math.max(0, session.lastSeq - limit);
+
+      session.pump(Date.now());
+      const match = (a: Action) =>
+        (args.tabId === undefined || a.tabId === args.tabId) && (!include || include.has(a.kind));
+
+      let result = session.read(sinceSeq, { tabId: args.tabId, include }, limit, WATCH_CHAR_BUDGET);
+      const waitMs = Math.max(0, Math.min(args.waitMs ?? 0, 25_000));
+      if (!result.actions.length && waitMs > 0 && !session.isStopped && watchRegistry.extensionConnected) {
+        await session.wait(match, waitMs, WATCH_SETTLE_MS, extra?.signal);
+        session.pump(Date.now());
+        result = session.read(sinceSeq, { tabId: args.tabId, include }, limit, WATCH_CHAR_BUDGET);
+      }
+
+      const health = session.health(watchRegistry.extensionConnected, Date.now());
+      const nextCursor = `${session.watchId}.${session.epoch}:${Math.max(result.scannedTo, sinceSeq)}`;
+      const meta = {
+        nextCursor,
+        dropped: result.dropped,
+        more: result.more,
+        remaining: result.remaining,
+        reset: reset || undefined,
+        health,
+      };
+
+      if (args.format === "json") return textResult({ ...meta, actions: result.actions });
+
+      const parts: string[] = [];
+      if (reset) parts.push("NOTE  that cursor is from an earlier watch session (the server restarted) - serving from the start of the current one.");
+      if (result.dropped) parts.push(`NOTE  ${result.dropped} actions were evicted from the ring before this read.`);
+      const header =
+        `WATCH  ${health.state}  tabs=${health.tabs.join(",")}  actions=${result.actions.length}` +
+        `  dropped=${result.dropped}  more=${result.more}`;
+      parts.push(renderActions(result.actions, { multiTab: multiTab(result.actions), header }));
+      parts.push(JSON.stringify(meta));
+      return textResult(parts.join("\n"));
+    }
+  );
+
+  tool(
+    "watch_status",
+    "Is watch mode running, on which tabs, and is capture actually live? Returns per-watch health " +
+      "(extension connected, last-event age, ring occupancy, warnings) without any cursor or actions.",
+    {},
+    async () => {
+      const now = Date.now();
+      return textResult({
+        extensionConnected: watchRegistry.extensionConnected,
+        watches: watchRegistry.list().map((s) => ({
+          watchId: s.watchId,
+          rootTabId: s.rootTabId,
+          tabs: [...s.tabs],
+          startedAt: new Date(s.startedAt).toISOString(),
+          actions: s.lastSeq,
+          digestPath: s.digestPath ?? undefined,
+          stopped: s.isStopped || undefined,
+          health: s.health(watchRegistry.extensionConnected, now),
+        })),
+      });
+    }
+  );
+
+  tool(
+    "watch_stop",
+    "Stop watch mode: unregisters the content scripts, flushes any pending typing burst into the " +
+      "timeline, and closes the digest file. The timeline stays readable afterwards via " +
+      "watch_read({file: digestPath}). Returns {stopped, watchId, actions, digestPath}.",
+    {
+      watchId: z.string().optional().describe("Which watch to stop (default: the current one)"),
+    },
+    async (args) => {
+      const session = args.watchId ? watchRegistry.get(args.watchId) : watchRegistry.sole();
+      if (!session) throw new Error("No watch session is running.");
+      const tabs = [...session.tabs];
+      let extensionError: string | undefined;
+      try {
+        await hub.call("watch_stop", { tabIds: tabs });
+      } catch (e) {
+        // The browser side may already be gone (tab closed, extension reloaded). The digest is still
+        // ours to finish, so report the failure rather than losing the timeline to it.
+        extensionError = e instanceof Error ? e.message : String(e);
+      }
+      // Detach every tab that got a network capture (the root plus any followed tabs), and close
+      // its sink so the JSONL is complete on disk rather than truncated at the last flush.
+      for (const tabId of session.netTabs) {
+        try {
+          await hub.call("debugger_detach", { tabId });
+        } catch {
+          /* tab gone or already detached */
+        }
+        hub.closeCaptureSink(tabId);
+      }
+      session.stop(Date.now());
+      const digestPath = session.digestPath;
+      watchRegistry.remove(session.watchId);
+      return textResult({
+        stopped: true,
+        watchId: session.watchId,
+        tabs,
+        actions: session.lastSeq,
+        digestPath: digestPath ?? undefined,
+        extensionError,
+      });
+    }
+  );
+
   // ---- batch (registered LAST: it reads `registry`, which every tool() call above populates) ----
   tool(
     "browser_batch",
@@ -1394,6 +1775,10 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         } catch (err) {
           return fail(`Invalid input for '${name}': ${err instanceof Error ? err.message : String(err)}`);
         }
+
+        // watch_read can block for up to 25s waiting for the human to do something. Inside a batch
+        // that would stall every remaining action behind it, so a batched read always returns now.
+        if (name === "watch_read") args.waitMs = 0;
 
         let out: any;
         try {
@@ -1620,7 +2005,10 @@ function harEntry(r: any, nowIso: string): any {
   const reqHeaders = r.requestHeaders || {};
   const ct = hget(reqHeaders, "content-type") || "application/octet-stream";
   const entry: any = {
-    startedDateTime: nowIso,
+    // Real request-start time when the capture row carries one (it now does - background.ts
+    // captureNetRow). Falling back to the export time is what every entry used to get, which made an
+    // imported HAR's waterfall meaningless.
+    startedDateTime: typeof r.ts === "number" ? new Date(r.ts).toISOString() : nowIso,
     time: 0,
     request: {
       method: r.method || "GET",

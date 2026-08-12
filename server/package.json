@@ -10,6 +10,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
+    "test": "node --import tsx --test test/*.test.ts",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "install-service": "node ../scripts/install-service.mjs",
@@ -28,7 +29,5 @@
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
   },
-  "overrides": {
-    "@hono/node-server": ">=2.0.5"
-  }
+  "overrides": { "@hono/node-server": ">=2.0.5" }
 }

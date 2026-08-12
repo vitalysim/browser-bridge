@@ -5,3 +5,5 @@ extension/options.js
 *.log
 .DS_Store
 extension/vendor/rrweb-record.js
+extension/vendor/bb-watch.js
+extension/vendor/bb-watch-main.js
