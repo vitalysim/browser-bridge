@@ -12,6 +12,7 @@ import { inlineAssets } from "./rrweb-inline.js";
 import { classifyError, truncateForText } from "./result.js";
 import { versionSkewWarning } from "./version.js";
 import { buildHar, parseSessionEventsStream } from "./capture-format.js";
+import { renderAxSnapshot, type AxSnapshot } from "./ax.js";
 import {
   DEFAULT_INCLUDE,
   defaultWatchOpts,
@@ -78,6 +79,7 @@ const BATCHABLE_TOOLS = new Set([
   "wait_for",
   // page reads
   "snapshot",
+  "ax_snapshot",
   "get_page_text",
   "screenshot",
   "eval_js",
@@ -1890,6 +1892,22 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       const row = findWatchNetRow(session, requestId);
       if (!row) throw new Error(`Request ${requestId} was not found in the watch network capture (it may not have finished, or its body was excluded).`);
       return textResult(row);
+    }
+  );
+
+  tool(
+    "ax_snapshot",
+    "Compact accessibility tree of the page (role + name + states like checked/expanded/level, " +
+      "indented YAML-like, incl. iframes and open shadow DOM). Interactive nodes carry a [ref=N] " +
+      "usable with click/fill/hover/type. Prefer over snapshot for understanding page STRUCTURE and " +
+      "forms; interactiveOnly:true trims to actionable nodes only. See docs/AX-SNAPSHOT.md.",
+    {
+      tabId: tabIdParam,
+      interactiveOnly: z.boolean().optional().describe("Keep only interactive nodes and the containers leading to them"),
+    },
+    async ({ tabId, interactiveOnly }) => {
+      const snap = (await hub.call("ax_snapshot", { tabId })) as AxSnapshot;
+      return textResult(renderAxSnapshot(snap, { interactiveOnly }));
     }
   );
 
