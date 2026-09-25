@@ -1387,6 +1387,10 @@ async function persistRecordings(): Promise<void> {
       allFrames: r.allFrames,
       maskInputs: r.maskInputs,
       recordCanvas: r.recordCanvas,
+      canvasFps: r.canvasFps ?? null,
+      canvasQuality: r.canvasQuality ?? null,
+      canvasMaxDim: r.canvasMaxDim ?? null,
+      canvasBudgetBytes: r.canvasBudgetBytes ?? null,
     }));
     await chrome.storage.session.set({ [RECORDINGS_KEY]: rows });
   } catch {
@@ -1410,6 +1414,11 @@ async function restoreRecordings(): Promise<void> {
         allFrames: !!row.allFrames,
         maskInputs: !!row.maskInputs,
         recordCanvas: !!row.recordCanvas,
+        // Preserve the original capture settings so post-eviction re-injection isn't silently downgraded to defaults.
+        canvasFps: row.canvasFps ?? undefined,
+        canvasQuality: row.canvasQuality ?? undefined,
+        canvasMaxDim: row.canvasMaxDim ?? undefined,
+        canvasBudgetBytes: row.canvasBudgetBytes ?? undefined,
       });
     }
   } catch {

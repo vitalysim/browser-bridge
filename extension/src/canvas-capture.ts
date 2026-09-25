@@ -199,11 +199,15 @@ function collectCanvases(root: Document | ShadowRoot, out: HTMLCanvasElement[], 
   if (depth > 8 || out.length > 256) return;
   const all = root.querySelectorAll("*");
   for (const el of Array.from(all)) {
-    if (el instanceof HTMLCanvasElement) out.push(el);
-    else if (el instanceof HTMLIFrameElement) {
+    // Identify by tagName, not instanceof: a same-origin child frame's nodes derive from THAT frame's
+    // realm, so `instanceof HTMLCanvasElement` (this frame's constructor) is false across the boundary
+    // and every iframe canvas would be skipped. bbSnapshot uses nodeName elsewhere for the same reason.
+    const tag = el.tagName;
+    if (tag === "CANVAS") out.push(el as HTMLCanvasElement);
+    else if (tag === "IFRAME") {
       let doc: Document | null = null;
       try {
-        doc = el.contentDocument; // null / throws for cross-origin - that frame runs its own recorder
+        doc = (el as HTMLIFrameElement).contentDocument; // null / throws for cross-origin - that frame runs its own recorder
       } catch {
         doc = null;
       }

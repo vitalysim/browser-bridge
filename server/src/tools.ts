@@ -40,7 +40,10 @@ const MAX_BATCH_ACTIONS = 50;
 // these calls' windows is labeled [agent], so the agent's own clicks/fills are told apart from the
 // human's. The window runs from just before the call to a short tail after it, covering the folded
 // click/input and the reorder hold (see WatchSession.reorderMs).
-const AGENT_ACTION_TOOLS = new Set(["click", "fill", "type", "press_key", "navigate", "scroll", "hover"]);
+const AGENT_ACTION_TOOLS = new Set([
+  "click", "fill", "type", "press_key", "navigate", "scroll", "hover",
+  "go_back", "go_forward", "input", "file_upload", "paste_image",
+]);
 const AGENT_ACTION_SLACK_MS = 1500;
 
 // Parallel same-origin script fetches for `analyze deep:true`. Bounded on purpose - see the call site.
@@ -183,7 +186,7 @@ export async function startWatchNetCapture(hub: ExtensionHub, session: WatchSess
  * watch_detail can drill into a timeline `net` line without starting a separate capture. Scans the
  * files for the tabs the watch attached to; returns the matching row or null.
  */
-function findWatchNetRow(session: WatchSession, requestId: string): any | null {
+export function findWatchNetRow(session: WatchSession, requestId: string): any | null {
   const cfg = session.netCapture;
   if (!cfg) return null;
   for (const tabId of session.netTabs) {

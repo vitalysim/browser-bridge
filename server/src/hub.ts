@@ -180,7 +180,13 @@ export class ExtensionHub {
         this.notifyConn(false);
         for (const sink of this.captureSinks.values()) sink.close();
         this.captureSinks.clear();
-        for (const sink of this.sessionSinks.values()) sink.close();
+        // Hand still-open session sinks to closedSessionSinks (as onCapture does on `done`) BEFORE
+        // clearing, so a session_record_stop racing this close still awaits their drain instead of
+        // reading a half-flushed events file. close() only chains the fd-close; drain() awaits it.
+        for (const [tabId, sink] of this.sessionSinks) {
+          sink.close();
+          this.closedSessionSinks.set(tabId, sink);
+        }
         this.sessionSinks.clear();
         // Wake any session_record_stop waiting on a streamed `done` that will now never come, so it
         // falls through to drain whatever was buffered instead of blocking out its full timeout.
