@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Canvas capture fixture</title>
+<style>
+  body { margin: 0; background: #0b0b0c; color: #ededee; font: 14px ui-monospace, Menlo, monospace; }
+  h1 { font-size: 15px; letter-spacing: .04em; padding: 14px 16px; margin: 0; border-bottom: 1px solid #222; }
+  .grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 16px; padding: 16px; }
+  figure { margin: 0; }
+  figcaption { color: #9a9aa2; margin-bottom: 8px; }
+  canvas { width: 240px; height: 180px; background: #000; border: 1px solid #2a2a2e; display: block; }
+  iframe { width: 260px; height: 210px; border: 1px solid #2a2a2e; }
+  p.note { color: #6c6c73; padding: 0 16px 20px; }
+</style>
+</head>
+<body>
+<h1>browser-bridge — canvas / WebGL recording fixture</h1>
+<div class="grid">
+  <figure><figcaption>2D canvas (animated)</figcaption><canvas id="c2d" width="480" height="360"></canvas></figure>
+  <figure><figcaption>WebGL canvas (preserveDrawingBuffer:false, animated)</figcaption><canvas id="cgl" width="480" height="360"></canvas></figure>
+  <figure><figcaption>same-origin iframe canvas</figcaption><iframe id="frame"></iframe></figure>
+  <figure><figcaption>open shadow DOM canvas</figcaption><div id="host"></div></figure>
+</div>
+<p class="note">Record with <code>session_record_start({ recordCanvas:true })</code>, let it animate a few seconds, then
+<code>session_record_stop</code>. All four canvases should replay their live pixels.</p>
+
+<script>
+// ---- 2D canvas: a bouncing, colour-cycling square (2D reads back anytime) ----
+(function () {
+  var cv = document.getElementById('c2d'), ctx = cv.getContext('2d');
+  var x = 40, y = 40, dx = 3.1, dy = 2.3, hue = 0;
+  (function draw() {
+    hue = (hue + 1) % 360;
+    ctx.fillStyle = '#101014'; ctx.fillRect(0, 0, cv.width, cv.height);
+    ctx.fillStyle = 'hsl(' + hue + ',80%,55%)';
+    ctx.fillRect(x, y, 90, 90);
+    x += dx; y += dy;
+    if (x < 0 || x > cv.width - 90) dx = -dx;
+    if (y < 0 || y > cv.height - 90) dy = -dy;
+    requestAnimationFrame(draw);
+  })();
+})();
+
+// ---- WebGL canvas: a full-screen animated colour (preserveDrawingBuffer defaults to false) ----
+(function () {
+  var cv = document.getElementById('cgl');
+  var gl = cv.getContext('webgl') || cv.getContext('experimental-webgl');
+  if (!gl) { cv.getContext('2d').fillText('no webgl', 10, 20); return; }
+  var t = 0;
+  (function draw() {
+    t += 0.016;
+    gl.clearColor(0.5 + 0.5 * Math.sin(t), 0.5 + 0.5 * Math.sin(t + 2), 0.5 + 0.5 * Math.sin(t + 4), 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    requestAnimationFrame(draw);
+  })();
+})();
+
+// ---- same-origin iframe with its own animated canvas ----
+(function () {
+  var f = document.getElementById('frame');
+  f.srcdoc =
+    '<!doctype html><body style="margin:0;background:#000">' +
+    '<canvas id="ic" width="240" height="190" style="width:100%;height:100%"></canvas>' +
+    '<script>(function(){var c=document.getElementById("ic"),x=c.getContext("2d"),a=0;' +
+    '(function d(){a+=0.05;x.fillStyle="#001018";x.fillRect(0,0,c.width,c.height);' +
+    'x.strokeStyle="#3ad";x.lineWidth=4;x.beginPath();' +
+    'for(var i=0;i<c.width;i++){x.lineTo(i,95+70*Math.sin(i*0.05+a));}x.stroke();' +
+    'requestAnimationFrame(d);})();})();<\/script></body>';
+})();
+
+// ---- open shadow DOM host with an animated canvas inside ----
+(function () {
+  var host = document.getElementById('host');
+  var root = host.attachShadow({ mode: 'open' });
+  var cv = document.createElement('canvas');
+  cv.width = 240; cv.height = 180; cv.style.width = '240px'; cv.style.height = '180px'; cv.style.background = '#000';
+  root.appendChild(cv);
+  var ctx = cv.getContext('2d'), a = 0;
+  (function draw() {
+    a += 0.04;
+    ctx.fillStyle = '#120018'; ctx.fillRect(0, 0, cv.width, cv.height);
+    ctx.fillStyle = '#c39bff';
+    for (var i = 0; i < 5; i++) {
+      var r = 20 + 12 * Math.sin(a + i);
+      ctx.beginPath(); ctx.arc(40 + i * 40, 90 + 30 * Math.sin(a + i), r, 0, 6.2832); ctx.fill();
+    }
+    requestAnimationFrame(draw);
+  })();
+})();
+</script>
+</body>
+</html>
