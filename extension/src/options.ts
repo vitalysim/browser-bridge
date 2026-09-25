@@ -26,8 +26,9 @@ async function load() {
 }
 
 document.getElementById("save")!.addEventListener("click", async () => {
+  // Writing token/port is enough: background's storage.onChanged listener reconnects once. Firing a
+  // separate "reconnect" message too made Save trigger two reconnects that raced each other.
   await chrome.storage.local.set({ token: tokenInput.value.trim(), port: Number(portInput.value) || 8765 });
-  chrome.runtime.sendMessage({ cmd: "reconnect" });
 });
 
 chrome.storage.onChanged.addListener((changes, area) => {
