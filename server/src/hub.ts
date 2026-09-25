@@ -51,6 +51,12 @@ export class ExtensionHub {
   // per-MCP-session tool closure) so session_record_stop can resolve the path regardless of which
   // MCP client/session issued session_record_start (start+stop need not share a session).
   private recordingPaths = new Map<number, string>();
+  // session_record_stop waits for the recorder's streamed `done` before reading the events file.
+  // A pending stop registers a one-shot resolver here (keyed by tab); onCapture fires it when the
+  // `done` batch lands. The just-closed sink is retained so the stop can still await its drain()
+  // after onCapture removed it from sessionSinks.
+  private sessionDoneWaiters = new Map<number, () => void>();
+  private closedSessionSinks = new Map<number, CaptureSink>();
 
   constructor(httpServer: HttpServer, token: string) {
     const wss = new WebSocketServer({ noServer: true });
@@ -151,6 +157,10 @@ export class ExtensionHub {
         this.captureSinks.clear();
         for (const sink of this.sessionSinks.values()) sink.close();
         this.sessionSinks.clear();
+        // Wake any session_record_stop waiting on a streamed `done` that will now never come, so it
+        // falls through to drain whatever was buffered instead of blocking out its full timeout.
+        for (const w of this.sessionDoneWaiters.values()) w();
+        this.sessionDoneWaiters.clear();
       }
     });
     ws.on("error", (err) => console.error(`[hub] ws error: ${err.message}`));
@@ -279,6 +289,49 @@ export class ExtensionHub {
     if (msg.done) {
       sink.close();
       sinks.delete(tabId);
+      if (msg.stream === "session") {
+        // Retain the closed sink so a pending session_record_stop can await its drain(), and wake it.
+        this.closedSessionSinks.set(tabId, sink);
+        const w = this.sessionDoneWaiters.get(tabId);
+        if (w) {
+          this.sessionDoneWaiters.delete(tabId);
+          w();
+        }
+      }
+    }
+  }
+
+  // Wait (bounded) for a tab's session recording to receive its streamed `done`, then drain the sink
+  // so every queued event is on disk before session_record_stop reads the file. Handles all three
+  // orderings: `done` already arrived, `done` arrives within the timeout, or it never comes (extension
+  // died mid-stop) - in which case we close+drain whatever was buffered rather than block or lose it.
+  async settleSessionSink(tabId: number, timeoutMs = 3000): Promise<void> {
+    if (tabId == null) return;
+    if (!this.sessionSinks.has(tabId)) {
+      // `done` already processed: onCapture closed the sink and chained its tail writes. Await them.
+      const closed = this.closedSessionSinks.get(tabId);
+      this.closedSessionSinks.delete(tabId);
+      if (closed) await closed.drain();
+      return;
+    }
+    // Still open: wait for onCapture to see the `done`, bounded by the timeout.
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        this.sessionDoneWaiters.delete(tabId);
+        resolve();
+      }, timeoutMs);
+      this.sessionDoneWaiters.set(tabId, () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    // Close+drain whichever handle we have (the retained closed one, or a still-open sink on timeout).
+    const sink = this.closedSessionSinks.get(tabId) ?? this.sessionSinks.get(tabId);
+    this.closedSessionSinks.delete(tabId);
+    this.sessionSinks.delete(tabId);
+    if (sink) {
+      sink.close(); // idempotent
+      await sink.drain();
     }
   }
 
