@@ -9,6 +9,7 @@ import { spawn } from "child_process";
 import { CALL_TIMEOUT_MS, type ExtensionHub } from "./hub.js";
 import { CaptureSink } from "./capture-sink.js";
 import { inlineAssets } from "./rrweb-inline.js";
+import { registerEmulateTools } from "./emulate.js";
 import {
   DEFAULT_INCLUDE,
   defaultWatchOpts,
@@ -1820,6 +1821,9 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       return textResult({ executed: results.length, total: actions.length, results });
     }
   );
+
+  // Environment emulation (device / network / locale / geolocation) - self-contained in emulate.ts.
+  registerEmulateTools(tool, hub);
 }
 
 // ---- server-side response diffing (used by authz_matrix + the response_diff tool) ----
