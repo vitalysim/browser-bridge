@@ -27,8 +27,13 @@ WATCH  live  tabs=5  actions=6  dropped=0  more=false
 |---|---|
 | `watch_start` | Begin watching. `network:true` captures traffic (**attaches `chrome.debugger` → shows Chrome's debugging banner**) — see [Network capture](#network-capture); `console:true` folds in console errors (banner-free). `redact` controls masking of typed values; `include` picks which action kinds to record; `retain:"none"` keeps it in memory only |
 | `watch_read` | Read the timeline. `since` is the cursor from the previous read — pass it back verbatim. `waitMs` (max 25000) blocks until something happens. `format:"json"` for structured actions. `file` reads a saved digest instead of the live session. Batchable (with `waitMs` forced to 0) |
+| `watch_detail` | Full request + response (headers, request/response bodies, timing) for one `net` line, by its `seq` or `requestId`, read from the watch's on-disk network capture (needs `network:true`). Drill into a request without starting a separate capture. Batchable |
 | `watch_status` | Is watch mode running, on which tabs, and is capture actually live? No cursor, no actions |
-| `watch_stop` | Stop, flush any in-progress typing burst, close the digest |
+| `watch_stop` | Stop **this** watch (by `watchId`, or the current one), flush any in-progress typing burst, close the digest. Other watches keep running |
+
+The agent's own actions are told apart from yours: a click/fill/type/press_key/navigate/scroll/hover the
+agent issues while watching is labeled `[agent]` on its timeline line, so "what did *I* do" excludes what
+the agent did.
 
 ## What it captures
 
@@ -51,7 +56,16 @@ requests and the link stops meaning anything.
 
 **Typing is coalesced.** Twenty keystrokes into one field become one action with the final value, a
 character count, and a duration — finalized on blur, Enter, Tab, submit, a different field, or 1.5s of
-quiet.
+quiet. A **search-as-you-type** field that rewrites the URL with `history.replaceState` on every
+keystroke stays a single `input` action: a `replaceState` fired while a burst is open is dropped rather
+than emitted as a per-keystroke navigation that would split the typing.
+
+**Submits report what the form actually sends.** The `fields` on a `submit` are `FormData` semantics —
+the checked checkboxes and the chosen radio only, not every option and every unchecked box.
+
+**Form fields are labeled like a human would name them.** A checkbox or radio with no placeholder or
+`aria-label` is labeled from its `<label for>` / wrapping `<label>` / `aria-labelledby`, so it is not
+left blank.
 
 ## Network capture
 
@@ -78,6 +92,13 @@ cursor is accepted as current and points past the head — verified live, it ret
 `dropped: 0` while browsing was actively happening**. With it, the stale cursor is reported as
 `reset: true` and served from the start.
 
+**A server restart recovers instead of losing everything.** The extension re-announces its live watches
+on reconnect, and the server **re-adopts** any watch it no longer has in memory — recreating the session
+so the events the page has been holding land instead of being dropped as an unknown watchId. (The
+recovered session is memory-only: the on-disk digest and the original options — redaction, network —
+did not survive the restart, and `health.warnings` says so.) In the brief window before the extension
+reconnects, `watch_read` returns `reset:true` with a *recovering* note rather than erroring.
+
 **A connected socket does not mean capture is alive.** When the extension is reloaded or updated it
 comes back and reconnects, but it may no longer hold the watch — every page then disarms itself on the
 hello handshake and nothing is captured. The extension re-announces its live watches on every connect,
@@ -90,7 +111,8 @@ will confabulate activity to fill the gap:
 
 - `dropped: N` — you fell behind the in-memory ring and missed N actions.
 - `gap` **actions in the timeline** — `extension-disconnected`, `sw-restarted`, `watch-lost`,
-  `ring-evicted`, `unscriptable`, `tab-closed`, with a duration.
+  `ring-evicted`, `unscriptable`, `tab-closed`, with a duration. A page whose local buffer overflows
+  during a long socket outage reports the count it dropped, and it surfaces as a visible gap too.
 - `health.state` — `live`, `blind`, or `stopped`. **`blind` means capture is down, not that you were
   idle.**
 
@@ -100,7 +122,10 @@ Watch starts on one tab and automatically follows tabs that tab opens — `targe
 middle-click, `window.open`, OAuth popups — via `openerTabId` and
 `webNavigation.onCreatedNavigationTarget`. A tab you open yourself with Cmd+T deliberately does not
 join. Prerender activation (which swaps the tab id) is handled, so a tab does not silently drop out
-mid-session.
+mid-session. A followed tab is registered server-side as soon as it reports, so **its network rows join
+the same timeline** (and its own `<digest>.net.<tabId>.jsonl` capture, when `network:true`) instead of
+being dropped as belonging to an unknown tab — the exact hole a `target="_blank"` checkout or an OAuth
+popup would otherwise be.
 
 ## Continuous awareness (the prompt hook)
 
@@ -177,8 +202,12 @@ Prefer `console: true`. If you need explicit `console.*` calls, the CDP path (`c
 anything that already attached the debugger via `network:true`) captures them passively — it costs the
 banner instead of a page-visible modification.
 
-SPA routes need no page patching either: `webNavigation.onHistoryStateUpdated` in the service worker
-reports them, which is what wins the race in practice anyway.
+SPA routes are caught two ways, belt-and-braces. The MAIN-world shim patches
+`history.pushState`/`replaceState` and relays the change to the isolated watcher (emitted as
+`via:"spa"`), which is instant and page-side; and `webNavigation.onHistoryStateUpdated` in the service
+worker reports the same thing (`via:"hint"`) without any page patching. Same-URL duplicates fold to one.
+The MAIN-world patch rides on the same injected shim as error capture, so it is present whenever
+`console` is on (the default) and absent under `console:false`, where the service-worker hint covers it.
 
 ### Why not rrweb?
 
