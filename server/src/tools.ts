@@ -11,6 +11,7 @@ import { CaptureSink } from "./capture-sink.js";
 import { inlineAssets } from "./rrweb-inline.js";
 import { classifyError, truncateForText } from "./result.js";
 import { versionSkewWarning } from "./version.js";
+import { buildHar, parseSessionEventsStream } from "./capture-format.js";
 import {
   DEFAULT_INCLUDE,
   defaultWatchOpts,
@@ -1168,15 +1169,24 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     {
       savePath: z.string().describe("Absolute path to write the .har file"),
       includeBodies: z.boolean().optional().describe("Include response bodies (default true)"),
+      maxBodyBytes: z.number().optional().describe("Cap each inlined body to N chars (base64 kept decodable); real size stays in content.size and the count of capped bodies is reported"),
       tabId: tabIdParam,
     },
-    async ({ savePath, includeBodies, tabId }) => {
+    async ({ savePath, includeBodies, maxBodyBytes, tabId }) => {
+      // Up to 5000 rows WITH bodies can land here; assemble, then report the on-disk size so a huge
+      // capture is visible rather than a silent multi-hundred-MB write.
       const cap = await hub.call("net_get_requests", { tabId, includeBodies: includeBodies !== false, limit: 5000 }, 120_000);
       const rows: any[] = cap?.requests || [];
-      const nowIso = new Date().toISOString();
-      const har = { log: { version: "1.2", creator: { name: "browser-bridge", version }, entries: rows.map((r) => harEntry(r, nowIso)) } };
-      writeFileSync(savePath, JSON.stringify(har, null, 2));
-      return textResult({ saved: savePath, entries: rows.length, note: cap?.totalBuffered ? `${cap.totalBuffered} buffered on tab` : undefined });
+      const { har, bodiesCapped } = buildHar(rows, { name: "browser-bridge", version }, new Date().toISOString(), { maxBodyBytes });
+      const json = JSON.stringify(har, null, 2);
+      writeFileSync(savePath, json);
+      return textResult({
+        saved: savePath,
+        entries: rows.length,
+        bytes: Buffer.byteLength(json),
+        bodiesCapped: bodiesCapped || undefined,
+        note: cap?.totalBuffered ? `${cap.totalBuffered} buffered on tab` : undefined,
+      });
     },
   );
 
@@ -1308,11 +1318,14 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     async (args) => {
       const r = await hub.call("session_record_stop", { tabId: args.tabId }, 30_000);
       const tabId = r?.tabId;
-      hub.closeSessionSink(tabId); // usually already closed by the streamed `done`; idempotent
+      // The recorder's final batch is streamed separately and can arrive AFTER this ack; its sink
+      // writes are async. Wait (bounded) for the streamed `done` and drain the sink to disk BEFORE
+      // reading, or the tail of the recording is silently lost from the replay.
+      await hub.settleSessionSink(tabId);
       const eventsPath = hub.getRecordingPath(tabId);
       hub.deleteRecordingPath(tabId);
       if (!eventsPath) throw new Error("no recording was active for this tab");
-      const events = parseSessionEvents(readFileSync(eventsPath, "utf8"));
+      const events = await parseSessionEventsStream(eventsPath); // line-stream: a recording can be 100s of MB
       if (!events.length) throw new Error(`recording had no events (${eventsPath}) - did you interact with the page?`);
       // Inline external assets so the replay is self-contained/offline-faithful (fetched via the extension).
       const perAssetMaxBytes = Math.round((args.perAssetMB ?? 2) * 1024 * 1024);
@@ -2021,52 +2034,7 @@ function decodeJwt(raw: string): any {
   };
 }
 
-// ---- HAR export (pure) ----
-function harHeaders(obj: Record<string, string> | undefined): { name: string; value: string }[] {
-  return Object.entries(obj || {}).map(([name, value]) => ({ name, value: String(value) }));
-}
-function harEntry(r: any, nowIso: string): any {
-  let query: { name: string; value: string }[] = [];
-  try {
-    query = [...new URL(r.url).searchParams].map(([name, value]) => ({ name, value }));
-  } catch {
-    /* relative/invalid url */
-  }
-  const reqHeaders = r.requestHeaders || {};
-  const ct = hget(reqHeaders, "content-type") || "application/octet-stream";
-  const entry: any = {
-    // Real request-start time when the capture row carries one (it now does - background.ts
-    // captureNetRow). Falling back to the export time is what every entry used to get, which made an
-    // imported HAR's waterfall meaningless.
-    startedDateTime: typeof r.ts === "number" ? new Date(r.ts).toISOString() : nowIso,
-    time: 0,
-    request: {
-      method: r.method || "GET",
-      url: r.url || "",
-      httpVersion: "HTTP/1.1",
-      headers: harHeaders(reqHeaders),
-      queryString: query,
-      cookies: [],
-      headersSize: -1,
-      bodySize: r.requestBody ? r.requestBody.length : 0,
-    },
-    response: {
-      status: r.status || 0,
-      statusText: "",
-      httpVersion: "HTTP/1.1",
-      headers: harHeaders(r.responseHeaders),
-      cookies: [],
-      content: { size: r.responseBody ? r.responseBody.length : 0, mimeType: r.mimeType || "", ...(r.responseBody ? { text: r.responseBody, encoding: r.responseBodyBase64 ? "base64" : undefined } : {}) },
-      redirectURL: hget(r.responseHeaders || {}, "location") || "",
-      headersSize: -1,
-      bodySize: r.responseBody ? r.responseBody.length : -1,
-    },
-    cache: {},
-    timings: { send: 0, wait: 0, receive: 0 },
-  };
-  if (r.requestBody) entry.request.postData = { mimeType: ct, text: r.requestBody };
-  return entry;
-}
+// HAR export lives in capture-format.ts (buildHar), split out so it's unit-testable without the hub.
 
 // ---- session replay: assemble a self-contained rrweb-player HTML (pure) ----
 // Vendored rrweb-player (MIT), read once. Path is relative to the compiled dist/tools.js.
@@ -2535,18 +2503,4 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
   return Buffer.byteLength(html);
 }
 
-// Parse a session events JSONL (rows {kind:"rrweb", event}) into a timestamp-sorted rrweb event array.
-function parseSessionEvents(jsonl: string): any[] {
-  const events: any[] = [];
-  for (const line of jsonl.split("\n")) {
-    if (!line.trim()) continue;
-    try {
-      const row = JSON.parse(line);
-      if (row && row.kind === "rrweb" && row.event) events.push(row.event);
-    } catch {
-      /* skip a torn last line */
-    }
-  }
-  events.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-  return events;
-}
+// Session-event parsing lives in capture-format.ts (parseSessionEvents / parseSessionEventsStream).

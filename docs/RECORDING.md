@@ -17,7 +17,10 @@ session_record_stop({ savePath, title?, autoplay? })   → { saved, htmlBytes, e
   `~/.browser-bridge/recordings/session-<ts>.events.jsonl` on disk as you go, so a long session survives the
   service-worker's memory limits.
 - **`session_record_stop`** assembles a self-contained `.html` (rrweb-player + the events inlined) at `savePath`
-  (default: the events file with `.html`). Double-click it — it replays offline, no server, no network.
+  (default: the events file with `.html`). Double-click it — it replays offline, no server, no network. Stop
+  **waits (bounded, up to 3s) for the recorder's final streamed batch and drains it to disk** before reading, so
+  the tail of the interaction is never dropped from the replay; the events file is parsed as a **line stream**, so a
+  canvas-heavy or very long recording (hundreds of MB) doesn't have to be slurped into memory whole.
 - **`session_record_status`** lists active recordings (tab, file, events so far).
 
 Start options: `allFrames:true` also records **cross-origin iframes** (best-effort: injected per-frame with a per-frame
