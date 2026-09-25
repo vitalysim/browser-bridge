@@ -69,7 +69,7 @@ const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 const httpServer = createServer(app);
-const hub = new ExtensionHub(httpServer, token);
+const hub = new ExtensionHub(httpServer, token, VERSION);
 
 // ---- watch mode wiring ----
 // The registry is a module singleton (registerTools runs per MCP session), so this is attached once,
@@ -242,6 +242,7 @@ httpServer.listen(PORT, HOST, () => {
   console.error(`[browser-bridge] listening on http://${HOST}:${PORT}`);
   console.error(`[browser-bridge] MCP endpoint:  http://${HOST}:${PORT}/mcp  (Authorization: Bearer <token>)`);
   console.error(`[browser-bridge] extension WS:  ws://${HOST}:${PORT}/ws?token=<token>`);
-  console.error(`[browser-bridge] token: ${token}`);
+  // Log the token FILE PATH, never the token value: launchd persists stderr to
+  // ~/.browser-bridge/server.log indefinitely, so a printed secret would linger there forever.
   console.error(`[browser-bridge] token file: ${join(homedir(), ".browser-bridge", "token")}`);
 });
