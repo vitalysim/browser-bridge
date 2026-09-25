@@ -2,8 +2,14 @@ import { WebSocketServer, WebSocket } from "ws";
 import type { Server as HttpServer, IncomingMessage } from "http";
 import { randomUUID } from "crypto";
 import { CaptureSink } from "./capture-sink.js";
+import { versionSkewWarning } from "./version.js";
 
 export const CALL_TIMEOUT_MS = 30_000;
+
+// The `ws` default maxPayload is 100 MiB; a single reply over that closes the socket with 1009 and
+// fails every in-flight call. Raise it generously so a big-but-legitimate frame (MHTML snapshot, HAR
+// export, full-page screenshot) is delivered instead of dropping the whole connection.
+const WS_MAX_PAYLOAD = 256 * 1024 * 1024;
 
 interface Pending {
   resolve: (v: unknown) => void;
@@ -51,9 +57,11 @@ export class ExtensionHub {
   // per-MCP-session tool closure) so session_record_stop can resolve the path regardless of which
   // MCP client/session issued session_record_start (start+stop need not share a session).
   private recordingPaths = new Map<number, string>();
+  // Last version-skew warning already logged, so a reconnecting extension doesn't spam the log.
+  private lastSkewWarned: string | null = null;
 
-  constructor(httpServer: HttpServer, token: string) {
-    const wss = new WebSocketServer({ noServer: true });
+  constructor(httpServer: HttpServer, token: string, private version = "0.0.0") {
+    const wss = new WebSocketServer({ noServer: true, maxPayload: WS_MAX_PAYLOAD });
 
     httpServer.on("upgrade", (req, socket, head) => {
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
@@ -99,6 +107,15 @@ export class ExtensionHub {
       if (msg.type === "hello") {
         this.lastHello = { version: msg.version, build: msg.build, at: Date.now() };
         console.error(`[hub] extension hello: v${msg.version} (build ${msg.build ?? "unknown"})`);
+        // Surface a version skew loudly, once per distinct mismatch - it silently breaks tools that
+        // exist on only one side.
+        const skew = versionSkewWarning(this.version, msg.version);
+        if (skew && skew !== this.lastSkewWarned) {
+          this.lastSkewWarned = skew;
+          console.error(`[hub] version skew: ${skew}`);
+        } else if (!skew) {
+          this.lastSkewWarned = null;
+        }
         // The extension re-announces its live watch state on every connect, so a server restart or a
         // service-worker respawn is recoverable without the agent doing anything.
         for (const w of this.helloWatchers) {
@@ -126,7 +143,13 @@ export class ExtensionHub {
       this.pending.delete(msg.id);
       clearTimeout(p.timer);
       if (msg.ok) p.resolve(msg.result);
-      else p.reject(new Error(msg.error ?? "unknown extension error"));
+      else {
+        // Carry the extension's structured code (e.g. RESULT_TOO_LARGE) onto the Error so the server
+        // classifier prefers it over parsing the message.
+        const e = new Error(msg.error ?? "unknown extension error");
+        if (typeof msg.code === "string") (e as any).code = msg.code;
+        p.reject(e);
+      }
     });
 
     ws.on("close", () => {

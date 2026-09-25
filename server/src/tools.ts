@@ -9,6 +9,8 @@ import { spawn } from "child_process";
 import { CALL_TIMEOUT_MS, type ExtensionHub } from "./hub.js";
 import { CaptureSink } from "./capture-sink.js";
 import { inlineAssets } from "./rrweb-inline.js";
+import { classifyError, truncateForText } from "./result.js";
+import { versionSkewWarning } from "./version.js";
 import {
   DEFAULT_INCLUDE,
   defaultWatchOpts,
@@ -182,16 +184,17 @@ function imageDims(buf: Buffer): { width: number; height: number } | null {
 }
 
 function textResult(value: unknown) {
-  let text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
-  if (text.length > MAX_TEXT_CHARS) {
-    text = text.slice(0, MAX_TEXT_CHARS) + `\n…[truncated at ${MAX_TEXT_CHARS} chars]`;
-  }
+  // Structure-aware so a trimmed result is still valid JSON (see result.ts); a blind slice of a JSON
+  // string yields something no agent can parse.
+  const { text } = truncateForText(value, MAX_TEXT_CHARS);
   return { content: [{ type: "text" as const, text }] };
 }
 
 function errorResult(err: unknown) {
+  // Keep the human-readable message, and prefix a stable machine code the agent can branch on.
+  const message = err instanceof Error ? err.message : String(err);
   return {
-    content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+    content: [{ type: "text" as const, text: `Error [${classifyError(err)}]: ${message}` }],
     isError: true,
   };
 }
@@ -1434,15 +1437,20 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     "bridge_status",
     "Check whether the Chrome extension is currently connected to the bridge.",
     {},
-    async () =>
-      textResult({
+    async () => {
+      // Compare the two versions instead of just printing them side by side: a skew is a common,
+      // silent cause of a tool existing on one side but not the other.
+      const warning = versionSkewWarning(version, hub.lastHello?.version);
+      return textResult({
         extensionConnected: hub.connected,
         recording: hub.recording,
         // Which extension bundle is actually loaded. If this build stamp is older than your last
         // `npm run build`, Chrome is still running the previous code - reload it at chrome://extensions.
         extension: hub.lastHello ?? undefined,
         serverVersion: version,
-      })
+        warning: warning ?? undefined,
+      });
+    }
   );
 
   // ---- watch mode (the human browses; the agent reads a live semantic timeline) ----

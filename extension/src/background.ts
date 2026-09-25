@@ -13,13 +13,33 @@ let ws: WebSocket | null = null;
 let pingTimer: ReturnType<typeof setInterval> | null = null;
 let reconnectDelay = 1_000;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+// Synchronous in-flight guard for connect(). The OPEN/CONNECTING check below runs BEFORE an await, so
+// two callers in the same tick (storage.onChanged + a reconnect message, onStartup + an alarm) would
+// each open a second socket - a race that leaves a superseded socket flipping status underneath the
+// live one. Setting this before the await closes that window.
+let connecting = false;
+
+// A reply frame larger than the server's maxPayload (256 MiB) would close the socket with 1009 and
+// fail every in-flight call, so anything past this threshold is refused with a structured error
+// instead. Generous enough for a full-page screenshot / MHTML / HAR, far under the server's cap.
+const REPLY_MAX_BYTES = 64 * 1024 * 1024;
 
 function setStatus(status: string, detail = "") {
   chrome.storage.local.set({ bbStatus: status, bbDetail: detail, bbUpdated: Date.now() });
 }
 
 async function connect() {
+  if (connecting) return;
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  connecting = true;
+  try {
+    await connectNow();
+  } finally {
+    connecting = false;
+  }
+}
+
+async function connectNow() {
   const { token, port } = await chrome.storage.local.get({ token: "", port: 8765 });
   if (!token) {
     setStatus("no-token", "Set the server token in the extension options.");
@@ -30,6 +50,7 @@ async function connect() {
   ws = socket;
 
   socket.onopen = async () => {
+    if (ws !== socket) return; // superseded by a newer connect() before we opened; don't touch globals
     reconnectDelay = 1_000;
     setStatus("connected");
     // Re-announce live watch state on every connect. One mechanism covers both a server restart and
@@ -68,26 +89,42 @@ async function connect() {
     }
     if (msg.type === "pong") return;
     if (!msg.id || !msg.method) return;
+    let reply: any;
     try {
       const result = await dispatch(msg.method, msg.params ?? {});
-      socket.send(JSON.stringify({ id: msg.id, ok: true, result }));
+      reply = { id: msg.id, ok: true, result };
     } catch (err) {
-      socket.send(JSON.stringify({ id: msg.id, ok: false, error: err instanceof Error ? err.message : String(err) }));
+      reply = { id: msg.id, ok: false, error: err instanceof Error ? err.message : String(err) };
     }
+    // Serialize once (this is the hot path). A frame larger than the server's maxPayload closes the
+    // socket (1009) and fails EVERY in-flight call, so refuse it with a structured error instead.
+    let json = JSON.stringify(reply);
+    if (reply.ok && json.length > REPLY_MAX_BYTES) {
+      reply = {
+        id: msg.id,
+        ok: false,
+        code: "RESULT_TOO_LARGE",
+        bytes: json.length,
+        error: `Result too large to return (${json.length} bytes > ${REPLY_MAX_BYTES}). Narrow the query (limit/filter) or fetch a subset.`,
+      };
+      json = JSON.stringify(reply);
+    }
+    replyOrQueue(socket, json, reply);
   };
 
   socket.onclose = () => {
+    if (ws !== socket) return; // a superseded/replaced socket closing must not disturb the live one
     if (pingTimer) {
       clearInterval(pingTimer);
       pingTimer = null;
     }
-    if (ws === socket) ws = null;
+    ws = null;
     setStatus("disconnected", "Will retry automatically.");
     scheduleReconnect();
   };
 
   socket.onerror = () => {
-    // onclose fires next; nothing to do here
+    // onclose fires next; nothing to do here (and a superseded socket must never touch globals)
   };
 }
 
@@ -162,6 +199,22 @@ function pumpOutbox(): void {
     outbox.shift();
     outboxBytes -= o.bytes;
   }
+}
+
+// Send a dispatch reply on the socket it arrived on, or - when that socket is no longer OPEN
+// (superseded by a reconnect, or closing) - hand it to the outbox instead of calling send() on a dead
+// socket. A reply the server no longer awaits is ignored by id, so routing a late one is harmless.
+// `json` is the already-serialized reply (sent as-is); `obj` is the same value for the outbox path.
+function replyOrQueue(socket: WebSocket, json: string, obj: any): void {
+  if (socket.readyState === WebSocket.OPEN) {
+    try {
+      socket.send(json);
+      return;
+    } catch {
+      /* fall through to the outbox */
+    }
+  }
+  shipOrQueue(obj);
 }
 
 // ---------- watch mode ----------
@@ -273,6 +326,12 @@ async function hydrate(): Promise<void> {
       await registerWatchScripts([...watchGroups.values()].some((g) => g.consoleMode !== "off"));
       void persistWatch();
     }
+    // Identities and active session recordings survive an SW eviction the same way the watch group
+    // does; the debugger reconcile cleans up any attach the evicted worker left dangling. Kept in
+    // storage.SESSION (cleared on browser close) - these are credential snapshots and live-page state.
+    await restoreIdentities();
+    await restoreRecordings();
+    await reconcileDebuggerTargets();
   } catch {
     /* first run / storage unavailable */
   }
@@ -1223,6 +1282,28 @@ const sessions = new Map<number, Session>();
 // Named identity snapshots (cookies incl. HttpOnly + storage + bearer) for replay/authz_matrix.
 const identities = new Map<string, { cookies: any[]; storage: any; bearer?: string }>();
 
+// storage.SESSION, not .local: an identity is a credential snapshot, so it should die with the
+// browser session rather than persist to disk indefinitely. It only needs to outlive an SW eviction,
+// which storage.session does.
+const IDENTITIES_KEY = "bb.identities.v1";
+async function persistIdentities(): Promise<void> {
+  try {
+    await chrome.storage.session.set({ [IDENTITIES_KEY]: [...identities.entries()] });
+  } catch {
+    /* best-effort */
+  }
+}
+async function restoreIdentities(): Promise<void> {
+  try {
+    const got = await chrome.storage.session.get({ [IDENTITIES_KEY]: [] });
+    for (const [name, v] of (got[IDENTITIES_KEY] as [string, any][]) ?? []) {
+      if (!identities.has(name)) identities.set(name, v);
+    }
+  } catch {
+    /* first run / storage unavailable */
+  }
+}
+
 function cmd(tabId: number, method: string, params?: any): Promise<any> {
   return new Promise((resolve, reject) => {
     chrome.debugger.sendCommand({ tabId }, method, params ?? {}, (result) => {
@@ -1315,6 +1396,30 @@ async function detachSession(tabId: number): Promise<void> {
     await new Promise<void>((resolve) => chrome.debugger.detach({ tabId }, () => resolve()));
   } catch {
     /* already gone */
+  }
+}
+
+// After an SW eviction the in-memory `sessions` map is empty, but a debugger attach the dead worker
+// held can linger. Detach any target still attached BY US with no live session, or the next
+// debugger-backed tool wedges on "already attached". Detaching a target we didn't attach is a no-op
+// (the callback just sets lastError), so this can't steal a DevTools attachment.
+async function reconcileDebuggerTargets(): Promise<void> {
+  let targets: chrome.debugger.TargetInfo[] = [];
+  try {
+    targets = await new Promise<chrome.debugger.TargetInfo[]>((resolve) =>
+      chrome.debugger.getTargets((t) => resolve(t ?? []))
+    );
+  } catch {
+    return;
+  }
+  for (const t of targets) {
+    if (!t.attached || t.tabId == null || sessions.has(t.tabId)) continue;
+    await new Promise<void>((resolve) =>
+      chrome.debugger.detach({ tabId: t.tabId! }, () => {
+        void chrome.runtime.lastError; // swallow "not attached" for a target that wasn't ours
+        resolve();
+      })
+    );
   }
 }
 
@@ -1550,6 +1655,48 @@ interface RecState {
   recordCanvas: boolean;
 }
 const sessionRecordings = new Map<number, RecState>();
+
+// Persist the DURABLE config of each active recording (not the transient queue/timer) so a recording
+// survives an SW eviction: the injected page recorder keeps posting bb-rec messages, and restoring the
+// map is what lets onMessage accept them again after the worker respawns. storage.SESSION because a
+// recording is tied to a live page, not something to resurrect after a browser restart.
+const RECORDINGS_KEY = "bb.recordings.v1";
+async function persistRecordings(): Promise<void> {
+  try {
+    const rows = [...sessionRecordings.entries()].map(([tabId, r]) => ({
+      tabId,
+      allFrames: r.allFrames,
+      maskInputs: r.maskInputs,
+      recordCanvas: r.recordCanvas,
+    }));
+    await chrome.storage.session.set({ [RECORDINGS_KEY]: rows });
+  } catch {
+    /* best-effort */
+  }
+}
+async function restoreRecordings(): Promise<void> {
+  try {
+    const got = await chrome.storage.session.get({ [RECORDINGS_KEY]: [] });
+    for (const row of (got[RECORDINGS_KEY] as any[]) ?? []) {
+      if (row?.tabId == null || sessionRecordings.has(row.tabId)) continue;
+      try {
+        await chrome.tabs.get(row.tabId); // drop recordings whose tab is gone
+      } catch {
+        continue;
+      }
+      // Fresh queue/timer; the page recorder is still running and streams into this on the next batch.
+      sessionRecordings.set(row.tabId, {
+        queue: [],
+        timer: null,
+        allFrames: !!row.allFrames,
+        maskInputs: !!row.maskInputs,
+        recordCanvas: !!row.recordCanvas,
+      });
+    }
+  } catch {
+    /* first run / storage unavailable */
+  }
+}
 
 function queueRecord(rec: RecState, tabId: number, events: any[]) {
   for (const e of events) rec.queue.push({ kind: "rrweb", event: e });
@@ -2855,6 +3002,7 @@ async function dispatch(method: string, params: any): Promise<any> {
         }
       }
       identities.set(params.name, { cookies, storage, bearer });
+      void persistIdentities(); // survive an SW eviction
       return {
         name: params.name,
         cookies: cookies.length,
@@ -2873,8 +3021,11 @@ async function dispatch(method: string, params: any): Promise<any> {
         })),
       };
 
-    case "identity_purge":
-      return { purged: identities.delete(params.name), name: params.name };
+    case "identity_purge": {
+      const purged = identities.delete(params.name);
+      void persistIdentities();
+      return { purged, name: params.name };
+    }
 
     case "replay_request": {
       const tab = await targetTab(params.tabId);
@@ -3355,6 +3506,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       };
       await injectRecorder(tabId, rec);
       sessionRecordings.set(tabId, rec);
+      void persistRecordings(); // survive an SW eviction; the page recorder keeps posting bb-rec
       return { recording: true, tabId, allFrames: rec.allFrames, url: tab.url };
     }
 
@@ -3376,6 +3528,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       if (rec) {
         flushRecord(rec, tabId, true);
         sessionRecordings.delete(tabId);
+        void persistRecordings();
       }
       return { stopped: true, tabId, wasRecording: !!rec };
     }
@@ -3549,6 +3702,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   const rec = sessionRecordings.get(tabId);
   if (rec) {
     sessionRecordings.delete(tabId);
+    void persistRecordings();
     // The recorder's final batch is relayed via sendMessage, a separate task. Closing the sink
     // immediately (as this did) discards it. session_record_stop already allows this grace; a tab
     // being closed is exactly when the last events matter most.
@@ -3559,6 +3713,10 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     g.tabs.delete(tabId);
     tabToWatch.delete(tabId);
     shipOrQueue({ type: "watch", watchId: g.watchId, tabId, entries: [{ t: Date.now(), k: "closed" }] }, false);
+    // An emptied group is dead; drop it, and when the LAST watch goes, unregister the <all_urls>
+    // content script so it stops injecting into every page (mirrors hydrate() and watch_stop).
+    if (!g.tabs.size) watchGroups.delete(g.watchId);
+    if (!watchGroups.size) void unregisterWatchScripts();
     void persistWatch();
   }
 });
@@ -3584,6 +3742,16 @@ chrome.webNavigation.onCreatedNavigationTarget.addListener((d) => {
 // Prerender activation and some back/forward navigations swap the tabId. Without this the tab
 // silently drops out of the group mid-session.
 chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
+  // A session recording is scripting-based and injected in the page, which survives the tabId swap, so
+  // move it to the new id - its bb-rec messages now arrive as the new tab. A debugger session can't
+  // follow the tabId (the CDP attach was to the old target), so clean it up rather than strand it.
+  const rec = sessionRecordings.get(removedTabId);
+  if (rec) {
+    sessionRecordings.delete(removedTabId);
+    sessionRecordings.set(addedTabId, rec);
+    void persistRecordings();
+  }
+  if (sessions.has(removedTabId)) void detachSession(removedTabId).catch(() => {});
   void ready().then(() => {
     const g = watchForTab(removedTabId);
     if (!g) return;
@@ -3665,8 +3833,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.cmd === "bb-rec") {
     const tabId = sender.tab?.id;
     if (tabId != null) {
-      const rec = sessionRecordings.get(tabId);
-      if (rec) queueRecord(rec, tabId, msg.events || []);
+      // await hydration: a bb-rec message can be what WOKE the worker after an eviction, arriving
+      // before restoreRecordings() has repopulated the map. Without this the first post-respawn batch
+      // would find no rec and be dropped.
+      void ready().then(() => {
+        const rec = sessionRecordings.get(tabId);
+        if (rec) queueRecord(rec, tabId, msg.events || []);
+      });
     }
     return false;
   }
