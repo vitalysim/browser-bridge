@@ -24,6 +24,8 @@ export interface StreamMsg {
   tabId: number;
   frameId?: number;
   entries: any[];
+  /** Cumulative page-buffer overflow count (watch mode); the server records the increase as a gap. */
+  dropped?: number;
   done?: boolean;
 }
 export type StreamTap = (msg: StreamMsg, receivedAt: number) => void;

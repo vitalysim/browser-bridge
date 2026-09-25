@@ -31,6 +31,13 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const MAX_BATCH_ACTIONS = 50;
 
+// Tools that drive the page on the agent's behalf. A watch timeline entry whose ts falls in one of
+// these calls' windows is labeled [agent], so the agent's own clicks/fills are told apart from the
+// human's. The window runs from just before the call to a short tail after it, covering the folded
+// click/input and the reorder hold (see WatchSession.reorderMs).
+const AGENT_ACTION_TOOLS = new Set(["click", "fill", "type", "press_key", "navigate", "scroll", "hover"]);
+const AGENT_ACTION_SLACK_MS = 1500;
+
 // Parallel same-origin script fetches for `analyze deep:true`. Bounded on purpose - see the call site.
 const DEEP_SCRIPT_CONCURRENCY = 6;
 
@@ -95,6 +102,8 @@ const BATCHABLE_TOOLS = new Set([
   // itself not batchable. Its waitMs is forced to 0 inside a batch so it can never stall the sequence.
   "watch_read",
   "watch_status",
+  // watch_detail reads the watch's own network JSONL (already gated behind network:true at start).
+  "watch_detail",
 ]);
 
 // Expand a leading ~/ to the home dir (Node fs doesn't do it). For playbook/record paths.
@@ -159,6 +168,41 @@ export async function startWatchNetCapture(hub: ExtensionHub, session: WatchSess
     session.netTabs.delete(tabId);
     throw e;
   }
+}
+
+/**
+ * Find one captured request in a watch's on-disk network JSONL, by requestId.
+ *
+ * The full traffic (headers, bodies, timing) is one file per tab (`<base>.net.<tabId>.jsonl`), so
+ * watch_detail can drill into a timeline `net` line without starting a separate capture. Scans the
+ * files for the tabs the watch attached to; returns the matching row or null.
+ */
+function findWatchNetRow(session: WatchSession, requestId: string): any | null {
+  const cfg = session.netCapture;
+  if (!cfg) return null;
+  for (const tabId of session.netTabs) {
+    const path = `${cfg.basePath}.net.${tabId}.jsonl`;
+    if (!existsSync(path)) continue;
+    let text: string;
+    try {
+      text = readFileSync(path, "utf8");
+    } catch {
+      continue;
+    }
+    // Scan from the end: a request the agent just saw is near the tail of the file.
+    const lines = text.split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      if (!line.trim() || !line.includes(requestId)) continue;
+      try {
+        const row = JSON.parse(line);
+        if (row && row.kind === "net" && row.requestId === requestId) return row;
+      } catch {
+        /* torn line - keep scanning */
+      }
+    }
+  }
+  return null;
 }
 
 // Parse pixel dimensions from a PNG or JPEG buffer (header only).
@@ -231,10 +275,24 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     inputSchema: z.ZodRawShape,
     handler: (args: any, extra?: any) => Promise<any>
   ) => {
-    registry.set(name, { schema: inputSchema, handler });
+    // Acting tools mark the window they run in as agent-driven, so watch mode labels the clicks/fills
+    // they cause as [agent] rather than as the human's. Done here (not in each handler) so it also
+    // covers the batched path, which invokes `handler` directly and would otherwise bypass it.
+    const wrapped = AGENT_ACTION_TOOLS.has(name)
+      ? async (args: any, extra?: any) => {
+          const from = Date.now();
+          try {
+            return await handler(args, extra);
+          } finally {
+            const sess = (args?.tabId !== undefined ? watchRegistry.forTab(args.tabId) : undefined) ?? watchRegistry.sole();
+            sess?.noteAgentCall(from, Date.now() + AGENT_ACTION_SLACK_MS);
+          }
+        }
+      : handler;
+    registry.set(name, { schema: inputSchema, handler: wrapped });
     server.registerTool(name, { description, inputSchema }, async (args: any, extra: any) => {
       try {
-        return await handler(args, extra);
+        return await wrapped(args, extra);
       } catch (err) {
         return errorResult(err);
       }
@@ -1638,7 +1696,36 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       }
 
       const session = args.watchId ? watchRegistry.get(args.watchId) : watchRegistry.sole();
-      if (!session) throw new Error("No watch session. Call watch_start first.");
+      if (!session) {
+        // A cursor (or watchId) naming a real watch, but no session right now, is the server-restart
+        // window: the extension is about to re-announce and the page is still holding its events.
+        // Don't throw "No watch session" - signal reset so the agent re-syncs once it re-adopts.
+        const wantId = args.watchId ?? parseCursor(args.since).watchId;
+        if (wantId) {
+          const meta = {
+            nextCursor: args.since ?? "",
+            dropped: 0,
+            more: false,
+            remaining: 0,
+            reset: true,
+            recovering: true,
+            health: {
+              state: "blind" as const,
+              extensionConnected: watchRegistry.extensionConnected,
+              lastEventAgeMs: null,
+              tabs: [] as number[],
+              ring: { size: 0, bytes: 0, minSeq: 1, maxSeq: 0, evicted: 0 },
+              warnings: ["watch session not resident (the server restarted); it re-binds when the extension reconnects - retry shortly, or call watch_start again if it does not"],
+            },
+          };
+          if (args.format === "json") return textResult({ ...meta, actions: [] });
+          return textResult(
+            "WATCH  recovering  the server restarted; this watch re-binds when the extension reconnects. Retry shortly.\n" +
+              JSON.stringify(meta)
+          );
+        }
+        throw new Error("No watch session. Call watch_start first.");
+      }
 
       const cursor = parseCursor(args.since);
       // A cursor from a previous watch, or a previous incarnation of this one, cannot be honored -
@@ -1674,13 +1761,15 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       if (args.format === "json") return textResult({ ...meta, actions: result.actions });
 
       const parts: string[] = [];
+      // The meta (with nextCursor) goes FIRST: textResult hard-truncates at MAX_TEXT_CHARS, so a very
+      // large page would otherwise cut off the trailing cursor line and break the paging stream.
+      parts.push(JSON.stringify(meta));
       if (reset) parts.push("NOTE  that cursor is from an earlier watch session (the server restarted) - serving from the start of the current one.");
       if (result.dropped) parts.push(`NOTE  ${result.dropped} actions were evicted from the ring before this read.`);
       const header =
         `WATCH  ${health.state}  tabs=${health.tabs.join(",")}  actions=${result.actions.length}` +
         `  dropped=${result.dropped}  more=${result.more}`;
       parts.push(renderActions(result.actions, { multiTab: multiTab(result.actions), header }));
-      parts.push(JSON.stringify(meta));
       return textResult(parts.join("\n"));
     }
   );
@@ -1722,7 +1811,9 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       const tabs = [...session.tabs];
       let extensionError: string | undefined;
       try {
-        await hub.call("watch_stop", { tabIds: tabs });
+        // Send the watchId so the extension stops ONLY this watch. tabIds stays for back-compat: an
+        // older extension that ignored watchId would otherwise stop every watch it holds.
+        await hub.call("watch_stop", { watchId: session.watchId, tabIds: tabs });
       } catch (e) {
         // The browser side may already be gone (tab closed, extension reloaded). The digest is still
         // ours to finish, so report the failure rather than losing the timeline to it.
@@ -1749,6 +1840,35 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         digestPath: digestPath ?? undefined,
         extensionError,
       });
+    }
+  );
+
+  tool(
+    "watch_detail",
+    "Return the full request+response (headers, request/response bodies, timing) for one network line " +
+      "of the watch timeline, by its `seq` or `requestId`, read from the watch's on-disk capture " +
+      "(needs network:true). Lets you drill into a request without starting a separate capture.",
+    {
+      seq: z.number().optional().describe("The #seq of a `net` line in the timeline"),
+      requestId: z.string().optional().describe("A requestId (from watch_read format:'json') instead of a seq"),
+      watchId: z.string().optional().describe("Which watch to read (default: the current one)"),
+    },
+    async (args) => {
+      const session = args.watchId ? watchRegistry.get(args.watchId) : watchRegistry.sole();
+      if (!session) throw new Error("No watch session. Call watch_start first.");
+      if (!session.netCapture) throw new Error("This watch has no network capture - start it with network:true to record request/response detail.");
+      let requestId: string | undefined = args.requestId;
+      if (!requestId && args.seq !== undefined) {
+        const a = session.findBySeq(args.seq);
+        if (!a) throw new Error(`No action #${args.seq} is still in the timeline (it may have been evicted from the ring).`);
+        if (a.kind !== "net") throw new Error(`Action #${args.seq} is a '${a.kind}', not a captured request.`);
+        requestId = (a as any).requestId;
+        if (!requestId) throw new Error(`Action #${args.seq} carries no requestId.`);
+      }
+      if (!requestId) throw new Error("Provide seq or requestId.");
+      const row = findWatchNetRow(session, requestId);
+      if (!row) throw new Error(`Request ${requestId} was not found in the watch network capture (it may not have finished, or its body was excluded).`);
+      return textResult(row);
     }
   );
 

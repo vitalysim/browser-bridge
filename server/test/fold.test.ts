@@ -168,3 +168,49 @@ test("other extensions' traffic is not the human's browsing", () => {
   ];
   for (const r of foreign) assert.equal(foldNetRow(state, env, r, 1100).length, 0, `dropped ${r.url}`);
 });
+
+test("net duration prefers CDP timing over the receivedAt-minus-start wall clock (item 5)", () => {
+  // receivedAt - ts includes the 300ms capture batch and the eager body fetch, so it overstates the
+  // request. CDP's receiveHeadersEnd is the real time-to-headers relative to the request.
+  const withTiming = foldNetRow(
+    createFoldState(),
+    env,
+    { kind: "net", method: "GET", url: "https://x.test/a", type: "XHR", status: 200, ts: 1000, timing: { requestTime: 123, receiveHeadersEnd: 42 } },
+    5000
+  )[0] as any;
+  assert.equal(withTiming.ms, 42, "uses CDP timing, not 4000ms of batching/body-fetch delay");
+
+  const noTiming = foldNetRow(
+    createFoldState(),
+    env,
+    { kind: "net", method: "GET", url: "https://x.test/b", type: "XHR", status: 200, ts: 1000 },
+    1080
+  )[0] as any;
+  assert.equal(noTiming.ms, 80, "falls back to receivedAt - start when there is no timing");
+});
+
+test("a hash or popstate change inside an iframe is not a tab navigation (item 9)", () => {
+  const sub = { tabId: 5, frameId: 3 };
+  assert.equal(foldEvent(createFoldState(), sub, { t: 1000, k: "nav", url: "https://ad.test/#x", via: "hash" }).length, 0, "subframe hash");
+  assert.equal(foldEvent(createFoldState(), sub, { t: 1000, k: "nav", url: "https://ad.test/back", via: "popstate" }).length, 0, "subframe popstate");
+  // But the top frame's own hash change still counts, and a real in-app route change inside a frame counts.
+  assert.equal(foldEvent(createFoldState(), env, { t: 1000, k: "nav", url: "https://app.test/#x", via: "hash" }).length, 1, "top-frame hash");
+  assert.equal(foldEvent(createFoldState(), sub, { t: 1000, k: "nav", url: "https://app.test/route", via: "spa" }).length, 1, "subframe spa route");
+});
+
+test("a replaceState during typing neither splits the input burst nor spams a nav (item 8)", () => {
+  const state = createFoldState();
+  typeInto(state, el(), "hel"); // burst still open
+  // search-as-you-type rewrites the URL via replaceState on each keystroke
+  const out = foldEvent(state, env, { t: 1500, k: "nav", url: "https://x.test/?q=hel", via: "spa", replace: true });
+  assert.equal(out.length, 0, "the replaceState emits no nav and does not finalize the input");
+  typeInto(state, el(), "hello", 1600); // keeps accumulating into the SAME field
+  const done = foldFlush(state, 99999);
+  assert.equal(done.length, 1, "one input action, not one per keystroke");
+  assert.equal((done[0] as any).value, "hello");
+
+  // A pushState (real route change) with no open burst still lands as an spa nav.
+  const nav = foldEvent(createFoldState(), env, { t: 2000, k: "nav", url: "https://x.test/next", via: "spa" });
+  assert.equal(nav.length, 1);
+  assert.equal((nav[0] as any).via, "spa");
+});
