@@ -5,6 +5,7 @@ import { NetRing, applyRedirectResponse, capBody, Semaphore, type NetEntry } fro
 // bbAct is the ONE find-and-act helper the interaction tools share; bbAxSnapshot is the ARIA walker.
 import { bbAct, type BbActParams } from "./dom-act";
 import { bbAxSnapshot } from "./ax";
+import { emulateDevice, emulateNetwork, emulateCpu, emulateLocale, emulateGeolocation, emulateReset } from "./emulate.js";
 
 // Injected at build time by build.mjs (esbuild define) from extension/package.json - single
 // source of truth shared with manifest.json, so the version can't drift.
@@ -3455,6 +3456,45 @@ async function dispatch(method: string, params: any): Promise<any> {
     case "ax_snapshot": {
       const tab = await targetTab(params.tabId);
       return axSnapshot(tab);
+    }
+
+    // ---- environment emulation (CDP; shows the debugger banner). Thin: the server resolved presets
+    //      to concrete metrics/throughput, this just applies them. See extension/src/emulate.ts. ----
+
+    case "emulate_device": {
+      const tab = await targetTab(params.tabId);
+      await ensureAttached(tab.id!);
+      return emulateDevice(tab.id!, params, cmd);
+    }
+
+    case "emulate_network": {
+      const tab = await targetTab(params.tabId);
+      await ensureAttached(tab.id!);
+      return emulateNetwork(tab.id!, params, cmd);
+    }
+
+    case "emulate_cpu": {
+      const tab = await targetTab(params.tabId);
+      await ensureAttached(tab.id!);
+      return emulateCpu(tab.id!, params.rate, cmd);
+    }
+
+    case "emulate_locale": {
+      const tab = await targetTab(params.tabId);
+      await ensureAttached(tab.id!);
+      return emulateLocale(tab.id!, params, cmd);
+    }
+
+    case "emulate_geolocation": {
+      const tab = await targetTab(params.tabId);
+      await ensureAttached(tab.id!);
+      return emulateGeolocation(tab.id!, params, cmd);
+    }
+
+    case "emulate_reset": {
+      const tab = await targetTab(params.tabId);
+      await ensureAttached(tab.id!);
+      return emulateReset(tab.id!, cmd);
     }
 
     default:

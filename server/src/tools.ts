@@ -13,6 +13,7 @@ import { classifyError, truncateForText } from "./result.js";
 import { versionSkewWarning } from "./version.js";
 import { buildHar, parseSessionEventsStream } from "./capture-format.js";
 import { renderAxSnapshot, type AxSnapshot } from "./ax.js";
+import { registerEmulateTools } from "./emulate.js";
 import {
   DEFAULT_INCLUDE,
   defaultWatchOpts,
@@ -1979,6 +1980,9 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       return textResult({ executed: results.length, total: actions.length, results });
     }
   );
+
+  // Environment emulation (device / network / locale / geolocation) - self-contained in emulate.ts.
+  registerEmulateTools(tool, hub);
 }
 
 // ---- server-side response diffing (used by authz_matrix + the response_diff tool) ----
