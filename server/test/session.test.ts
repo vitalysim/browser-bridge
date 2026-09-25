@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import {
   ActionRing,
   WatchSession,
+  WatchRegistry,
   defaultWatchOpts,
   renderActions,
   type Action,
@@ -148,6 +149,62 @@ test("a request with no preceding user action is left unattributed", () => {
   s.pump(Infinity, true);
   const a = s.read(0, {}, 100, 40_000).actions[0];
   assert.equal(a.causedBy, undefined, "background polling is not blamed on an unrelated click");
+});
+
+test("a request is attributed to the click that preceded its START, even after a newer click (item 5)", () => {
+  // Keeping only the LAST click failed the moment a second click landed before the first click's
+  // request finished: the request carries its START time, so it fails a.ts >= newerClick.ts and shows
+  // no cause. A short action history fixes it.
+  const s = session();
+  feed(s, [{ t: 1000, k: "click", el: el({ selector: "#search", label: "Search" }) }]);
+  feed(s, [{ t: 1500, k: "click", el: el({ selector: "#other" }) }]); // a newer click lands first
+  // The request STARTED at 1100 (right after #search) but its row only arrives now.
+  s.ingestNet({ tabId: 5 }, [{ kind: "net", method: "GET", url: "https://x.test/api", type: "XHR", status: 200, ts: 1100 }], 3000);
+  s.pump(Infinity, true);
+
+  const all = s.read(0, {}, 100, 40_000).actions;
+  const search = all.find((a) => a.kind === "click" && (a as any).target.selector === "#search")!;
+  const net = all.find((a) => a.kind === "net")!;
+  assert.equal(net.causedBy, search.seq, "attributed to the click at/before the request start, not the newer one");
+});
+
+test("a lone action wakes a pending long-poll without waiting out the timeout (item 3)", async () => {
+  // With a non-zero reorder window and no follow-up event, only a self-armed timer can commit the
+  // click and wake the poll - otherwise a single click waits the full ~25s.
+  const s = new WatchSession("w1", 5, defaultWatchOpts({ network: true, reorderMs: 300 }), Date.now());
+  const start = Date.now();
+  const woke = s.wait((a) => a.kind === "click", 5000, 0);
+  s.ingest({ tabId: 5, frameId: 0 }, [{ t: Date.now(), k: "click", el: el() }], Date.now());
+  await woke;
+  const waited = Date.now() - start;
+  assert.ok(waited < 2000, `woke in ${waited}ms, not after the full 5000ms timeout`);
+  s.pump(Date.now());
+  assert.ok(s.read(0, {}, 100, 40_000).actions.some((a) => a.kind === "click"), "the click is readable once the poll wakes");
+  s.stop(Date.now());
+});
+
+test("a watch the server lost is re-adopted so re-sent events land again (item 2)", () => {
+  const reg = new WatchRegistry();
+  // A batch arrives for a watch the server never created (it restarted): adopt it.
+  const s = reg.adopt("wZ", 7, [7, 8], 1000);
+  assert.equal(s.watchId, "wZ");
+  assert.equal(s.recreated, true, "flagged as recovered so health can say the digest/opts were lost");
+  assert.ok(reg.get("wZ"), "the session now exists and watch_read will find it");
+  assert.ok(s.tabs.has(7) && s.tabs.has(8), "its tabs are registered");
+  assert.equal(reg.forTab(8)?.watchId, "wZ", "a followed tab's net rows now resolve to this watch");
+  assert.equal(reg.adopt("wZ", 7, [7], 2000), s, "adopting again is idempotent, not a second session");
+  assert.ok(s.health(true, 3000).warnings.some((w) => /recovered after a server restart/.test(w)));
+});
+
+test("submit field bytes count against the read budget so paging engages (item 10)", () => {
+  const s = session();
+  feed(s, [
+    { t: 1000, k: "submit", el: el({ tag: "form", selector: "form#f" }), fields: [{ name: "q", value: "z".repeat(3000) }] },
+    { t: 1001, k: "submit", el: el({ tag: "form", selector: "form#g" }), fields: [{ name: "q", value: "z".repeat(3000) }] },
+  ]);
+  const page = s.read(0, {}, 100, 2000);
+  assert.equal(page.actions.length, 1, "the first big submit fills the budget; the estimate no longer ignores fields");
+  assert.equal(page.more, true, "so the second is paged rather than silently over-budget");
 });
 
 test("losing the extension writes a gap into the timeline", () => {

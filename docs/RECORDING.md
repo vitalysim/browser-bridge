@@ -7,7 +7,7 @@ session replay (the rrweb approach), and browser-bridge does it with a few advan
 ## Use it
 
 ```
-session_record_start({ tabId?, allFrames?, maskInputs?, recordCanvas?, eventsPath? })
+session_record_start({ tabId?, allFrames?, maskInputs?, recordCanvas?, canvasFps?, canvasQuality?, canvasMaxDim?, canvasBudgetMB?, eventsPath? })
    … interact with the page (scroll, click, type, navigate) …
 session_record_stop({ savePath, title?, autoplay? })   → { saved, htmlBytes, eventCount, durationMs }
 ```
@@ -17,12 +17,16 @@ session_record_stop({ savePath, title?, autoplay? })   → { saved, htmlBytes, e
   `~/.browser-bridge/recordings/session-<ts>.events.jsonl` on disk as you go, so a long session survives the
   service-worker's memory limits.
 - **`session_record_stop`** assembles a self-contained `.html` (rrweb-player + the events inlined) at `savePath`
-  (default: the events file with `.html`). Double-click it — it replays offline, no server, no network.
+  (default: the events file with `.html`). Double-click it — it replays offline, no server, no network. Stop
+  **waits (bounded, up to 3s) for the recorder's final streamed batch and drains it to disk** before reading, so
+  the tail of the interaction is never dropped from the replay; the events file is parsed as a **line stream**, so a
+  canvas-heavy or very long recording (hundreds of MB) doesn't have to be slurped into memory whole.
 - **`session_record_status`** lists active recordings (tab, file, events so far).
 
 Start options: `allFrames:true` also records **cross-origin iframes** (best-effort: injected per-frame with a per-frame
 timeout, so one wedged ad/embed frame can't stall the start); `maskInputs:true` redacts form values; `recordCanvas:true`
-attempts `<canvas>`. Stop options: `inlineAssets` (default **true** - see below), `assetBudgetMB` (total budget,
+captures **`<canvas>`/WebGL** as periodic image frames the replay paints (see **Canvas / WebGL** below). Stop options:
+`inlineAssets` (default **true** - see below), `assetBudgetMB` (total budget,
 default 50), `perAssetMB` (per-asset cap, default 2), `skipInactive` (default **false** - play idle/scroll stretches in
 real time), `autoplay`.
 
@@ -47,6 +51,37 @@ controller is hidden; the bar is wired to the player API.
   key-by-key. Recording with `maskInputs:true` redacts printable keys typed into inputs (shown as `•`), consistent with
   how it masks input values. Treat a recording as sensitive as the session it captured.
 
+## Canvas / WebGL (`recordCanvas:true`)
+
+Session replay reconstructs the DOM + CSS, not the page's JS runtime, so raw `<canvas>`/WebGL drawing is otherwise
+lost. With `recordCanvas:true` the recorder **samples each canvas as an image on a timer** and streams those frames
+alongside the DOM events; the replay player **paints the latest frame at-or-before the play head onto the replayed
+canvas** (matched by rrweb node id). It's off by default and adds weight, so turn it on only when the canvas is the
+point.
+
+- **How it reads pixels.** 2D canvases read back anytime. A WebGL canvas with the common `preserveDrawingBuffer:false`
+  is **blank if read outside the page's own paint**, so the sampler reads inside a `requestAnimationFrame` — in the same
+  frame the page drew, before the compositor discards the back-buffer. `createImageBitmap` snapshots at call time, so a
+  continuously-animating WebGL canvas captures its real pixels. This runs on plain `chrome.scripting` (banner-free) and
+  is **independent of rrweb's own canvas code**, which the extension disables (it runs in the isolated world and reads
+  WebGL blank — 0 frames for the common case).
+- **Frames are de-duplicated.** An unchanged canvas ships nothing (a per-canvas hash skips identical frames), so an
+  idle canvas costs almost nothing.
+- **Reach.** Canvases in **open shadow DOM** and **same-origin iframes** are discovered (a plain `querySelectorAll`
+  misses both).
+- **Options** (on `session_record_start`): `canvasFps` (default **4**), `canvasQuality` (WebP quality 0-1, default
+  **0.6**), `canvasMaxDim` (downscale a canvas past this longest edge, default **1280** px), `canvasBudgetMB` (total
+  encoded-canvas byte budget; capture stops past it, default **32**).
+- **Caveats (honest).** A **cross-origin-tainted** canvas (drawn from another origin's image/video without CORS) is
+  unreadable — it's **skipped**, with a one-time note in the stream, never a thrown error. **Closed shadow roots** and
+  canvases inside **cross-origin iframes** aren't reached. A WebGL canvas that only draws **on demand** (not every
+  frame) may be sampled between paints and read blank (also skipped + noted); continuously-animating canvases are the
+  solid case. `canvas.captureStream()` would sidestep the rAF-timing issue for WebGL and is a possible future
+  enhancement.
+- **Export.** The MP4 export (`render_recording_video`) waits until each frame's canvas image has decoded before it
+  screenshots, so exported canvas frames aren't stale. Regenerate the replay with this version for canvas frames to
+  appear.
+
 ## What makes this better than page-level rrweb
 
 - **Truly self-contained / offline-faithful.** On stop, the server fetches **every external asset the capture
@@ -70,10 +105,10 @@ controller is hidden; the bar is wired to the player API.
 ## Caveats (be honest about fidelity)
 
 - **rrweb replays a reconstructed DOM + CSS, not the original JS runtime.** Visual state that isn't expressed as DOM
-  or attribute mutations (e.g. raw `requestAnimationFrame` drawing) is lost.
-- **Canvas / WebGL** aren't captured by default (`recordCanvas` is heavy and lossy). Live `<video>`/`<audio>` **pixels**
-  aren't captured (the poster is inlined; the stream isn't). For pixel-perfect canvas/video, the MP4 export (screencast,
-  roadmap) is the right tool.
+  or attribute mutations (e.g. raw `requestAnimationFrame` drawing) is lost — **except `<canvas>`/WebGL**, which
+  `recordCanvas:true` captures as image frames (see **Canvas / WebGL** above, and its caveats).
+- **Canvas / WebGL** aren't captured **by default** — pass `recordCanvas:true`. Live `<video>`/`<audio>` **pixels**
+  still aren't captured (the poster is inlined; the stream isn't).
 - **Closed shadow roots** and **sandboxed (no-scripts) iframes** can't run the recorder → not captured.
 - **Assets over budget** (default 2 MB/asset, 50 MB total) are left as live URLs and listed in the `skipped` result —
   raise `assetBudgetMB` to inline more. Auth-gated assets that 401 for the background fetch are likewise left live.
@@ -109,4 +144,5 @@ render_recording_video({ htmlPath, out?, fps?, scale?, crf?, settleMs? })
 - **Caveats:** it drives a **focused** tab for the whole render (steals focus) and is not instant - roughly
   `frames × ~0.4-0.7 s` (a 30 s clip at 30 fps ≈ several minutes); lower `fps`/`scale` to go faster. Needs `ffmpeg` on
   the machine (auto-found in Homebrew/usr paths, or set `FFMPEG_PATH`). Only works on replays generated by **v0.14+**
-  (they carry the export harness). Canvas/WebGL/video **pixels** are still not captured (DOM replay limitation).
+  (they carry the export harness). **Canvas/WebGL** frames captured with `recordCanvas:true` ARE exported (the export
+  waits for each frame's image to decode first); live `<video>` **pixels** are still not captured (DOM replay limitation).

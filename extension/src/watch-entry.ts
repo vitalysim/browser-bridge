@@ -32,12 +32,19 @@
   let retryTimer: any = null;
   let retryDelay = 500;
 
+  // Per-event id: a per-document nonce plus a counter, so the server can drop an event it already
+  // folded. The pagehide flush and the retry path can each ship an event twice; the id makes both safe.
+  const pageNonce = Math.random().toString(36).slice(2, 8);
+  let eventSeq = 0;
+  const eid = () => `${pageNonce}.${++eventSeq}`;
+
   const nav = () => location.href;
 
   const sizeOf = (e: any) => 120 + (e.value ? String(e.value).length : 0) + (e.text ? String(e.text).length : 0);
 
   function push(ev: any): void {
     if (dormant) return;
+    ev.i = eid();
     buf.push(ev);
     bufBytes += sizeOf(ev);
     while (buf.length > MAX_BUFFER || bufBytes > MAX_BUFFER_BYTES) {
@@ -52,8 +59,22 @@
   // Flush per event rather than on a timer. Peak activity is a couple of events per second, so there
   // is nothing to gain by batching — and a 300ms batch is exactly what loses the click that navigates,
   // which is the single most valuable event in the stream.
-  function flush(): void {
-    if (!armed || sending || !buf.length) return;
+  //
+  // `force` is the pagehide path: the document is dying, so ship whatever is buffered even if a normal
+  // send is already in flight (the old code no-op'd on `sending` and lost the tail). Fire-and-forget —
+  // there is no time for the ack — and `final:true` tells the SW to hold it in the outbox if the socket
+  // is down. Per-event ids let the server drop any duplicate the in-flight send also delivered.
+  function flush(force = false): void {
+    if (!armed || !buf.length) return;
+    if (force) {
+      try {
+        chrome.runtime.sendMessage({ cmd: "bb-watch", v: V, events: buf.slice(), dropped, final: true });
+      } catch {
+        /* extension context gone as the page unloads - nothing more we can do */
+      }
+      return;
+    }
+    if (sending) return;
     sending = true;
     // A COPY, and a count captured now: `buf` keeps growing while this call is in flight, so holding
     // a reference to it and slicing by its later length would discard events that were never sent.
@@ -110,6 +131,34 @@
       .replace(/\s+/g, " ")
       .slice(0, n);
 
+  /** aria-labelledby, then a <label for=id> or an ancestor <label>. This is where a checkbox/radio's
+   *  visible text lives - it has no placeholder, aria-label or useful name - so without it those come
+   *  out unlabeled. */
+  function associatedLabel(h: HTMLElement): string {
+    const doc = h.ownerDocument || document;
+    const lb = h.getAttribute("aria-labelledby");
+    if (lb) {
+      const t = lb
+        .split(/\s+/)
+        .map((id) => (doc.getElementById(id)?.innerText || "").trim())
+        .filter(Boolean)
+        .join(" ");
+      if (t) return t;
+    }
+    const id = h.getAttribute("id");
+    if (id) {
+      try {
+        const lab = doc.querySelector(`label[for="${CSS.escape ? CSS.escape(id) : id}"]`) as HTMLElement | null;
+        if (lab?.innerText) return lab.innerText;
+      } catch {
+        /* unescapable id */
+      }
+    }
+    const wrap = (h.closest && h.closest("label")) as HTMLElement | null;
+    if (wrap?.innerText) return wrap.innerText;
+    return "";
+  }
+
   function labelOf(h: HTMLElement): string {
     const i = h as HTMLInputElement;
     // For a form field the label must NOT fall back to `value`: the action already carries the value,
@@ -118,7 +167,7 @@
     // state; here the state is reported separately.
     if (/^(INPUT|TEXTAREA|SELECT)$/.test(h.tagName)) {
       return clean(
-        (i.placeholder || h.getAttribute("aria-label") || h.getAttribute("title") || i.name || "") as string
+        (i.placeholder || h.getAttribute("aria-label") || associatedLabel(h) || h.getAttribute("title") || i.name || "") as string
       );
     }
     return clean(
@@ -165,7 +214,30 @@
       cur = parent;
       hops++;
     }
-    return parts.join(" > ").replace(/ > >> > /g, " >> ").slice(0, 200);
+    // Assemble by dropping WHOLE leading segments if too long - a blind slice(0,200) can cut mid-token
+    // ("div.foo" → "div.fo") and yield an invalid selector. The leaf (most specific) is always kept.
+    const join = () => parts.join(" > ").replace(/ > >> > /g, " >> ");
+    let out = join();
+    while (out.length > 200 && parts.length > 1) {
+      parts.shift();
+      out = join();
+    }
+    // Prefer the SHORTEST suffix of the path that already uniquely identifies this element: start at
+    // the leaf and extend leftward until querySelectorAll returns exactly it. A more specific (longer)
+    // prefix can disambiguate where the leaf alone cannot, so keep extending rather than giving up.
+    try {
+      const doc = h.ownerDocument || document;
+      const segs = out.split(" > ");
+      for (let i = segs.length - 1; i >= 0; i--) {
+        const cand = segs.slice(i).join(" > ");
+        if (cand.includes(">>")) break; // shadow-boundary paths are not re-queryable; keep the full form
+        const m = doc.querySelectorAll(cand);
+        if (m.length === 1 && m[0] === h) return cand;
+      }
+    } catch {
+      /* invalid selector under querySelectorAll - fall through to the assembled (still valid) form */
+    }
+    return out;
   }
 
   const SECRET_AC = /(current|new)-password|one-time-code|cc-(number|csc)/i;
@@ -264,9 +336,16 @@
       if (!form) return;
       const fields: any[] = [];
       try {
+        // FormData is exactly what the browser will submit: unchecked checkboxes and unselected radios
+        // are omitted, the chosen radio's value appears once, disabled fields are excluded. Iterating
+        // form.elements instead reported every option and every unchecked box - not what was sent.
+        const secretNames = new Set<string>();
         for (const el of Array.from(form.elements ?? []) as HTMLInputElement[]) {
-          if (!el.name || el.type === "submit" || el.type === "button") continue;
-          fields.push({ name: el.name, value: String(el.value ?? "").slice(0, 200), secret: isSecretField(el) });
+          if (el.name && isSecretField(el)) secretNames.add(el.name);
+        }
+        for (const [name, value] of new FormData(form).entries()) {
+          if (typeof value !== "string") continue; // a File entry - the name/size, not contents
+          fields.push({ name, value: value.slice(0, 200), secret: secretNames.has(name) });
           if (fields.length >= 25) break;
         }
       } catch {
@@ -322,15 +401,19 @@
     true
   );
 
-  // SPA route changes. history.pushState is patched in the MAIN world (watch-main.ts) and relayed
-  // here; popstate/hashchange are observable from an isolated world directly.
+  // SPA route changes. history.pushState/replaceState are patched in the MAIN world (bbWatchMainShim)
+  // and relayed here; popstate/hashchange are observable from an isolated world directly.
   let lastUrl = nav();
-  const reportNav = (via: string) => {
+  const reportNav = (via: string, replace = false) => {
     const url = nav();
     if (url === lastUrl) return;
     const from = lastUrl;
     lastUrl = url;
-    push({ t: now(), k: "nav", url, from, via, title: document.title });
+    const ev: any = { t: now(), k: "nav", url, from, via, title: document.title };
+    // replaceState (search-as-you-type rewrites ?q= per keystroke) must not split the input burst -
+    // the server drops it while a burst is open. Carry the flag so it can.
+    if (replace) ev.replace = true;
+    push(ev);
   };
   window.addEventListener("popstate", () => reportNav("popstate"), true);
   window.addEventListener("hashchange", () => reportNav("hash"), true);
@@ -343,7 +426,7 @@
     } catch {
       return;
     }
-    if (d.kind === "nav") reportNav("spa");
+    if (d.kind === "nav") reportNav("spa", !!d.replace);
     else if (d.kind === "console") push({ t: now(), k: "console", level: d.level, text: String(d.text ?? "").slice(0, 500), src: d.src, line: d.line });
   }) as EventListener);
 
@@ -351,8 +434,8 @@
     push({ t: now(), k: document.visibilityState === "hidden" ? "hidden" : "visible", url: nav(), title: document.title });
   });
 
-  // The document is about to die; get whatever is buffered onto the wire.
-  window.addEventListener("pagehide", () => flush(), true);
+  // The document is about to die; get whatever is buffered onto the wire even if a send is in flight.
+  window.addEventListener("pagehide", () => flush(true), true);
 
   // ---- arming handshake ---------------------------------------------------
 

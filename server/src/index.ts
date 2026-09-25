@@ -69,16 +69,28 @@ const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 const httpServer = createServer(app);
-const hub = new ExtensionHub(httpServer, token);
+const hub = new ExtensionHub(httpServer, token, VERSION);
 
 // ---- watch mode wiring ----
 // The registry is a module singleton (registerTools runs per MCP session), so this is attached once,
 // here, rather than inside a tool closure.
 hub.registerTap((msg, receivedAt) => {
   if (msg.type === "watch") {
-    const session = msg.watchId ? watchRegistry.get(msg.watchId) : watchRegistry.forTab(msg.tabId);
+    let session = msg.watchId ? watchRegistry.get(msg.watchId) : watchRegistry.forTab(msg.tabId);
+    // A batch for a watch the server lost (a restart, before the extension's hello re-announce lands):
+    // adopt it rather than dropping the human's browsing on the floor. The page has been holding these
+    // events; recreating the session lets them - and every later one - land.
+    if (!session && msg.watchId) session = watchRegistry.adopt(msg.watchId, msg.tabId, [msg.tabId], receivedAt);
     if (!session) return;
+    // A FOLLOWED tab (target=_blank / window.open / OAuth popup) streams under the same watchId but a
+    // new tabId. Bind it so its net rows (which arrive on the capture channel, keyed only by tabId)
+    // resolve to this session, and so health.tabs / watch_stop know it exists. The extension's own
+    // `opened` event folds into the "tab added" line, so this does not stage a duplicate.
+    if (session.followTab(msg.tabId)) watchRegistry.bindTab(msg.tabId, session.watchId);
     session.ingest({ tabId: msg.tabId, frameId: msg.frameId }, msg.entries ?? [], receivedAt);
+    // The page reports its own overflow-drop count; record it as a visible gap rather than losing a
+    // stretch of browsing silently.
+    if (msg.dropped) session.notePageDropped(msg.tabId, msg.dropped, receivedAt);
     // A tab the watch just followed needs its own network capture, or "capture everything" silently
     // stops at the tab the watch started on - which is exactly where an OAuth popup or a
     // target=_blank checkout flow goes.
@@ -105,8 +117,10 @@ hub.onHello((hello) => {
   const announced = new Set<string>();
   for (const g of hello?.watch?.groups ?? []) {
     announced.add(g.watchId);
-    const session = watchRegistry.get(g.watchId);
-    if (!session) continue;
+    // The extension still has this watch. If the server lost it (a restart), recreate it so the
+    // timeline resumes instead of every re-sent page event being dropped as unknown - "total loss
+    // after a server restart" was exactly this gap.
+    const session = watchRegistry.get(g.watchId) ?? watchRegistry.adopt(g.watchId, g.rootTabId ?? g.tabs?.[0] ?? -1, g.tabs ?? [], Date.now());
     session.markBrowserFound();
     for (const tabId of g.tabs ?? []) watchRegistry.bindTab(tabId, g.watchId);
     if (g.swRestarted) session.noteGap("sw-restarted", g.gapMs ?? 0, Date.now());
@@ -242,6 +256,7 @@ httpServer.listen(PORT, HOST, () => {
   console.error(`[browser-bridge] listening on http://${HOST}:${PORT}`);
   console.error(`[browser-bridge] MCP endpoint:  http://${HOST}:${PORT}/mcp  (Authorization: Bearer <token>)`);
   console.error(`[browser-bridge] extension WS:  ws://${HOST}:${PORT}/ws?token=<token>`);
-  console.error(`[browser-bridge] token: ${token}`);
+  // Log the token FILE PATH, never the token value: launchd persists stderr to
+  // ~/.browser-bridge/server.log indefinitely, so a printed secret would linger there forever.
   console.error(`[browser-bridge] token file: ${join(homedir(), ".browser-bridge", "token")}`);
 });

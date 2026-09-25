@@ -2,8 +2,14 @@ import { WebSocketServer, WebSocket } from "ws";
 import type { Server as HttpServer, IncomingMessage } from "http";
 import { randomUUID } from "crypto";
 import { CaptureSink } from "./capture-sink.js";
+import { versionSkewWarning } from "./version.js";
 
 export const CALL_TIMEOUT_MS = 30_000;
+
+// The `ws` default maxPayload is 100 MiB; a single reply over that closes the socket with 1009 and
+// fails every in-flight call. Raise it generously so a big-but-legitimate frame (MHTML snapshot, HAR
+// export, full-page screenshot) is delivered instead of dropping the whole connection.
+const WS_MAX_PAYLOAD = 256 * 1024 * 1024;
 
 interface Pending {
   resolve: (v: unknown) => void;
@@ -24,6 +30,8 @@ export interface StreamMsg {
   tabId: number;
   frameId?: number;
   entries: any[];
+  /** Cumulative page-buffer overflow count (watch mode); the server records the increase as a gap. */
+  dropped?: number;
   done?: boolean;
 }
 export type StreamTap = (msg: StreamMsg, receivedAt: number) => void;
@@ -51,9 +59,17 @@ export class ExtensionHub {
   // per-MCP-session tool closure) so session_record_stop can resolve the path regardless of which
   // MCP client/session issued session_record_start (start+stop need not share a session).
   private recordingPaths = new Map<number, string>();
+  // Last version-skew warning already logged, so a reconnecting extension doesn't spam the log.
+  private lastSkewWarned: string | null = null;
+  // session_record_stop waits for the recorder's streamed `done` before reading the events file.
+  // A pending stop registers a one-shot resolver here (keyed by tab); onCapture fires it when the
+  // `done` batch lands. The just-closed sink is retained so the stop can still await its drain()
+  // after onCapture removed it from sessionSinks.
+  private sessionDoneWaiters = new Map<number, () => void>();
+  private closedSessionSinks = new Map<number, CaptureSink>();
 
-  constructor(httpServer: HttpServer, token: string) {
-    const wss = new WebSocketServer({ noServer: true });
+  constructor(httpServer: HttpServer, token: string, private version = "0.0.0") {
+    const wss = new WebSocketServer({ noServer: true, maxPayload: WS_MAX_PAYLOAD });
 
     httpServer.on("upgrade", (req, socket, head) => {
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
@@ -99,6 +115,15 @@ export class ExtensionHub {
       if (msg.type === "hello") {
         this.lastHello = { version: msg.version, build: msg.build, at: Date.now() };
         console.error(`[hub] extension hello: v${msg.version} (build ${msg.build ?? "unknown"})`);
+        // Surface a version skew loudly, once per distinct mismatch - it silently breaks tools that
+        // exist on only one side.
+        const skew = versionSkewWarning(this.version, msg.version);
+        if (skew && skew !== this.lastSkewWarned) {
+          this.lastSkewWarned = skew;
+          console.error(`[hub] version skew: ${skew}`);
+        } else if (!skew) {
+          this.lastSkewWarned = null;
+        }
         // The extension re-announces its live watch state on every connect, so a server restart or a
         // service-worker respawn is recoverable without the agent doing anything.
         for (const w of this.helloWatchers) {
@@ -126,7 +151,13 @@ export class ExtensionHub {
       this.pending.delete(msg.id);
       clearTimeout(p.timer);
       if (msg.ok) p.resolve(msg.result);
-      else p.reject(new Error(msg.error ?? "unknown extension error"));
+      else {
+        // Carry the extension's structured code (e.g. RESULT_TOO_LARGE) onto the Error so the server
+        // classifier prefers it over parsing the message.
+        const e = new Error(msg.error ?? "unknown extension error");
+        if (typeof msg.code === "string") (e as any).code = msg.code;
+        p.reject(e);
+      }
     });
 
     ws.on("close", () => {
@@ -149,8 +180,18 @@ export class ExtensionHub {
         this.notifyConn(false);
         for (const sink of this.captureSinks.values()) sink.close();
         this.captureSinks.clear();
-        for (const sink of this.sessionSinks.values()) sink.close();
+        // Hand still-open session sinks to closedSessionSinks (as onCapture does on `done`) BEFORE
+        // clearing, so a session_record_stop racing this close still awaits their drain instead of
+        // reading a half-flushed events file. close() only chains the fd-close; drain() awaits it.
+        for (const [tabId, sink] of this.sessionSinks) {
+          sink.close();
+          this.closedSessionSinks.set(tabId, sink);
+        }
         this.sessionSinks.clear();
+        // Wake any session_record_stop waiting on a streamed `done` that will now never come, so it
+        // falls through to drain whatever was buffered instead of blocking out its full timeout.
+        for (const w of this.sessionDoneWaiters.values()) w();
+        this.sessionDoneWaiters.clear();
       }
     });
     ws.on("error", (err) => console.error(`[hub] ws error: ${err.message}`));
@@ -279,6 +320,49 @@ export class ExtensionHub {
     if (msg.done) {
       sink.close();
       sinks.delete(tabId);
+      if (msg.stream === "session") {
+        // Retain the closed sink so a pending session_record_stop can await its drain(), and wake it.
+        this.closedSessionSinks.set(tabId, sink);
+        const w = this.sessionDoneWaiters.get(tabId);
+        if (w) {
+          this.sessionDoneWaiters.delete(tabId);
+          w();
+        }
+      }
+    }
+  }
+
+  // Wait (bounded) for a tab's session recording to receive its streamed `done`, then drain the sink
+  // so every queued event is on disk before session_record_stop reads the file. Handles all three
+  // orderings: `done` already arrived, `done` arrives within the timeout, or it never comes (extension
+  // died mid-stop) - in which case we close+drain whatever was buffered rather than block or lose it.
+  async settleSessionSink(tabId: number, timeoutMs = 3000): Promise<void> {
+    if (tabId == null) return;
+    if (!this.sessionSinks.has(tabId)) {
+      // `done` already processed: onCapture closed the sink and chained its tail writes. Await them.
+      const closed = this.closedSessionSinks.get(tabId);
+      this.closedSessionSinks.delete(tabId);
+      if (closed) await closed.drain();
+      return;
+    }
+    // Still open: wait for onCapture to see the `done`, bounded by the timeout.
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        this.sessionDoneWaiters.delete(tabId);
+        resolve();
+      }, timeoutMs);
+      this.sessionDoneWaiters.set(tabId, () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    // Close+drain whichever handle we have (the retained closed one, or a still-open sink on timeout).
+    const sink = this.closedSessionSinks.get(tabId) ?? this.sessionSinks.get(tabId);
+    this.closedSessionSinks.delete(tabId);
+    this.sessionSinks.delete(tabId);
+    if (sink) {
+      sink.close(); // idempotent
+      await sink.drain();
     }
   }
 

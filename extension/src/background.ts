@@ -1,5 +1,12 @@
 /// <reference types="chrome" />
 
+import { NetRing, applyRedirectResponse, capBody, Semaphore, type NetEntry } from "./net-capture.js";
+// Self-contained injected page helpers, kept in their own files so the two hot files stay small:
+// bbAct is the ONE find-and-act helper the interaction tools share; bbAxSnapshot is the ARIA walker.
+import { bbAct, type BbActParams } from "./dom-act";
+import { bbAxSnapshot } from "./ax";
+import { emulateDevice, emulateNetwork, emulateCpu, emulateLocale, emulateGeolocation, emulateReset } from "./emulate.js";
+
 // Injected at build time by build.mjs (esbuild define) from extension/package.json - single
 // source of truth shared with manifest.json, so the version can't drift.
 declare const __BB_VERSION__: string;
@@ -13,13 +20,33 @@ let ws: WebSocket | null = null;
 let pingTimer: ReturnType<typeof setInterval> | null = null;
 let reconnectDelay = 1_000;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+// Synchronous in-flight guard for connect(). The OPEN/CONNECTING check below runs BEFORE an await, so
+// two callers in the same tick (storage.onChanged + a reconnect message, onStartup + an alarm) would
+// each open a second socket - a race that leaves a superseded socket flipping status underneath the
+// live one. Setting this before the await closes that window.
+let connecting = false;
+
+// A reply frame larger than the server's maxPayload (256 MiB) would close the socket with 1009 and
+// fail every in-flight call, so anything past this threshold is refused with a structured error
+// instead. Generous enough for a full-page screenshot / MHTML / HAR, far under the server's cap.
+const REPLY_MAX_BYTES = 64 * 1024 * 1024;
 
 function setStatus(status: string, detail = "") {
   chrome.storage.local.set({ bbStatus: status, bbDetail: detail, bbUpdated: Date.now() });
 }
 
 async function connect() {
+  if (connecting) return;
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  connecting = true;
+  try {
+    await connectNow();
+  } finally {
+    connecting = false;
+  }
+}
+
+async function connectNow() {
   const { token, port } = await chrome.storage.local.get({ token: "", port: 8765 });
   if (!token) {
     setStatus("no-token", "Set the server token in the extension options.");
@@ -30,6 +57,7 @@ async function connect() {
   ws = socket;
 
   socket.onopen = async () => {
+    if (ws !== socket) return; // superseded by a newer connect() before we opened; don't touch globals
     reconnectDelay = 1_000;
     setStatus("connected");
     // Re-announce live watch state on every connect. One mechanism covers both a server restart and
@@ -44,6 +72,7 @@ async function connect() {
         watch: {
           groups: serializeWatch().map((g) => ({
             watchId: g.watchId,
+            rootTabId: g.rootTabId,
             tabs: g.tabs.map((t: WatchTab) => t.tabId),
             swRestarted: gapMs > 45_000,
             gapMs,
@@ -68,26 +97,42 @@ async function connect() {
     }
     if (msg.type === "pong") return;
     if (!msg.id || !msg.method) return;
+    let reply: any;
     try {
       const result = await dispatch(msg.method, msg.params ?? {});
-      socket.send(JSON.stringify({ id: msg.id, ok: true, result }));
+      reply = { id: msg.id, ok: true, result };
     } catch (err) {
-      socket.send(JSON.stringify({ id: msg.id, ok: false, error: err instanceof Error ? err.message : String(err) }));
+      reply = { id: msg.id, ok: false, error: err instanceof Error ? err.message : String(err) };
     }
+    // Serialize once (this is the hot path). A frame larger than the server's maxPayload closes the
+    // socket (1009) and fails EVERY in-flight call, so refuse it with a structured error instead.
+    let json = JSON.stringify(reply);
+    if (reply.ok && json.length > REPLY_MAX_BYTES) {
+      reply = {
+        id: msg.id,
+        ok: false,
+        code: "RESULT_TOO_LARGE",
+        bytes: json.length,
+        error: `Result too large to return (${json.length} bytes > ${REPLY_MAX_BYTES}). Narrow the query (limit/filter) or fetch a subset.`,
+      };
+      json = JSON.stringify(reply);
+    }
+    replyOrQueue(socket, json, reply);
   };
 
   socket.onclose = () => {
+    if (ws !== socket) return; // a superseded/replaced socket closing must not disturb the live one
     if (pingTimer) {
       clearInterval(pingTimer);
       pingTimer = null;
     }
-    if (ws === socket) ws = null;
+    ws = null;
     setStatus("disconnected", "Will retry automatically.");
     scheduleReconnect();
   };
 
   socket.onerror = () => {
-    // onclose fires next; nothing to do here
+    // onclose fires next; nothing to do here (and a superseded socket must never touch globals)
   };
 }
 
@@ -162,6 +207,22 @@ function pumpOutbox(): void {
     outbox.shift();
     outboxBytes -= o.bytes;
   }
+}
+
+// Send a dispatch reply on the socket it arrived on, or - when that socket is no longer OPEN
+// (superseded by a reconnect, or closing) - hand it to the outbox instead of calling send() on a dead
+// socket. A reply the server no longer awaits is ignored by id, so routing a late one is harmless.
+// `json` is the already-serialized reply (sent as-is); `obj` is the same value for the outbox path.
+function replyOrQueue(socket: WebSocket, json: string, obj: any): void {
+  if (socket.readyState === WebSocket.OPEN) {
+    try {
+      socket.send(json);
+      return;
+    } catch {
+      /* fall through to the outbox */
+    }
+  }
+  shipOrQueue(obj);
 }
 
 // ---------- watch mode ----------
@@ -273,6 +334,12 @@ async function hydrate(): Promise<void> {
       await registerWatchScripts([...watchGroups.values()].some((g) => g.consoleMode !== "off"));
       void persistWatch();
     }
+    // Identities and active session recordings survive an SW eviction the same way the watch group
+    // does; the debugger reconcile cleans up any attach the evicted worker left dangling. Kept in
+    // storage.SESSION (cleared on browser close) - these are credential snapshots and live-page state.
+    await restoreIdentities();
+    await restoreRecordings();
+    await reconcileDebuggerTargets();
   } catch {
     /* first run / storage unavailable */
   }
@@ -388,7 +455,30 @@ function bbWatchMainShim(mode: string) {
       };
     }
   };
+  // SPA route changes are only observable from the MAIN world: history.pushState/replaceState run in
+  // the page's own JS and fire no event an isolated listener can see (popstate/hashchange are the
+  // only ones that reach the isolated world, and pushState is neither). Patch them here and relay to
+  // the isolated watcher, which emits them as via:"spa" navigations. `replace` is carried through so
+  // the fold can leave a search-as-you-type burst intact instead of splitting it per keystroke.
+  const patchHistory = () => {
+    if (w.__bbWatchHist) return;
+    w.__bbWatchHist = 1;
+    for (const m of ["pushState", "replaceState"] as const) {
+      const orig = (history as any)[m];
+      if (typeof orig !== "function") continue;
+      (history as any)[m] = function (this: History, ...args: any[]) {
+        const r = orig.apply(this, args);
+        try {
+          relay({ kind: "nav", replace: m === "replaceState" });
+        } catch {
+          /* never break the page's navigation */
+        }
+        return r;
+      };
+    }
+  };
   if (w.__bbWatchMain) {
+    patchHistory();
     if (mode === "calls") wrapConsole();
     return true;
   }
@@ -398,6 +488,7 @@ function bbWatchMainShim(mode: string) {
   window.addEventListener("unhandledrejection", (e: any) => {
     relay({ kind: "console", level: "error", text: "Unhandled rejection: " + fmt([e?.reason]) });
   });
+  patchHistory();
   if (mode === "calls") wrapConsole();
   w.__bbWatchMain = 1;
   return true;
@@ -446,7 +537,10 @@ function addTabToGroup(g: WatchGroup, tabId: number, openerTabId?: number): void
   if (g.tabs.has(tabId)) return;
   g.tabs.set(tabId, { tabId, openerTabId, addedAt: Date.now() });
   tabToWatch.set(tabId, g.watchId);
-  shipOrQueue({ type: "watch", watchId: g.watchId, tabId, entries: [{ t: Date.now(), k: "opened" }] }, false);
+  // queue:true - the SW is the ONLY source of this event (unlike page events, which the page holds a
+  // copy of), so if the socket is down it must go to the outbox or the followed tab is never
+  // registered server-side and its whole timeline/network is lost.
+  shipOrQueue({ type: "watch", watchId: g.watchId, tabId, entries: [{ t: Date.now(), k: "opened" }] }, true);
   void persistWatch();
   // The new tab's content script may have run its hello handshake before this membership existed
   // (onCreated and the first document load race), in which case it is sitting dormant. Arm it.
@@ -528,6 +622,41 @@ async function injectAllAggregate(tab: chrome.tabs.Tab, func: (...args: any[]) =
   }
   if (acted) return acted;
   throw new Error(stale ? "Ref matched an element that was since removed/re-rendered - take a fresh snapshot" : "Element not found in any frame - take a fresh snapshot");
+}
+
+// bbAct across every frame, tracking WHICH frame owns the element so the auto-wait retry can
+// re-inject into just that frame instead of walking every frame's DOM again each tick. Unlike
+// injectAllAggregate it does NOT throw on not-found/stale - it returns a structured result the retry
+// loop interprets (a real {error} still throws). frameId is null when no frame located the element.
+async function actAllFrames(tab: chrome.tabs.Tab, args: any[]): Promise<{ result: any; frameId: number | null }> {
+  const results = await injectAllFrames(tab, bbAct, args);
+  let acted: any = null;
+  let ownerFrame: number | null = null;
+  let stale = false;
+  for (const r of results) {
+    const v: any = r?.result;
+    if (!v || typeof v !== "object") continue;
+    if (typeof v.error === "string") throw new Error(v.error);
+    if (v.staleRef) { stale = true; continue; }
+    if (v.notFound) continue;
+    acted = v;
+    ownerFrame = r.frameId; // this frame owns the element (result may be notActionable)
+  }
+  if (acted) return { result: acted, frameId: ownerFrame };
+  return { result: stale ? { staleRef: true } : { notFound: true }, frameId: null };
+}
+
+// A retry once the owning frame is known: run bbAct in just that one frame.
+async function actInFrame(tab: chrome.tabs.Tab, frameId: number, args: any[]): Promise<any> {
+  const res = await chrome.scripting.executeScript({
+    target: { tabId: tab.id!, frameIds: [frameId] },
+    world: "ISOLATED",
+    func: bbAct as any,
+    args: clean(args),
+  });
+  const v: any = res?.[0]?.result;
+  if (v && typeof v === "object" && typeof v.error === "string") throw new Error(v.error);
+  return v ?? { notFound: true };
 }
 
 // ---------- injected page functions ----------
@@ -660,356 +789,6 @@ function bbSnapshot(refOffset: number) {
   return { url: location.href, count: items.length, elements: items };
 }
 
-function bbInteract(action: string, ref: number | null, sel: string | null, value: string | null) {
-  // Self-contained shadow-piercing finder (injected funcs may not reference module-scope helpers).
-  const deepFind = (pred: (e: Element) => boolean): HTMLElement | null => {
-    const stack: (Document | ShadowRoot)[] = [document];
-    while (stack.length) {
-      const root = stack.pop()!;
-      let els: NodeListOf<Element>;
-      try {
-        els = root.querySelectorAll("*");
-      } catch {
-        continue;
-      }
-      for (const el of Array.from(els)) {
-        try {
-          if (pred(el)) return el as HTMLElement;
-        } catch {}
-        const sr = (el as HTMLElement).shadowRoot;
-        if (sr) stack.push(sr);
-      }
-    }
-    return null;
-  };
-  // Resolve a ref via the ISOLATED-world registry (window.__bbRefs) that bbSnapshot builds -
-  // no data-bb-ref DOM mutation. A ref that matched but whose element was since removed/re-rendered
-  // returns {staleRef} so the caller retries with a fresh snapshot. CSS selectors still deep-find.
-  let el: HTMLElement | null = null;
-  if (ref != null) {
-    const reg = (window as any).__bbRefs as Map<number, Element> | undefined;
-    const hit = reg && reg.get(ref);
-    if (!hit) return { notFound: true };
-    if (!(hit as Element).isConnected) return { staleRef: true };
-    el = hit as HTMLElement;
-  } else {
-    el = deepFind((e) => {
-      try {
-        return (e as HTMLElement).matches(sel!);
-      } catch {
-        return false;
-      }
-    });
-    if (!el) return { notFound: true };
-  }
-
-  const setNativeValue = (target: HTMLElement, v: string): boolean => {
-    if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
-      const proto = target instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
-      if (setter) setter.call(target, v);
-      else (target as any).value = v;
-    } else if (target instanceof HTMLSelectElement) {
-      (target as HTMLSelectElement).value = v;
-    } else if (target.isContentEditable) {
-      target.textContent = v;
-    } else {
-      return false;
-    }
-    return true;
-  };
-
-  const tag = el.tagName.toLowerCase();
-  // --- actionability preflight (returns {notActionable, reason} so the caller can retry/report) ---
-  const cs = getComputedStyle(el);
-  const rect0 = el.getBoundingClientRect();
-  const visible =
-    (!!rect0.width || !!rect0.height) &&
-    cs.visibility !== "hidden" &&
-    cs.display !== "none" &&
-    ((el as any).checkVisibility ? (el as any).checkVisibility() : true);
-  const disabled = !!(el as any).disabled || el.getAttribute("aria-disabled") === "true";
-  if (!visible) return { notActionable: true, reason: "hidden", tag };
-  if (disabled && action !== "hover") return { notActionable: true, reason: "disabled", tag };
-
-  if (action === "click" || action === "hover") {
-    el.scrollIntoView({ block: "center", inline: "center" });
-    const r = el.getBoundingClientRect();
-    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-    if (action === "click") {
-      const top = document.elementFromPoint(cx, cy) as HTMLElement | null;
-      const covered = !!top && top !== el && !el.contains(top) && !top.contains(el);
-      if (covered) {
-        const by = top!.tagName.toLowerCase() + (top!.id ? "#" + top!.id : top!.className && typeof top!.className === "string" ? "." + top!.className.trim().split(/\s+/)[0] : "");
-        return { notActionable: true, reason: "covered", coveredBy: by, tag };
-      }
-      el.click();
-      return { clicked: true, via: "synthetic", tag, label: (el.innerText || "").trim().slice(0, 80) };
-    }
-    const base: any = { bubbles: true, cancelable: true, clientX: cx, clientY: cy };
-    el.dispatchEvent(new PointerEvent("pointerover", base));
-    el.dispatchEvent(new MouseEvent("mouseover", base));
-    el.dispatchEvent(new MouseEvent("mouseenter", base));
-    el.dispatchEvent(new MouseEvent("mousemove", base));
-    return { hovered: true, tag };
-  }
-  if (action === "fill") {
-    el.focus();
-    if (el.isContentEditable) {
-      // rich editors (ProseMirror/Quill/Lit/React) require beforeinput - execCommand fires it
-      try {
-        document.execCommand("selectAll", false);
-        document.execCommand("insertText", false, value ?? "");
-      } catch {
-        el.textContent = value ?? "";
-      }
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      return { filled: true, via: "execCommand", tag };
-    }
-    if (!setNativeValue(el, value ?? "")) return { error: `Element <${tag}> is not fillable` };
-    el.dispatchEvent(new Event("input", { bubbles: true }));
-    el.dispatchEvent(new Event("change", { bubbles: true }));
-    return { filled: true, tag };
-  }
-  if (action === "type") {
-    el.focus();
-    const text = value ?? "";
-    if (el.isContentEditable) {
-      for (const ch of Array.from(text)) {
-        el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, bubbles: true, cancelable: true }));
-        try {
-          document.execCommand("insertText", false, ch);
-        } catch {
-          el.textContent = (el.textContent ?? "") + ch;
-        }
-        el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, bubbles: true, cancelable: true }));
-      }
-      return { typed: text.length, via: "execCommand", tag };
-    }
-    let cur = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? el.value : el.textContent ?? "";
-    for (const ch of Array.from(text)) {
-      const opts: any = { key: ch, bubbles: true, cancelable: true };
-      el.dispatchEvent(new KeyboardEvent("keydown", opts));
-      el.dispatchEvent(new KeyboardEvent("keypress", opts));
-      cur += ch;
-      setNativeValue(el, cur);
-      el.dispatchEvent(new InputEvent("input", { bubbles: true, data: ch, inputType: "insertText" }));
-      el.dispatchEvent(new KeyboardEvent("keyup", opts));
-    }
-    el.dispatchEvent(new Event("change", { bubbles: true }));
-    return { typed: text.length, tag };
-  }
-  return { error: `Unknown action: ${action}` };
-}
-
-function bbFileUpload(sel: string | null, ref: number | null, filename: string, mimeType: string | null, b64: string) {
-  const deepFind = (pred: (e: Element) => boolean): HTMLElement | null => {
-    const stack: (Document | ShadowRoot)[] = [document];
-    while (stack.length) {
-      const root = stack.pop()!;
-      let els: NodeListOf<Element>;
-      try {
-        els = root.querySelectorAll("*");
-      } catch {
-        continue;
-      }
-      for (const el of Array.from(els)) {
-        try {
-          if (pred(el)) return el as HTMLElement;
-        } catch {}
-        const sr = (el as HTMLElement).shadowRoot;
-        if (sr) stack.push(sr);
-      }
-    }
-    return null;
-  };
-  // Resolve a ref via the ISOLATED-world registry (window.__bbRefs) that bbSnapshot builds -
-  // no data-bb-ref DOM mutation. A ref that matched but whose element was since removed/re-rendered
-  // returns {staleRef} so the caller retries with a fresh snapshot. CSS selectors still deep-find.
-  let el: HTMLElement | null = null;
-  if (ref != null) {
-    const reg = (window as any).__bbRefs as Map<number, Element> | undefined;
-    const hit = reg && reg.get(ref);
-    if (!hit) return { notFound: true };
-    if (!(hit as Element).isConnected) return { staleRef: true };
-    el = hit as HTMLElement;
-  } else {
-    el = deepFind((e) => {
-      try {
-        return (e as HTMLElement).matches(sel!);
-      } catch {
-        return false;
-      }
-    });
-    if (!el) return { notFound: true };
-  }
-  if (!(el instanceof HTMLInputElement) || el.type !== "file") return { error: "Target is not an <input type=file>" };
-  let bytes: Uint8Array;
-  try {
-    const bin = atob(b64);
-    bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  } catch {
-    return { error: "Invalid base64 content" };
-  }
-  const file = new File([bytes as BlobPart], filename, { type: mimeType || "application/octet-stream" });
-  const dt = new DataTransfer();
-  dt.items.add(file);
-  (el as HTMLInputElement).files = dt.files;
-  el.dispatchEvent(new Event("input", { bubbles: true }));
-  el.dispatchEvent(new Event("change", { bubbles: true }));
-  return { uploaded: filename, size: bytes.length };
-}
-
-// Paste (or drop) an image into a rich text / contenteditable field via synthetic clipboard/drag events.
-function bbPasteImage(sel: string | null, ref: number | null, b64: string, mimeType: string, method: string) {
-  const deepFind = (pred: (e: Element) => boolean): HTMLElement | null => {
-    const stack: (Document | ShadowRoot)[] = [document];
-    while (stack.length) {
-      const root = stack.pop()!;
-      let els: NodeListOf<Element>;
-      try {
-        els = root.querySelectorAll("*");
-      } catch {
-        continue;
-      }
-      for (const el of Array.from(els)) {
-        try {
-          if (pred(el)) return el as HTMLElement;
-        } catch {}
-        const sr = (el as HTMLElement).shadowRoot;
-        if (sr) stack.push(sr);
-      }
-    }
-    return null;
-  };
-  // Resolve a ref via the ISOLATED-world registry (window.__bbRefs) that bbSnapshot builds -
-  // no data-bb-ref DOM mutation. A ref that matched but whose element was since removed/re-rendered
-  // returns {staleRef} so the caller retries with a fresh snapshot. CSS selectors still deep-find.
-  let el: HTMLElement | null = null;
-  if (ref != null) {
-    const reg = (window as any).__bbRefs as Map<number, Element> | undefined;
-    const hit = reg && reg.get(ref);
-    if (!hit) return { notFound: true };
-    if (!(hit as Element).isConnected) return { staleRef: true };
-    el = hit as HTMLElement;
-  } else {
-    el = deepFind((e) => {
-      try {
-        return (e as HTMLElement).matches(sel!);
-      } catch {
-        return false;
-      }
-    });
-    if (!el) return { notFound: true };
-  }
-  let bytes: Uint8Array;
-  try {
-    const bin = atob(b64);
-    bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  } catch {
-    return { error: "Invalid base64 content" };
-  }
-  const type = mimeType || "image/png";
-  const ext = (type.split("/")[1] || "png").split("+")[0];
-  const file = new File([bytes as BlobPart], `image.${ext}`, { type });
-  const makeDT = () => {
-    const dt = new DataTransfer();
-    dt.items.add(file);
-    return dt;
-  };
-
-  el.focus();
-  const did: string[] = [];
-  if (method === "paste" || method === "both") {
-    const dt = makeDT();
-    let ev: ClipboardEvent;
-    try {
-      ev = new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true });
-    } catch {
-      ev = new Event("paste", { bubbles: true, cancelable: true }) as ClipboardEvent;
-    }
-    if (!ev.clipboardData) {
-      try {
-        Object.defineProperty(ev, "clipboardData", { value: dt });
-      } catch {}
-    }
-    el.dispatchEvent(ev);
-    did.push("paste");
-  }
-  if (method === "drop" || method === "both") {
-    const r = el.getBoundingClientRect();
-    const base: any = { bubbles: true, cancelable: true, composed: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
-    for (const t of ["dragenter", "dragover", "drop"]) {
-      const dt = makeDT();
-      let de: DragEvent;
-      try {
-        de = new DragEvent(t, { ...base, dataTransfer: dt });
-      } catch {
-        de = new Event(t, base) as DragEvent;
-        try {
-          Object.defineProperty(de, "dataTransfer", { value: dt });
-        } catch {}
-      }
-      el.dispatchEvent(de);
-    }
-    did.push("drop");
-  }
-  return { pasted: true, method: did.join("+") || method, tag: el.tagName.toLowerCase(), size: bytes.length };
-}
-
-// Locate an element (by data-bb-ref or CSS selector, piercing open shadow roots), scroll it into view,
-// and return its viewport-center coordinates - for the trusted (CDP Input) paste path.
-function bbLocate(sel: string | null, ref: number | null) {
-  const deepFind = (pred: (e: Element) => boolean): HTMLElement | null => {
-    const stack: (Document | ShadowRoot)[] = [document];
-    while (stack.length) {
-      const root = stack.pop()!;
-      let els: NodeListOf<Element>;
-      try {
-        els = root.querySelectorAll("*");
-      } catch {
-        continue;
-      }
-      for (const el of Array.from(els)) {
-        try {
-          if (pred(el)) return el as HTMLElement;
-        } catch {}
-        const sr = (el as HTMLElement).shadowRoot;
-        if (sr) stack.push(sr);
-      }
-    }
-    return null;
-  };
-  // Resolve a ref via the ISOLATED-world registry (window.__bbRefs) that bbSnapshot builds -
-  // no data-bb-ref DOM mutation. A ref that matched but whose element was since removed/re-rendered
-  // returns {staleRef} so the caller retries with a fresh snapshot. CSS selectors still deep-find.
-  let el: HTMLElement | null = null;
-  if (ref != null) {
-    const reg = (window as any).__bbRefs as Map<number, Element> | undefined;
-    const hit = reg && reg.get(ref);
-    if (!hit) return { notFound: true };
-    if (!(hit as Element).isConnected) return { staleRef: true };
-    el = hit as HTMLElement;
-  } else {
-    el = deepFind((e) => {
-      try {
-        return (e as HTMLElement).matches(sel!);
-      } catch {
-        return false;
-      }
-    });
-    if (!el) return { notFound: true };
-  }
-  el.scrollIntoView({ block: "center", inline: "center" });
-  try {
-    (el as HTMLElement).focus();
-  } catch {}
-  const r = el.getBoundingClientRect();
-  return { x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height };
-}
-
 // Put an image on the REAL OS clipboard as image/png (converting via canvas if needed). Async; the
 // executeScript caller awaits it. Requires the document focused + user activation (a trusted click).
 async function bbClipboardWriteImage(b64: string, mimeType: string) {
@@ -1120,23 +899,12 @@ async function navByHistory(tab: chrome.tabs.Tab, direction: "back" | "forward")
 const CDP_VERSION = "1.3";
 const NET_MAX_ENTRIES = 500;
 const BODY_CAP = 512 * 1024; // chars returned to the agent per body
+// Bound eager response-body fetches: on an asset-heavy page every loadingFinished would otherwise
+// fire Network.getResponseBody at once, each buffering a whole body in the worker (memory spike).
+const bodyFetchSem = new Semaphore(6);
 const IDLE_DETACH_MS = 5 * 60_000;
 
-interface NetEntry {
-  requestId: string;
-  method?: string;
-  url?: string;
-  type?: string;
-  status?: number;
-  mimeType?: string;
-  requestHeaders?: Record<string, string>;
-  responseHeaders?: Record<string, string>;
-  requestBody?: string;
-  timing?: any;
-  finished?: boolean;
-  failed?: string;
-  ts?: number;
-}
+// NetEntry lives in net-capture.ts (with the ring that holds it).
 
 interface ExtraInfo {
   reqHeaders?: Record<string, string>;
@@ -1189,7 +957,7 @@ interface LogEntry {
 interface Session {
   attachedAt: number;
   lastUsedAt: number;
-  net: NetEntry[];
+  net: NetRing; // bounded request ring with a requestId index (see net-capture.ts)
   netOn: boolean;
   netFilter?: string; // if set, only buffer requests whose URL contains this
   excludeExtensionTraffic?: boolean; // drop non-http(s) requests (other extensions' own traffic)
@@ -1222,6 +990,28 @@ const sessions = new Map<number, Session>();
 
 // Named identity snapshots (cookies incl. HttpOnly + storage + bearer) for replay/authz_matrix.
 const identities = new Map<string, { cookies: any[]; storage: any; bearer?: string }>();
+
+// storage.SESSION, not .local: an identity is a credential snapshot, so it should die with the
+// browser session rather than persist to disk indefinitely. It only needs to outlive an SW eviction,
+// which storage.session does.
+const IDENTITIES_KEY = "bb.identities.v1";
+async function persistIdentities(): Promise<void> {
+  try {
+    await chrome.storage.session.set({ [IDENTITIES_KEY]: [...identities.entries()] });
+  } catch {
+    /* best-effort */
+  }
+}
+async function restoreIdentities(): Promise<void> {
+  try {
+    const got = await chrome.storage.session.get({ [IDENTITIES_KEY]: [] });
+    for (const [name, v] of (got[IDENTITIES_KEY] as [string, any][]) ?? []) {
+      if (!identities.has(name)) identities.set(name, v);
+    }
+  } catch {
+    /* first run / storage unavailable */
+  }
+}
 
 function cmd(tabId: number, method: string, params?: any): Promise<any> {
   return new Promise((resolve, reject) => {
@@ -1278,7 +1068,7 @@ async function ensureAttached(tabId: number): Promise<Session> {
       const s: Session = {
         attachedAt: Date.now(),
         lastUsedAt: Date.now(),
-        net: [],
+        net: new NetRing(NET_MAX_ENTRIES),
         netOn: false,
         netMax: NET_MAX_ENTRIES,
         persist: false,
@@ -1315,6 +1105,30 @@ async function detachSession(tabId: number): Promise<void> {
     await new Promise<void>((resolve) => chrome.debugger.detach({ tabId }, () => resolve()));
   } catch {
     /* already gone */
+  }
+}
+
+// After an SW eviction the in-memory `sessions` map is empty, but a debugger attach the dead worker
+// held can linger. Detach any target still attached BY US with no live session, or the next
+// debugger-backed tool wedges on "already attached". Detaching a target we didn't attach is a no-op
+// (the callback just sets lastError), so this can't steal a DevTools attachment.
+async function reconcileDebuggerTargets(): Promise<void> {
+  let targets: chrome.debugger.TargetInfo[] = [];
+  try {
+    targets = await new Promise<chrome.debugger.TargetInfo[]>((resolve) =>
+      chrome.debugger.getTargets((t) => resolve(t ?? []))
+    );
+  } catch {
+    return;
+  }
+  for (const t of targets) {
+    if (!t.attached || t.tabId == null || sessions.has(t.tabId)) continue;
+    await new Promise<void>((resolve) =>
+      chrome.debugger.detach({ tabId: t.tabId! }, () => {
+        void chrome.runtime.lastError; // swallow "not attached" for a target that wasn't ours
+        resolve();
+      })
+    );
   }
 }
 
@@ -1355,7 +1169,7 @@ function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, param
   if (s.logOn && (method === "Runtime.consoleAPICalled" || method === "Runtime.exceptionThrown" || method === "Log.entryAdded"))
     return onLogEvent(s, method, params);
   if (!s.netOn) return;
-  const find = (id: string) => s.net.find((e) => e.requestId === id);
+  const find = (id: string) => s.net.get(id); // latest hop for the id (redirect-aware, O(1))
   if (method === "Network.requestWillBeSent") {
     const url = params.request?.url ?? "";
     if (s.netFilter && !url.includes(s.netFilter)) return;
@@ -1364,13 +1178,14 @@ function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, param
     // Acrobat/Pocket/etc bundles and base64 font blobs. With persistBodies on, that noise dominates
     // the capture file. Excluded at the source so it never reaches the ring, the JSONL, or a HAR.
     if (s.excludeExtensionTraffic && !/^https?:/i.test(url)) return;
-    // Evict the oldest ring entry AND its side data together, or s.extra grows unbounded past the
-    // ring cap and eventually OOM-kills the MV3 service worker (silently ending a long capture).
-    if (s.net.length >= s.netMax) {
-      const ev = s.net.shift();
-      if (ev) s.extra.delete(ev.requestId);
-    }
-    s.net.push({
+    // A redirect hop re-fires requestWillBeSent with the SAME requestId and a redirectResponse for
+    // the hop that just finished. Finalize that prior hop (its status/headers/Location) and keep it
+    // as its own entry; the new entry below becomes the latest hop the requestId resolves to.
+    if (params.redirectResponse) applyRedirectResponse(s.net.get(params.requestId), params.redirectResponse, url);
+    // push() evicts the oldest entry when at cap and returns the requestId that thereby left the ring
+    // entirely (a still-live redirect hop keeps it), so we drop its side data in lockstep - else
+    // s.extra grows past the ring cap and eventually OOM-kills the MV3 service worker.
+    const gone = s.net.push({
       requestId: params.requestId,
       method: params.request?.method,
       url: params.request?.url,
@@ -1379,6 +1194,7 @@ function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, param
       requestBody: params.request?.postData ? String(params.request.postData).slice(0, BODY_CAP) : undefined,
       ts: Date.now(),
     });
+    if (gone) s.extra.delete(gone);
   } else if (method === "Network.responseReceived") {
     const e = find(params.requestId);
     if (e) {
@@ -1413,9 +1229,13 @@ function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, param
           void (async () => {
             const row = captureNetRow(s, e);
             try {
-              const b = await getResponseBody(tabId, e.requestId);
+              const b = await bodyFetchSem.run(() => getResponseBody(tabId, e.requestId));
               row.responseBody = b.body;
               row.responseBodyBase64 = b.base64;
+              if (b.truncated) {
+                row.responseBodyTruncated = true;
+                row.responseBodyOriginalLength = b.originalLength;
+              }
             } catch (err) {
               row.bodyError = err instanceof Error ? err.message : String(err);
             }
@@ -1476,11 +1296,11 @@ function wsFrame(s: Session, params: any, dir: "sent" | "received"): WsFrame {
   };
 }
 
-async function getResponseBody(tabId: number, requestId: string): Promise<{ body: string; base64: boolean }> {
+async function getResponseBody(tabId: number, requestId: string): Promise<ReturnType<typeof capBody>> {
   const r = await cmd(tabId, "Network.getResponseBody", { requestId });
-  let body = r?.body ?? "";
-  if (typeof body === "string" && body.length > BODY_CAP) body = body.slice(0, BODY_CAP) + "\n…[truncated]";
-  return { body, base64: !!r?.base64Encoded };
+  // capBody reports truncation as {truncated, originalLength} and keeps a base64 body decodable
+  // (cut to a multiple of 4) instead of appending a marker that corrupts it.
+  return capBody(typeof r?.body === "string" ? r.body : "", !!r?.base64Encoded, BODY_CAP);
 }
 
 function djb2(s: string): string {
@@ -1548,8 +1368,63 @@ interface RecState {
   allFrames: boolean;
   maskInputs: boolean;
   recordCanvas: boolean;
+  canvasFps?: number;
+  canvasQuality?: number;
+  canvasMaxDim?: number;
+  canvasBudgetBytes?: number;
 }
 const sessionRecordings = new Map<number, RecState>();
+
+// Persist the DURABLE config of each active recording (not the transient queue/timer) so a recording
+// survives an SW eviction: the injected page recorder keeps posting bb-rec messages, and restoring the
+// map is what lets onMessage accept them again after the worker respawns. storage.SESSION because a
+// recording is tied to a live page, not something to resurrect after a browser restart.
+const RECORDINGS_KEY = "bb.recordings.v1";
+async function persistRecordings(): Promise<void> {
+  try {
+    const rows = [...sessionRecordings.entries()].map(([tabId, r]) => ({
+      tabId,
+      allFrames: r.allFrames,
+      maskInputs: r.maskInputs,
+      recordCanvas: r.recordCanvas,
+      canvasFps: r.canvasFps ?? null,
+      canvasQuality: r.canvasQuality ?? null,
+      canvasMaxDim: r.canvasMaxDim ?? null,
+      canvasBudgetBytes: r.canvasBudgetBytes ?? null,
+    }));
+    await chrome.storage.session.set({ [RECORDINGS_KEY]: rows });
+  } catch {
+    /* best-effort */
+  }
+}
+async function restoreRecordings(): Promise<void> {
+  try {
+    const got = await chrome.storage.session.get({ [RECORDINGS_KEY]: [] });
+    for (const row of (got[RECORDINGS_KEY] as any[]) ?? []) {
+      if (row?.tabId == null || sessionRecordings.has(row.tabId)) continue;
+      try {
+        await chrome.tabs.get(row.tabId); // drop recordings whose tab is gone
+      } catch {
+        continue;
+      }
+      // Fresh queue/timer; the page recorder is still running and streams into this on the next batch.
+      sessionRecordings.set(row.tabId, {
+        queue: [],
+        timer: null,
+        allFrames: !!row.allFrames,
+        maskInputs: !!row.maskInputs,
+        recordCanvas: !!row.recordCanvas,
+        // Preserve the original capture settings so post-eviction re-injection isn't silently downgraded to defaults.
+        canvasFps: row.canvasFps ?? undefined,
+        canvasQuality: row.canvasQuality ?? undefined,
+        canvasMaxDim: row.canvasMaxDim ?? undefined,
+        canvasBudgetBytes: row.canvasBudgetBytes ?? undefined,
+      });
+    }
+  } catch {
+    /* first run / storage unavailable */
+  }
+}
 
 function queueRecord(rec: RecState, tabId: number, events: any[]) {
   for (const e of events) rec.queue.push({ kind: "rrweb", event: e });
@@ -1575,7 +1450,18 @@ function injectFrame(tabId: number, frameId: number, rec: RecState, timeoutMs: n
     await chrome.scripting.executeScript({
       target: { tabId, frameIds: [frameId] },
       func: (opts: any) => (window as any).__bbRec?.start(opts),
-      args: [{ allFrames: rec.allFrames, maskInputs: rec.maskInputs, recordCanvas: rec.recordCanvas }],
+      // executeScript rejects `undefined` in args ("Value is unserializable") - coalesce to null.
+      args: [
+        {
+          allFrames: rec.allFrames,
+          maskInputs: rec.maskInputs,
+          recordCanvas: rec.recordCanvas,
+          canvasFps: rec.canvasFps ?? null,
+          canvasQuality: rec.canvasQuality ?? null,
+          canvasMaxDim: rec.canvasMaxDim ?? null,
+          canvasBudgetBytes: rec.canvasBudgetBytes ?? null,
+        },
+      ],
     });
     return true;
   })();
@@ -1586,19 +1472,22 @@ function injectFrame(tabId: number, frameId: number, rec: RecState, timeoutMs: n
 }
 
 // (Re)inject + start the recorder in a tab's frames. Called on start and on navigation-complete.
-async function injectRecorder(tabId: number, rec: RecState) {
+// Returns whether the TOP frame was injected (the mandatory one: it carries the Meta+FullSnapshot the
+// replay is built from). Subframes are best-effort.
+async function injectRecorder(tabId: number, rec: RecState): Promise<boolean> {
   // Top frame is mandatory (own origin, always injectable) and gets a generous budget.
-  await injectFrame(tabId, 0, rec, 8000);
-  if (!rec.allFrames) return;
+  const top = await injectFrame(tabId, 0, rec, 8000);
+  if (!rec.allFrames) return top;
   // Cross-origin iframes: inject each independently and in parallel, each with its own short timeout,
   // so a frame that never responds is simply skipped (best-effort) instead of blocking record-start.
   let frames: { frameId: number }[] = [];
   try {
     frames = (await chrome.webNavigation.getAllFrames({ tabId })) ?? [];
   } catch {
-    return; // no webNavigation result -> top-frame recording only
+    return top; // no webNavigation result -> top-frame recording only
   }
   await Promise.all(frames.filter((f) => f.frameId !== 0).map((f) => injectFrame(tabId, f.frameId, rec, 4000)));
+  return top;
 }
 
 // scheme + host only, no path/query/fragment - for compact tab listings where the path may carry
@@ -1632,7 +1521,7 @@ async function doReplay(tab: chrome.tabs.Tab, params: any): Promise<any> {
   };
   if (params.requestId) {
     const s = sessions.get(tabId);
-    const e = s?.net.find((x) => x.requestId === params.requestId);
+    const e = s?.net.get(params.requestId);
     if (!e) throw new Error("requestId not found in this tab's capture buffer");
     base = {
       url: e.url,
@@ -2271,7 +2160,7 @@ async function trustedPasteImage(tab: chrome.tabs.Tab, params: any): Promise<any
   }
 
   // find the target element's on-screen center (CSP-safe function injection; handles plain refs + shadow)
-  const loc = await inject(tab, bbLocate, [params.selector ?? null, params.ref ?? null]);
+  const loc = await inject(tab, bbAct, ["locate", { sel: params.selector ?? null, ref: params.ref ?? null }]);
   if (!loc || loc.notFound || loc.staleRef) throw new Error("Target not found (or since re-rendered) for trusted paste - take a fresh snapshot or check the selector.");
   await sleep(150);
 
@@ -2546,6 +2435,41 @@ async function shallowSnapshot(tab: chrome.tabs.Tab): Promise<any> {
   return { url: tab.url, count: all.length, elements: all };
 }
 
+// Banner-free accessibility-tree snapshot, injected per-frame (same scheme as shallowSnapshot: each
+// frame gets a disjoint ref-offset stride, and each interactive node is registered in that frame's
+// window.__bbRefs so its ref works with click/fill/hover/type). The extension returns the structured
+// per-frame trees; the server renders the compact text (server/src/ax.ts).
+async function axSnapshot(tab: chrome.tabs.Tab): Promise<any> {
+  assertScriptable(tab);
+  let frames: { frameId: number }[];
+  try {
+    frames = (await chrome.webNavigation.getAllFrames({ tabId: tab.id! })) ?? [{ frameId: 0 }];
+  } catch {
+    frames = [{ frameId: 0 }];
+  }
+  const FRAME_REF_STRIDE = 500;
+  const results = await Promise.all(
+    frames.map(async (f, i) => {
+      try {
+        const res = await chrome.scripting.executeScript({
+          target: { tabId: tab.id!, frameIds: [f.frameId] },
+          func: bbAxSnapshot as any,
+          args: [i * FRAME_REF_STRIDE],
+        });
+        return { frameId: f.frameId, v: res?.[0]?.result as any };
+      } catch {
+        return null; // frame not injectable (about:blank, sandboxed, gone)
+      }
+    })
+  );
+  const outFrames: any[] = [];
+  for (const r of results) {
+    if (!r || !r.v) continue;
+    outFrames.push({ frameId: r.frameId, url: r.v.url, root: r.v.root ?? null, truncated: !!r.v.truncated });
+  }
+  return { url: tab.url, frames: outFrames };
+}
+
 // Optionally attaches a fresh shallow snapshot to an interaction result (params.withSnapshot),
 // so a caller doing e.g. click-then-observe can skip a separate follow-up snapshot() call.
 // A snapshot failure is reported inline rather than masking the (already-succeeded) action result.
@@ -2567,15 +2491,19 @@ async function withSnapshotIfRequested(tab: chrome.tabs.Tab, params: any, result
 async function interact(tab: chrome.tabs.Tab, action: string, ref: number | null, sel: string | null, value: string | null, params: any): Promise<any> {
   const timeoutMs = params.timeoutMs ?? 5000;
   const deadline = Date.now() + timeoutMs;
+  const args: any[] = [action, { ref, sel, value } satisfies BbActParams];
   let last: any = null;
+  let ownerFrame: number | null = null; // once a frame owns the element, retry only there
   for (;;) {
-    try {
-      last = await injectAllAggregate(tab, bbInteract, [action, ref, sel, value]);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (/not found in any frame|removed\/re-rendered/i.test(msg)) last = { notFound: true };
-      else throw e; // real error (e.g. "not fillable") - surface it
+    if (ownerFrame == null) {
+      const r = await actAllFrames(tab, args);
+      last = r.result;
+      ownerFrame = r.frameId;
+    } else {
+      last = await actInFrame(tab, ownerFrame, args);
+      if (last?.notFound) ownerFrame = null; // the frame lost the element - re-search all frames
     }
+    if (last?.staleRef) last = { notFound: true }; // a dead ref won't recover; report as not found
     const retryable = last && (last.notFound || (last.notActionable && last.reason !== "covered"));
     if (!retryable || Date.now() >= deadline) break;
     await sleep(150);
@@ -2703,24 +2631,30 @@ async function dispatch(method: string, params: any): Promise<any> {
         await cmd(tab.id!, "DOM.setFileInputFiles", { files: [params.path], nodeId });
         return { uploaded: params.path, trusted: true };
       }
-      return injectAllAggregate(tab, bbFileUpload, [
-        params.selector,
-        params.ref,
-        params.filename,
-        params.mimeType,
-        params.base64,
+      return injectAllAggregate(tab, bbAct, [
+        "upload",
+        {
+          sel: params.selector ?? null,
+          ref: params.ref ?? null,
+          filename: params.filename ?? null,
+          mimeType: params.mimeType ?? null,
+          b64: params.base64 ?? null,
+        } satisfies BbActParams,
       ]);
     }
 
     case "paste_image": {
       const tab = await targetTab(params.tabId);
       if (params.trusted) return trustedPasteImage(tab, params);
-      return injectAllAggregate(tab, bbPasteImage, [
-        params.selector ?? null,
-        params.ref ?? null,
-        params.base64,
-        params.mimeType ?? "image/png",
-        params.method ?? "paste",
+      return injectAllAggregate(tab, bbAct, [
+        "pasteImage",
+        {
+          sel: params.selector ?? null,
+          ref: params.ref ?? null,
+          b64: params.base64 ?? null,
+          mimeType: params.mimeType ?? "image/png",
+          method: params.method ?? "paste",
+        } satisfies BbActParams,
       ]);
     }
 
@@ -2737,7 +2671,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       const s = await ensureAttached(tab.id!);
       finalizeCapture(tab.id!); // close any prior persist sink on this tab before (re)starting
       await cmd(tab.id!, "Network.enable");
-      s.net = [];
+      s.net = new NetRing(NET_MAX_ENTRIES);
       s.extra = new Map();
       s.wsUrls = new Map();
       s.wsFrames = [];
@@ -2745,6 +2679,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       s.netFilter = params.urlFilter || undefined;
       s.excludeExtensionTraffic = !!params.excludeExtensionTraffic;
       s.netMax = Math.max(1, Math.min(params.maxEntries ?? NET_MAX_ENTRIES, 5000));
+      s.net.max = s.netMax;
       if (s.flushTimer) {
         clearTimeout(s.flushTimer);
         s.flushTimer = null;
@@ -2761,7 +2696,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       if (!s) throw new Error("Not capturing on this tab - call net_capture_start first.");
       s.lastUsedAt = Date.now();
       const filter: string | undefined = params.urlFilter;
-      let entries = s.net.filter((e) => !filter || (e.url ?? "").includes(filter));
+      let entries = s.net.list().filter((e) => !filter || (e.url ?? "").includes(filter));
       const limit = params.limit ?? 100;
       if (entries.length > limit) entries = entries.slice(-limit);
       const out: any[] = [];
@@ -2783,18 +2718,23 @@ async function dispatch(method: string, params: any): Promise<any> {
         };
         if (x?.setCookie) row.setCookie = x.setCookie;
         if (e.requestBody) row.requestBody = e.requestBody;
+        if (e.redirectLocation) row.redirectLocation = e.redirectLocation;
         if (params.includeBodies && e.finished && !e.failed) {
           try {
-            const b = await getResponseBody(tab.id!, e.requestId);
+            const b = await bodyFetchSem.run(() => getResponseBody(tab.id!, e.requestId));
             row.responseBody = b.body;
             row.responseBodyBase64 = b.base64;
+            if (b.truncated) {
+              row.responseBodyTruncated = true;
+              row.responseBodyOriginalLength = b.originalLength;
+            }
           } catch (err) {
             row.responseBodyError = err instanceof Error ? err.message : String(err);
           }
         }
         out.push(row);
       }
-      return { count: out.length, totalBuffered: s.net.length, requests: out };
+      return { count: out.length, totalBuffered: s.net.size, requests: out };
     }
 
     case "net_get_body": {
@@ -2802,8 +2742,8 @@ async function dispatch(method: string, params: any): Promise<any> {
       const s = sessions.get(tab.id!);
       if (!s) throw new Error("Not capturing on this tab - call net_capture_start first.");
       s.lastUsedAt = Date.now();
-      const b = await getResponseBody(tab.id!, params.requestId);
-      return { requestId: params.requestId, base64: b.base64, body: b.body };
+      const b = await bodyFetchSem.run(() => getResponseBody(tab.id!, params.requestId));
+      return { requestId: params.requestId, base64: b.base64, body: b.body, truncated: !!b.truncated, originalLength: b.originalLength };
     }
 
     case "net_get_ws_frames": {
@@ -2849,12 +2789,14 @@ async function dispatch(method: string, params: any): Promise<any> {
       let bearer: string | undefined;
       const s = sessions.get(tab.id!);
       if (s) {
-        for (let i = s.net.length - 1; i >= 0 && !bearer; i--) {
-          const h = s.extra.get(s.net[i].requestId)?.reqHeaders ?? s.net[i].requestHeaders;
+        const list = s.net.list();
+        for (let i = list.length - 1; i >= 0 && !bearer; i--) {
+          const h = s.extra.get(list[i].requestId)?.reqHeaders ?? list[i].requestHeaders;
           if (h) bearer = (h as any).authorization ?? (h as any).Authorization;
         }
       }
       identities.set(params.name, { cookies, storage, bearer });
+      void persistIdentities(); // survive an SW eviction
       return {
         name: params.name,
         cookies: cookies.length,
@@ -2873,8 +2815,11 @@ async function dispatch(method: string, params: any): Promise<any> {
         })),
       };
 
-    case "identity_purge":
-      return { purged: identities.delete(params.name), name: params.name };
+    case "identity_purge": {
+      const purged = identities.delete(params.name);
+      void persistIdentities();
+      return { purged, name: params.name };
+    }
 
     case "replay_request": {
       const tab = await targetTab(params.tabId);
@@ -2885,7 +2830,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       const tab = await targetTab(params.tabId);
       const s = sessions.get(tab.id!);
       if (params.requestId) {
-        const e = s?.net.find((x) => x.requestId === params.requestId);
+        const e = s?.net.get(params.requestId);
         if (!e) throw new Error("requestId not found in this tab's capture buffer");
         const method = (e.method || "GET").toUpperCase();
         let body = e.requestBody;
@@ -2910,7 +2855,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       const s = sessions.get(tab.id!);
       const rows: any[] = [];
       const runOne = async (rid: string, urlOverride?: string, label?: string) => {
-        const e = s?.net.find((x) => x.requestId === rid);
+        const e = s?.net.get(rid);
         const cells: any[] = [];
         for (const ident of idents) {
           try {
@@ -2936,7 +2881,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       for (const rid of reqIds) {
         await runOne(rid);
         if (params.mutateIds) {
-          const e = s?.net.find((x) => x.requestId === rid);
+          const e = s?.net.get(rid);
           const nb = e?.url ? neighborUrl(e.url) : null;
           if (nb) await runOne(rid, nb, "id+1 neighbor");
         }
@@ -2955,14 +2900,14 @@ async function dispatch(method: string, params: any): Promise<any> {
         const s = sessions.get(params.tabId);
         const detach = lastDetach.get(params.tabId);
         return s
-          ? { tabId: params.tabId, attached: true, capturing: s.netOn, bufferedRequests: s.net.length, deepRefs: s.refNodes.size, idleMs: Date.now() - s.lastUsedAt }
+          ? { tabId: params.tabId, attached: true, capturing: s.netOn, bufferedRequests: s.net.size, deepRefs: s.refNodes.size, idleMs: Date.now() - s.lastUsedAt }
           : { tabId: params.tabId, attached: false, lastDetach: detach };
       }
       return {
         sessions: [...sessions.entries()].map(([tabId, s]) => ({
           tabId,
           capturing: s.netOn,
-          bufferedRequests: s.net.length,
+          bufferedRequests: s.net.size,
           idleMs: Date.now() - s.lastUsedAt,
         })),
         // Why a capture stopped, when it stopped on its own. "canceled_by_user" = the human dismissed
@@ -3352,9 +3297,27 @@ async function dispatch(method: string, params: any): Promise<any> {
         allFrames: !!params.allFrames,
         maskInputs: !!params.maskInputs,
         recordCanvas: !!params.recordCanvas,
+        canvasFps: params.canvasFps,
+        canvasQuality: params.canvasQuality,
+        canvasMaxDim: params.canvasMaxDim,
+        canvasBudgetBytes: params.canvasBudgetBytes,
       };
-      await injectRecorder(tabId, rec);
+      // Register BEFORE injecting: with allFrames the inject can take seconds, and the top frame's
+      // first batch (Meta + FullSnapshot) arrives via sendMessage/bb-rec meanwhile - if the state
+      // isn't there yet that base snapshot is dropped and the replay has nothing to build from.
       sessionRecordings.set(tabId, rec);
+      let injected = false;
+      try {
+        injected = await injectRecorder(tabId, rec);
+      } catch (e) {
+        sessionRecordings.delete(tabId);
+        throw e;
+      }
+      if (!injected) {
+        sessionRecordings.delete(tabId); // top-frame injection failed - don't strand a dead state
+        throw new Error("could not inject the session recorder into the top frame");
+      }
+      void persistRecordings(); // survive an SW eviction; the page recorder keeps posting bb-rec
       return { recording: true, tabId, allFrames: rec.allFrames, url: tab.url };
     }
 
@@ -3376,6 +3339,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       if (rec) {
         flushRecord(rec, tabId, true);
         sessionRecordings.delete(tabId);
+        void persistRecordings();
       }
       return { stopped: true, tabId, wasRecording: !!rec };
     }
@@ -3443,7 +3407,14 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "watch_stop": {
       await ready();
-      const ids: string[] = params.watchId ? [params.watchId] : [...watchGroups.keys()];
+      // Stop ONLY the named watch. Falling back to ALL groups when a watchId is absent is what made
+      // stopping one watch kill the others. tabIds is the back-compat path: derive the owning groups
+      // from the tabs rather than stopping everything.
+      let ids: string[];
+      if (params.watchId) ids = [params.watchId];
+      else if (Array.isArray(params.tabIds) && params.tabIds.length)
+        ids = [...new Set(params.tabIds.map((t: number) => tabToWatch.get(t)).filter(Boolean) as string[])];
+      else ids = [...watchGroups.keys()];
       const stopped: string[] = [];
       for (const id of ids) {
         const g = watchGroups.get(id);
@@ -3510,6 +3481,50 @@ async function dispatch(method: string, params: any): Promise<any> {
       };
     }
 
+    case "ax_snapshot": {
+      const tab = await targetTab(params.tabId);
+      return axSnapshot(tab);
+    }
+
+    // ---- environment emulation (CDP; shows the debugger banner). Thin: the server resolved presets
+    //      to concrete metrics/throughput, this just applies them. See extension/src/emulate.ts. ----
+
+    case "emulate_device": {
+      const tab = await targetTab(params.tabId);
+      await ensureAttached(tab.id!);
+      return emulateDevice(tab.id!, params, cmd);
+    }
+
+    case "emulate_network": {
+      const tab = await targetTab(params.tabId);
+      await ensureAttached(tab.id!);
+      return emulateNetwork(tab.id!, params, cmd);
+    }
+
+    case "emulate_cpu": {
+      const tab = await targetTab(params.tabId);
+      await ensureAttached(tab.id!);
+      return emulateCpu(tab.id!, params.rate, cmd);
+    }
+
+    case "emulate_locale": {
+      const tab = await targetTab(params.tabId);
+      await ensureAttached(tab.id!);
+      return emulateLocale(tab.id!, params, cmd);
+    }
+
+    case "emulate_geolocation": {
+      const tab = await targetTab(params.tabId);
+      await ensureAttached(tab.id!);
+      return emulateGeolocation(tab.id!, params, cmd);
+    }
+
+    case "emulate_reset": {
+      const tab = await targetTab(params.tabId);
+      await ensureAttached(tab.id!);
+      return emulateReset(tab.id!, cmd);
+    }
+
     default:
       throw new Error(`Unknown method: ${method}`);
   }
@@ -3549,6 +3564,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   const rec = sessionRecordings.get(tabId);
   if (rec) {
     sessionRecordings.delete(tabId);
+    void persistRecordings();
     // The recorder's final batch is relayed via sendMessage, a separate task. Closing the sink
     // immediately (as this did) discards it. session_record_stop already allows this grace; a tab
     // being closed is exactly when the last events matter most.
@@ -3558,7 +3574,12 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   if (g) {
     g.tabs.delete(tabId);
     tabToWatch.delete(tabId);
-    shipOrQueue({ type: "watch", watchId: g.watchId, tabId, entries: [{ t: Date.now(), k: "closed" }] }, false);
+    // queue:true - SW-only event; hold it in the outbox across a socket blip (see addTabToGroup).
+    shipOrQueue({ type: "watch", watchId: g.watchId, tabId, entries: [{ t: Date.now(), k: "closed" }] }, true);
+    // An emptied group is dead; drop it, and when the LAST watch goes, unregister the <all_urls>
+    // content script so it stops injecting into every page (mirrors hydrate() and watch_stop).
+    if (!g.tabs.size) watchGroups.delete(g.watchId);
+    if (!watchGroups.size) void unregisterWatchScripts();
     void persistWatch();
   }
 });
@@ -3584,6 +3605,16 @@ chrome.webNavigation.onCreatedNavigationTarget.addListener((d) => {
 // Prerender activation and some back/forward navigations swap the tabId. Without this the tab
 // silently drops out of the group mid-session.
 chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
+  // A session recording is scripting-based and injected in the page, which survives the tabId swap, so
+  // move it to the new id - its bb-rec messages now arrive as the new tab. A debugger session can't
+  // follow the tabId (the CDP attach was to the old target), so clean it up rather than strand it.
+  const rec = sessionRecordings.get(removedTabId);
+  if (rec) {
+    sessionRecordings.delete(removedTabId);
+    sessionRecordings.set(addedTabId, rec);
+    void persistRecordings();
+  }
+  if (sessions.has(removedTabId)) void detachSession(removedTabId).catch(() => {});
   void ready().then(() => {
     const g = watchForTab(removedTabId);
     if (!g) return;
@@ -3593,6 +3624,9 @@ chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
     g.tabs.set(addedTabId, { tabId: addedTabId, openerTabId: old?.openerTabId, addedAt: Date.now() });
     tabToWatch.set(addedTabId, g.watchId);
     void persistWatch();
+    // Tell the server, or its timeline keeps binding the dead tab id and drops the new tab's net rows
+    // (which arrive keyed only by tabId). The `opened` event binds addedTabId server-side.
+    shipOrQueue({ type: "watch", watchId: g.watchId, tabId: addedTabId, entries: [{ t: Date.now(), k: "opened" }] }, true);
   });
 });
 // Which tab the human is actually looking at - the difference between "activity across 6 tabs" and
@@ -3610,7 +3644,7 @@ chrome.tabs.onActivated.addListener((info) => {
     }
     shipOrQueue(
       { type: "watch", watchId: g.watchId, tabId: info.tabId, entries: [{ t: Date.now(), k: "visible", url }] },
-      false
+      true // SW-only event - hold it across a socket blip (see addTabToGroup)
     );
   });
 });
@@ -3639,7 +3673,7 @@ chrome.webNavigation.onHistoryStateUpdated.addListener((d) => {
     if (!g) return;
     shipOrQueue(
       { type: "watch", watchId: g.watchId, tabId: d.tabId, entries: [{ t: Date.now(), k: "nav", url: d.url, via: "hint" }] },
-      false
+      true // SW-only event - hold it across a socket blip (see addTabToGroup)
     );
   });
 });
@@ -3665,8 +3699,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.cmd === "bb-rec") {
     const tabId = sender.tab?.id;
     if (tabId != null) {
-      const rec = sessionRecordings.get(tabId);
-      if (rec) queueRecord(rec, tabId, msg.events || []);
+      // await hydration: a bb-rec message can be what WOKE the worker after an eviction, arriving
+      // before restoreRecordings() has repopulated the map. Without this the first post-respawn batch
+      // would find no rec and be dropped.
+      void ready().then(() => {
+        const rec = sessionRecordings.get(tabId);
+        if (rec) queueRecord(rec, tabId, msg.events || []);
+      });
     }
     return false;
   }
@@ -3698,7 +3737,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           entries: msg.events || [],
           dropped: msg.dropped || 0,
         },
-        false // the page keeps custody until this returns true
+        // Normally the page keeps custody until this returns true. But a pagehide flush (final:true)
+        // comes from a dying document that will NOT retry, so hold it in the outbox instead of losing
+        // it when the socket is down; per-event ids let the server drop any duplicate.
+        msg.final === true
       );
       sendResponse({ ok: true, shipped, armed: true });
     });

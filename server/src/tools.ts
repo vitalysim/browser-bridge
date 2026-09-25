@@ -9,6 +9,11 @@ import { spawn } from "child_process";
 import { CALL_TIMEOUT_MS, type ExtensionHub } from "./hub.js";
 import { CaptureSink } from "./capture-sink.js";
 import { inlineAssets } from "./rrweb-inline.js";
+import { classifyError, truncateForText } from "./result.js";
+import { versionSkewWarning } from "./version.js";
+import { buildHar, parseSessionEventsStream } from "./capture-format.js";
+import { renderAxSnapshot, type AxSnapshot } from "./ax.js";
+import { registerEmulateTools } from "./emulate.js";
 import {
   DEFAULT_INCLUDE,
   defaultWatchOpts,
@@ -30,6 +35,16 @@ const WATCH_SETTLE_MS = 300;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const MAX_BATCH_ACTIONS = 50;
+
+// Tools that drive the page on the agent's behalf. A watch timeline entry whose ts falls in one of
+// these calls' windows is labeled [agent], so the agent's own clicks/fills are told apart from the
+// human's. The window runs from just before the call to a short tail after it, covering the folded
+// click/input and the reorder hold (see WatchSession.reorderMs).
+const AGENT_ACTION_TOOLS = new Set([
+  "click", "fill", "type", "press_key", "navigate", "scroll", "hover",
+  "go_back", "go_forward", "input", "file_upload", "paste_image",
+]);
+const AGENT_ACTION_SLACK_MS = 1500;
 
 // Parallel same-origin script fetches for `analyze deep:true`. Bounded on purpose - see the call site.
 const DEEP_SCRIPT_CONCURRENCY = 6;
@@ -68,6 +83,7 @@ const BATCHABLE_TOOLS = new Set([
   "wait_for",
   // page reads
   "snapshot",
+  "ax_snapshot",
   "get_page_text",
   "screenshot",
   "eval_js",
@@ -95,6 +111,8 @@ const BATCHABLE_TOOLS = new Set([
   // itself not batchable. Its waitMs is forced to 0 inside a batch so it can never stall the sequence.
   "watch_read",
   "watch_status",
+  // watch_detail reads the watch's own network JSONL (already gated behind network:true at start).
+  "watch_detail",
 ]);
 
 // Expand a leading ~/ to the home dir (Node fs doesn't do it). For playbook/record paths.
@@ -161,6 +179,41 @@ export async function startWatchNetCapture(hub: ExtensionHub, session: WatchSess
   }
 }
 
+/**
+ * Find one captured request in a watch's on-disk network JSONL, by requestId.
+ *
+ * The full traffic (headers, bodies, timing) is one file per tab (`<base>.net.<tabId>.jsonl`), so
+ * watch_detail can drill into a timeline `net` line without starting a separate capture. Scans the
+ * files for the tabs the watch attached to; returns the matching row or null.
+ */
+export function findWatchNetRow(session: WatchSession, requestId: string): any | null {
+  const cfg = session.netCapture;
+  if (!cfg) return null;
+  for (const tabId of session.netTabs) {
+    const path = `${cfg.basePath}.net.${tabId}.jsonl`;
+    if (!existsSync(path)) continue;
+    let text: string;
+    try {
+      text = readFileSync(path, "utf8");
+    } catch {
+      continue;
+    }
+    // Scan from the end: a request the agent just saw is near the tail of the file.
+    const lines = text.split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      if (!line.trim() || !line.includes(requestId)) continue;
+      try {
+        const row = JSON.parse(line);
+        if (row && row.kind === "net" && row.requestId === requestId) return row;
+      } catch {
+        /* torn line - keep scanning */
+      }
+    }
+  }
+  return null;
+}
+
 // Parse pixel dimensions from a PNG or JPEG buffer (header only).
 function imageDims(buf: Buffer): { width: number; height: number } | null {
   if (buf.length > 24 && buf[0] === 0x89 && buf[1] === 0x50) {
@@ -182,16 +235,17 @@ function imageDims(buf: Buffer): { width: number; height: number } | null {
 }
 
 function textResult(value: unknown) {
-  let text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
-  if (text.length > MAX_TEXT_CHARS) {
-    text = text.slice(0, MAX_TEXT_CHARS) + `\n…[truncated at ${MAX_TEXT_CHARS} chars]`;
-  }
+  // Structure-aware so a trimmed result is still valid JSON (see result.ts); a blind slice of a JSON
+  // string yields something no agent can parse.
+  const { text } = truncateForText(value, MAX_TEXT_CHARS);
   return { content: [{ type: "text" as const, text }] };
 }
 
 function errorResult(err: unknown) {
+  // Keep the human-readable message, and prefix a stable machine code the agent can branch on.
+  const message = err instanceof Error ? err.message : String(err);
   return {
-    content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+    content: [{ type: "text" as const, text: `Error [${classifyError(err)}]: ${message}` }],
     isError: true,
   };
 }
@@ -231,10 +285,24 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     inputSchema: z.ZodRawShape,
     handler: (args: any, extra?: any) => Promise<any>
   ) => {
-    registry.set(name, { schema: inputSchema, handler });
+    // Acting tools mark the window they run in as agent-driven, so watch mode labels the clicks/fills
+    // they cause as [agent] rather than as the human's. Done here (not in each handler) so it also
+    // covers the batched path, which invokes `handler` directly and would otherwise bypass it.
+    const wrapped = AGENT_ACTION_TOOLS.has(name)
+      ? async (args: any, extra?: any) => {
+          const from = Date.now();
+          try {
+            return await handler(args, extra);
+          } finally {
+            const sess = (args?.tabId !== undefined ? watchRegistry.forTab(args.tabId) : undefined) ?? watchRegistry.sole();
+            sess?.noteAgentCall(from, Date.now() + AGENT_ACTION_SLACK_MS);
+          }
+        }
+      : handler;
+    registry.set(name, { schema: inputSchema, handler: wrapped });
     server.registerTool(name, { description, inputSchema }, async (args: any, extra: any) => {
       try {
-        return await handler(args, extra);
+        return await wrapped(args, extra);
       } catch (err) {
         return errorResult(err);
       }
@@ -1165,15 +1233,24 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     {
       savePath: z.string().describe("Absolute path to write the .har file"),
       includeBodies: z.boolean().optional().describe("Include response bodies (default true)"),
+      maxBodyBytes: z.number().optional().describe("Cap each inlined body to N chars (base64 kept decodable); real size stays in content.size and the count of capped bodies is reported"),
       tabId: tabIdParam,
     },
-    async ({ savePath, includeBodies, tabId }) => {
+    async ({ savePath, includeBodies, maxBodyBytes, tabId }) => {
+      // Up to 5000 rows WITH bodies can land here; assemble, then report the on-disk size so a huge
+      // capture is visible rather than a silent multi-hundred-MB write.
       const cap = await hub.call("net_get_requests", { tabId, includeBodies: includeBodies !== false, limit: 5000 }, 120_000);
       const rows: any[] = cap?.requests || [];
-      const nowIso = new Date().toISOString();
-      const har = { log: { version: "1.2", creator: { name: "browser-bridge", version }, entries: rows.map((r) => harEntry(r, nowIso)) } };
-      writeFileSync(savePath, JSON.stringify(har, null, 2));
-      return textResult({ saved: savePath, entries: rows.length, note: cap?.totalBuffered ? `${cap.totalBuffered} buffered on tab` : undefined });
+      const { har, bodiesCapped } = buildHar(rows, { name: "browser-bridge", version }, new Date().toISOString(), { maxBodyBytes });
+      const json = JSON.stringify(har, null, 2);
+      writeFileSync(savePath, json);
+      return textResult({
+        saved: savePath,
+        entries: rows.length,
+        bytes: Buffer.byteLength(json),
+        bodiesCapped: bodiesCapped || undefined,
+        note: cap?.totalBuffered ? `${cap.totalBuffered} buffered on tab` : undefined,
+      });
     },
   );
 
@@ -1256,7 +1333,11 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       tabId: tabIdParam,
       allFrames: z.boolean().optional().describe("Also record cross-origin iframes (default false = top frame + same-origin subframes)"),
       maskInputs: z.boolean().optional().describe("Redact form input values in the recording (default false)"),
-      recordCanvas: z.boolean().optional().describe("Attempt to record <canvas>/WebGL (heavier; default false)"),
+      recordCanvas: z.boolean().optional().describe("Capture <canvas>/WebGL as periodic image frames the replay paints (heavier; default false). See docs/RECORDING.md."),
+      canvasFps: z.number().optional().describe("Canvas frames/sec when recordCanvas (default 4)"),
+      canvasQuality: z.number().optional().describe("Canvas WebP quality 0-1 when recordCanvas (default 0.6)"),
+      canvasMaxDim: z.number().optional().describe("Downscale canvases past this longest edge, px (default 1280)"),
+      canvasBudgetMB: z.number().optional().describe("Total encoded-canvas byte budget in MB; capture stops past it (default 32)"),
       eventsPath: z.string().optional().describe("Absolute path (or ~/…) for the raw events JSONL; default ~/.browser-bridge/recordings/session-<ts>.events.jsonl"),
     },
     async (args) => {
@@ -1273,6 +1354,10 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
           allFrames: !!args.allFrames,
           maskInputs: !!args.maskInputs,
           recordCanvas: !!args.recordCanvas,
+          canvasFps: args.canvasFps,
+          canvasQuality: args.canvasQuality,
+          canvasMaxDim: args.canvasMaxDim,
+          canvasBudgetBytes: args.canvasBudgetMB != null ? Math.round(args.canvasBudgetMB * 1024 * 1024) : undefined,
         });
         if (r?.tabId == null) throw new Error("extension did not return the recorded tabId");
         hub.registerSessionSink(r.tabId, sink);
@@ -1305,11 +1390,14 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     async (args) => {
       const r = await hub.call("session_record_stop", { tabId: args.tabId }, 30_000);
       const tabId = r?.tabId;
-      hub.closeSessionSink(tabId); // usually already closed by the streamed `done`; idempotent
+      // The recorder's final batch is streamed separately and can arrive AFTER this ack; its sink
+      // writes are async. Wait (bounded) for the streamed `done` and drain the sink to disk BEFORE
+      // reading, or the tail of the recording is silently lost from the replay.
+      await hub.settleSessionSink(tabId);
       const eventsPath = hub.getRecordingPath(tabId);
       hub.deleteRecordingPath(tabId);
       if (!eventsPath) throw new Error("no recording was active for this tab");
-      const events = parseSessionEvents(readFileSync(eventsPath, "utf8"));
+      const events = await parseSessionEventsStream(eventsPath); // line-stream: a recording can be 100s of MB
       if (!events.length) throw new Error(`recording had no events (${eventsPath}) - did you interact with the page?`);
       // Inline external assets so the replay is self-contained/offline-faithful (fetched via the extension).
       const perAssetMaxBytes = Math.round((args.perAssetMB ?? 2) * 1024 * 1024);
@@ -1403,6 +1491,15 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         }
         if (!total) throw new Error("replay export harness not ready (regenerate the replay with v0.14+), or zero duration");
 
+        // Wait for any captured canvas frames to finish decoding before the first seek, so an exported
+        // frame never screenshots a canvas that hasn't been painted yet (older replays lack this and
+        // report ready immediately).
+        for (let i = 0; i < 100; i++) {
+          const r = await evalJs(tabId, "String(!window.__bbExport.framesReady || window.__bbExport.framesReady())");
+          if (r?.value === "true") break;
+          await sleep(100);
+        }
+
         const nframes = Math.max(1, Math.ceil((total / 1000) * fps));
         for (let f = 0; f < nframes; f++) {
           const t = Math.min(total, Math.round((f * 1000) / fps));
@@ -1434,15 +1531,20 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     "bridge_status",
     "Check whether the Chrome extension is currently connected to the bridge.",
     {},
-    async () =>
-      textResult({
+    async () => {
+      // Compare the two versions instead of just printing them side by side: a skew is a common,
+      // silent cause of a tool existing on one side but not the other.
+      const warning = versionSkewWarning(version, hub.lastHello?.version);
+      return textResult({
         extensionConnected: hub.connected,
         recording: hub.recording,
         // Which extension bundle is actually loaded. If this build stamp is older than your last
         // `npm run build`, Chrome is still running the previous code - reload it at chrome://extensions.
         extension: hub.lastHello ?? undefined,
         serverVersion: version,
-      })
+        warning: warning ?? undefined,
+      });
+    }
   );
 
   // ---- watch mode (the human browses; the agent reads a live semantic timeline) ----
@@ -1638,7 +1740,36 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       }
 
       const session = args.watchId ? watchRegistry.get(args.watchId) : watchRegistry.sole();
-      if (!session) throw new Error("No watch session. Call watch_start first.");
+      if (!session) {
+        // A cursor (or watchId) naming a real watch, but no session right now, is the server-restart
+        // window: the extension is about to re-announce and the page is still holding its events.
+        // Don't throw "No watch session" - signal reset so the agent re-syncs once it re-adopts.
+        const wantId = args.watchId ?? parseCursor(args.since).watchId;
+        if (wantId) {
+          const meta = {
+            nextCursor: args.since ?? "",
+            dropped: 0,
+            more: false,
+            remaining: 0,
+            reset: true,
+            recovering: true,
+            health: {
+              state: "blind" as const,
+              extensionConnected: watchRegistry.extensionConnected,
+              lastEventAgeMs: null,
+              tabs: [] as number[],
+              ring: { size: 0, bytes: 0, minSeq: 1, maxSeq: 0, evicted: 0 },
+              warnings: ["watch session not resident (the server restarted); it re-binds when the extension reconnects - retry shortly, or call watch_start again if it does not"],
+            },
+          };
+          if (args.format === "json") return textResult({ ...meta, actions: [] });
+          return textResult(
+            "WATCH  recovering  the server restarted; this watch re-binds when the extension reconnects. Retry shortly.\n" +
+              JSON.stringify(meta)
+          );
+        }
+        throw new Error("No watch session. Call watch_start first.");
+      }
 
       const cursor = parseCursor(args.since);
       // A cursor from a previous watch, or a previous incarnation of this one, cannot be honored -
@@ -1674,13 +1805,15 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       if (args.format === "json") return textResult({ ...meta, actions: result.actions });
 
       const parts: string[] = [];
+      // The meta (with nextCursor) goes FIRST: textResult hard-truncates at MAX_TEXT_CHARS, so a very
+      // large page would otherwise cut off the trailing cursor line and break the paging stream.
+      parts.push(JSON.stringify(meta));
       if (reset) parts.push("NOTE  that cursor is from an earlier watch session (the server restarted) - serving from the start of the current one.");
       if (result.dropped) parts.push(`NOTE  ${result.dropped} actions were evicted from the ring before this read.`);
       const header =
         `WATCH  ${health.state}  tabs=${health.tabs.join(",")}  actions=${result.actions.length}` +
         `  dropped=${result.dropped}  more=${result.more}`;
       parts.push(renderActions(result.actions, { multiTab: multiTab(result.actions), header }));
-      parts.push(JSON.stringify(meta));
       return textResult(parts.join("\n"));
     }
   );
@@ -1722,7 +1855,9 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       const tabs = [...session.tabs];
       let extensionError: string | undefined;
       try {
-        await hub.call("watch_stop", { tabIds: tabs });
+        // Send the watchId so the extension stops ONLY this watch. tabIds stays for back-compat: an
+        // older extension that ignored watchId would otherwise stop every watch it holds.
+        await hub.call("watch_stop", { watchId: session.watchId, tabIds: tabs });
       } catch (e) {
         // The browser side may already be gone (tab closed, extension reloaded). The digest is still
         // ours to finish, so report the failure rather than losing the timeline to it.
@@ -1749,6 +1884,51 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         digestPath: digestPath ?? undefined,
         extensionError,
       });
+    }
+  );
+
+  tool(
+    "watch_detail",
+    "Return the full request+response (headers, request/response bodies, timing) for one network line " +
+      "of the watch timeline, by its `seq` or `requestId`, read from the watch's on-disk capture " +
+      "(needs network:true). Lets you drill into a request without starting a separate capture.",
+    {
+      seq: z.number().optional().describe("The #seq of a `net` line in the timeline"),
+      requestId: z.string().optional().describe("A requestId (from watch_read format:'json') instead of a seq"),
+      watchId: z.string().optional().describe("Which watch to read (default: the current one)"),
+    },
+    async (args) => {
+      const session = args.watchId ? watchRegistry.get(args.watchId) : watchRegistry.sole();
+      if (!session) throw new Error("No watch session. Call watch_start first.");
+      if (!session.netCapture) throw new Error("This watch has no network capture - start it with network:true to record request/response detail.");
+      let requestId: string | undefined = args.requestId;
+      if (!requestId && args.seq !== undefined) {
+        const a = session.findBySeq(args.seq);
+        if (!a) throw new Error(`No action #${args.seq} is still in the timeline (it may have been evicted from the ring).`);
+        if (a.kind !== "net") throw new Error(`Action #${args.seq} is a '${a.kind}', not a captured request.`);
+        requestId = (a as any).requestId;
+        if (!requestId) throw new Error(`Action #${args.seq} carries no requestId.`);
+      }
+      if (!requestId) throw new Error("Provide seq or requestId.");
+      const row = findWatchNetRow(session, requestId);
+      if (!row) throw new Error(`Request ${requestId} was not found in the watch network capture (it may not have finished, or its body was excluded).`);
+      return textResult(row);
+    }
+  );
+
+  tool(
+    "ax_snapshot",
+    "Compact accessibility tree of the page (role + name + states like checked/expanded/level, " +
+      "indented YAML-like, incl. iframes and open shadow DOM). Interactive nodes carry a [ref=N] " +
+      "usable with click/fill/hover/type. Prefer over snapshot for understanding page STRUCTURE and " +
+      "forms; interactiveOnly:true trims to actionable nodes only. See docs/AX-SNAPSHOT.md.",
+    {
+      tabId: tabIdParam,
+      interactiveOnly: z.boolean().optional().describe("Keep only interactive nodes and the containers leading to them"),
+    },
+    async ({ tabId, interactiveOnly }) => {
+      const snap = (await hub.call("ax_snapshot", { tabId })) as AxSnapshot;
+      return textResult(renderAxSnapshot(snap, { interactiveOnly }));
     }
   );
 
@@ -1820,6 +2000,9 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       return textResult({ executed: results.length, total: actions.length, results });
     }
   );
+
+  // Environment emulation (device / network / locale / geolocation) - self-contained in emulate.ts.
+  registerEmulateTools(tool, hub);
 }
 
 // ---- server-side response diffing (used by authz_matrix + the response_diff tool) ----
@@ -2013,52 +2196,7 @@ function decodeJwt(raw: string): any {
   };
 }
 
-// ---- HAR export (pure) ----
-function harHeaders(obj: Record<string, string> | undefined): { name: string; value: string }[] {
-  return Object.entries(obj || {}).map(([name, value]) => ({ name, value: String(value) }));
-}
-function harEntry(r: any, nowIso: string): any {
-  let query: { name: string; value: string }[] = [];
-  try {
-    query = [...new URL(r.url).searchParams].map(([name, value]) => ({ name, value }));
-  } catch {
-    /* relative/invalid url */
-  }
-  const reqHeaders = r.requestHeaders || {};
-  const ct = hget(reqHeaders, "content-type") || "application/octet-stream";
-  const entry: any = {
-    // Real request-start time when the capture row carries one (it now does - background.ts
-    // captureNetRow). Falling back to the export time is what every entry used to get, which made an
-    // imported HAR's waterfall meaningless.
-    startedDateTime: typeof r.ts === "number" ? new Date(r.ts).toISOString() : nowIso,
-    time: 0,
-    request: {
-      method: r.method || "GET",
-      url: r.url || "",
-      httpVersion: "HTTP/1.1",
-      headers: harHeaders(reqHeaders),
-      queryString: query,
-      cookies: [],
-      headersSize: -1,
-      bodySize: r.requestBody ? r.requestBody.length : 0,
-    },
-    response: {
-      status: r.status || 0,
-      statusText: "",
-      httpVersion: "HTTP/1.1",
-      headers: harHeaders(r.responseHeaders),
-      cookies: [],
-      content: { size: r.responseBody ? r.responseBody.length : 0, mimeType: r.mimeType || "", ...(r.responseBody ? { text: r.responseBody, encoding: r.responseBodyBase64 ? "base64" : undefined } : {}) },
-      redirectURL: hget(r.responseHeaders || {}, "location") || "",
-      headersSize: -1,
-      bodySize: r.responseBody ? r.responseBody.length : -1,
-    },
-    cache: {},
-    timings: { send: 0, wait: 0, receive: 0 },
-  };
-  if (r.requestBody) entry.request.postData = { mimeType: ct, text: r.requestBody };
-  return entry;
-}
+// HAR export lives in capture-format.ts (buildHar), split out so it's unit-testable without the hub.
 
 // ---- session replay: assemble a self-contained rrweb-player HTML (pure) ----
 // Vendored rrweb-player (MIT), read once. Path is relative to the compiled dist/tools.js.
@@ -2251,6 +2389,13 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
     var exportMode=false;         // when true, the live rAF trail + event-cast overlay yield to __bbExport.renderAt
     var lastVal = {};             // per-input last value (typed-text fallback / paste detection)
     var hudTokens = [], hudTimer=null;
+    // Canvas/WebGL frames the recorder streamed as CanvasMutation events. rrweb ignores them
+    // (UNSAFE_replayCanvas stays false); WE paint the latest frame at-or-before the play head onto the
+    // replayed <canvas> node, matched by rrweb id. Images are preloaded so export draws synchronously.
+    var canvasFrames = {};        // id -> [{t, img}] sorted by relative time
+    var canvasIds = [];           // Object.keys(canvasFrames) cached
+    var canvasPending = 0, canvasLoaded = 0, liveT = 0;
+    var canvasBase = events.length ? (events[0].timestamp||0) : 0; // player time 0 = first event
 
     function ensure(){
       wrap = document.querySelector('.replayer-wrapper'); // the single scaled element; recorded x/y map into it
@@ -2268,6 +2413,48 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
       requestAnimationFrame(draw);
       buildBar();
       exSetup();
+      buildCanvasIndex();
+      if(canvasIds.length){
+        // Repaint on every time tick (playback + scrub). ui-update-current-time fires after goto() too.
+        player.addEventListener('ui-update-current-time', function(d){ liveT=(d&&d.payload)||0; if(!exportMode) paintCanvasesAt(liveT); });
+        // Frames decode async; repaint until all images are in, so the first painted frame isn't missed.
+        paintCanvasesAt(0);
+        var settle=setInterval(function(){ if(!exportMode) paintCanvasesAt(liveT); if(canvasLoaded>=canvasPending){ clearInterval(settle); } }, 200);
+      }
+    }
+    // Reconstruct each captured frame as a preloaded <img> (Blob object-URL) indexed per canvas id.
+    function b64ToBlob(b64, type){ var bin=atob(b64), n=bin.length, u8=new Uint8Array(n); for(var i=0;i<n;i++) u8[i]=bin.charCodeAt(i); return new Blob([u8],{type:type||'image/webp'}); }
+    function buildCanvasIndex(){
+      for(var i=0;i<events.length;i++){ var e=events[i];
+        if(!e || e.type!==3 || !e.data || e.data.source!==9 || typeof e.data.id!=='number') continue;
+        var cmds=e.data.commands, img64=null, mime='';
+        if(cmds) for(var j=0;j<cmds.length;j++){ var c=cmds[j];
+          if(c && c.property==='drawImage' && c.args && c.args[0] && c.args[0].rr_type==='ImageBitmap'){
+            var bl=c.args[0].args && c.args[0].args[0];
+            if(bl && bl.rr_type==='Blob' && bl.data && bl.data[0] && bl.data[0].rr_type==='ArrayBuffer'){ img64=bl.data[0].base64; mime=bl.type||''; }
+          }
+        }
+        if(!img64) continue;
+        var im=new Image(); canvasPending++;
+        im.onload=function(){ canvasLoaded++; }; im.onerror=function(){ canvasLoaded++; };
+        try{ im.src=URL.createObjectURL(b64ToBlob(img64,mime)); }catch(err){ canvasLoaded++; continue; }
+        var id=e.data.id; if(!canvasFrames[id]) canvasFrames[id]=[];
+        canvasFrames[id].push({t:(e.timestamp||0)-canvasBase, img:im});
+      }
+      for(var k in canvasFrames){ canvasFrames[k].sort(function(a,b){return a.t-b.t;}); }
+      canvasIds=Object.keys(canvasFrames);
+    }
+    // Draw the latest captured frame at-or-before t into each replayed canvas (matched by rrweb id).
+    function paintCanvasesAt(t){
+      if(!canvasIds.length || !replayer || !replayer.getMirror) return;
+      var mirror; try{ mirror=replayer.getMirror(); }catch(e){ return; }
+      for(var i=0;i<canvasIds.length;i++){ var id=canvasIds[i], list=canvasFrames[id], frame=null;
+        for(var j=0;j<list.length;j++){ if(list[j].t<=t) frame=list[j]; else break; }
+        if(!frame || !frame.img.complete || frame.img.naturalWidth===0) continue;
+        var node=mirror.getNode(parseInt(id,10));
+        if(!node || node.nodeName!=='CANVAS') continue;
+        try{ var cx=node.getContext('2d'); if(!cx) continue; cx.clearRect(0,0,node.width,node.height); cx.drawImage(frame.img,0,0,node.width,node.height); }catch(e){}
+      }
     }
     function fmt(ms){ var s=Math.max(0,Math.round(ms/1000)); var m=Math.floor(s/60); s=s%60; return m+':'+(s<10?'0':'')+s; }
     var ICON_PLAY='<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
@@ -2513,8 +2700,12 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
           if(trail.width!==vw||trail.height!==vh){ trail.width=vw; trail.height=vh; }
           ctx.clearRect(0,0,trail.width,trail.height);
           exTrail(ms, cur?cur.x:null, cur?cur.y:null); exClicks(ms); exHud(ms);
+          paintCanvasesAt(ms); // draw the captured canvas frame for this instant (images preloaded)
           return true;
-        }
+        },
+        // True once every captured canvas image has decoded - the exporter waits on this before the
+        // first frame so a seek never screenshots a canvas that hasn't been painted yet.
+        framesReady: function(){ return canvasLoaded>=canvasPending; }
       };
     }
 
@@ -2527,18 +2718,4 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
   return Buffer.byteLength(html);
 }
 
-// Parse a session events JSONL (rows {kind:"rrweb", event}) into a timestamp-sorted rrweb event array.
-function parseSessionEvents(jsonl: string): any[] {
-  const events: any[] = [];
-  for (const line of jsonl.split("\n")) {
-    if (!line.trim()) continue;
-    try {
-      const row = JSON.parse(line);
-      if (row && row.kind === "rrweb" && row.event) events.push(row.event);
-    } catch {
-      /* skip a torn last line */
-    }
-  }
-  events.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-  return events;
-}
+// Session-event parsing lives in capture-format.ts (parseSessionEvents / parseSessionEventsStream).

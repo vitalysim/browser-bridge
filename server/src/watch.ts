@@ -36,6 +36,9 @@ export interface ElementRef {
 /** One raw event off the wire. `k` is the discriminator; the rest is per-kind. */
 export interface RawEvent {
   t: number; // Date.now() in the page
+  /** Per-event id, unique within a page document. Lets the server drop a re-delivered event (the
+   *  pagehide force-flush and any retry can send an event twice). Absent on SW-originated events. */
+  i?: string;
   k:
     | "click"
     | "input"
@@ -68,6 +71,9 @@ export interface RawEvent {
   url?: string;
   from?: string;
   via?: "load" | "spa" | "hint" | "popstate" | "hash";
+  /** True for a history.replaceState (search-as-you-type rewrites ?q= per keystroke). It must not
+   *  finalize an open typing burst, or one query becomes N input actions. */
+  replace?: boolean;
   title?: string;
   level?: string;
   text?: string;
@@ -546,14 +552,19 @@ export function foldEvent(state: FoldState, env: EventEnvelope, ev: RawEvent): S
     }
 
     case "nav": {
-      finalizeAll(state, out);
       const url = ev.url ?? "";
+      // A replaceState fired DURING typing (search-as-you-type rewrites ?q= on each keystroke) must
+      // neither finalize the input burst nor spam the timeline with a nav per keystroke: the input
+      // action already carries the query. Drop it while a burst is open.
+      if (ev.replace && state.input) break;
+      finalizeAll(state, out);
       if (!url) break;
       // Not navigations of the tab: about:blank / blob: / data: documents, and a SUBFRAME reporting
-      // its own initial load. The listener runs in every frame, so each iframe would otherwise
-      // announce itself as a page navigation the human never made.
+      // its own load/hash/popstate. The listener runs in every frame, so each iframe would otherwise
+      // announce its own history changes as page navigations the human never made. An in-app "spa"
+      // route change inside a frame is still meaningful, so it is kept.
       if (/^(about|blob|data|chrome-extension):/i.test(url)) break;
-      if (env.frameId !== undefined && env.frameId !== 0 && (ev.via ?? "load") === "load") break;
+      if (env.frameId !== undefined && env.frameId !== 0 && ["load", "hash", "popstate"].includes(ev.via ?? "load")) break;
       // The same navigation reaches us twice by design (the page's popstate and the SW's
       // webNavigation hint). Dedupe on URL so belt-and-braces coverage doesn't double-report.
       if (state.lastUrl.get(env.tabId) === url) break;
@@ -606,6 +617,22 @@ export function foldEvent(state: FoldState, env: EventEnvelope, ev: RawEvent): S
   return out;
 }
 
+/**
+ * Duration for a net row, in ms, preferring CDP's own timing over the wall-clock delta.
+ *
+ * `receivedAt - row.ts` overstates the request: row.ts is the request START, but the row only reaches
+ * us at load-finish AND after the 300ms capture batch AND (with persistBodies) after the body fetch.
+ * CDP's ResourceTiming carries the real time-to-headers relative to the request, so use it when present.
+ */
+export function netRowMs(row: NetRow, receivedAt: number): number | undefined {
+  const t = row.timing;
+  if (t && typeof t === "object") {
+    const end = Number(t.receiveHeadersEnd);
+    if (isFinite(end) && end > 0) return Math.round(end);
+  }
+  return row.ts ? Math.max(0, receivedAt - row.ts) : undefined;
+}
+
 /** Fold a network row from the capture stream. */
 export function foldNetRow(state: FoldState, env: EventEnvelope, row: NetRow, receivedAt: number): Staged[] {
   if (!state.opts.include.has("net")) return [];
@@ -629,7 +656,7 @@ export function foldNetRow(state: FoldState, env: EventEnvelope, row: NetRow, re
       status: row.status,
       resType: type || undefined,
       failed: row.failed,
-      ms: row.ts ? Math.max(0, receivedAt - row.ts) : undefined,
+      ms: netRowMs(row, receivedAt),
       requestId: row.requestId,
     },
   ];
@@ -690,6 +717,11 @@ export class ActionRing {
     return this.bytes;
   }
 
+  /** Look up a still-resident action by seq (for watch_detail). Linear scan - the ring is bounded. */
+  find(seq: number): Action | undefined {
+    return this.buf.find((a) => a.seq === seq);
+  }
+
   scan(sinceSeq: number, match: (a: Action) => boolean, limit: number, charBudget: number): ScanResult {
     const actions: Action[] = [];
     let scannedTo = sinceSeq;
@@ -728,6 +760,9 @@ function approxBytes(a: Action): number {
   if (anyA.value) n += String(anyA.value).length;
   if (anyA.text) n += String(anyA.text).length;
   if (anyA.target) n += (anyA.target.selector?.length ?? 0) + (anyA.target.label?.length ?? 0);
+  // A submit carries its whole field set; without counting it, the read budget under-estimates and
+  // then truncates a page that is actually over budget (which is how the cursor line got cut).
+  if (anyA.fields) for (const f of anyA.fields) n += (f.name?.length ?? 0) + String(f.value ?? "").length + 8;
   return n;
 }
 
@@ -815,6 +850,10 @@ export class WatchSession {
   /** The extension reconnected but no longer knows about this watch (it was reloaded or updated).
    *  The socket being up says nothing about whether any PAGE is still instrumented. */
   browserLost = false;
+  /** Recreated from a `hello`/stream after the SERVER lost its session (a restart) rather than from
+   *  watch_start. The digest sink and the original opts did not survive, but the timeline resumes
+   *  instead of every re-sent page event being dropped as unknown. Surfaced in health. */
+  recreated = false;
   /** Set when the watch persists full network traffic. Carried on the session so a tab that JOINS
    *  later (a link opened in a new tab) gets its own capture too - otherwise "capture everything"
    *  would quietly stop at the tab the watch started on. */
@@ -822,13 +861,23 @@ export class WatchSession {
   /** Tabs that already have a network capture attached, so a re-announce doesn't double-attach. */
   readonly netTabs = new Set<number>();
 
-  // Causality bookkeeping - a short tail of recent user actions, per tab.
-  private lastClick = new Map<number, Action>();
-  private lastSubmit = new Map<number, Action>();
-  private lastKey = new Map<number, Action>();
-  private lastNav = new Map<number, Action>();
+  // Causality bookkeeping - a short tail of recent user actions per tab, so a request that finished
+  // AFTER a newer click is still attributed to the click that actually preceded its START (keeping
+  // only the LAST click failed the a.ts >= click.ts test the moment a second click landed first).
+  private history = new Map<number, Action[]>();
+  private static readonly HISTORY_MAX = 40;
   /** Windows during which incoming actions are attributed to the agent rather than the human. */
   private agentCalls: { from: number; to: number }[] = [];
+  /** Recently-seen per-event ids, for dropping a re-delivered page event (pagehide force-flush /
+   *  retry can send one twice). A bounded FIFO - order of magnitude larger than any single batch. */
+  private seenIds = new Set<string>();
+  private seenIdOrder: string[] = [];
+  /** Cumulative page-buffer drop count last seen per tab, so each overflow is reported as a gap once. */
+  private pageDropped = new Map<number, number>();
+  /** Self-arming drain timer: commits held/idle events and wakes long-polls when no further event
+   *  arrives, so a lone click does not sit in the reorder buffer for the full poll timeout. */
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private flushTimerAt = 0;
 
   constructor(watchId: string, rootTabId: number, opts: WatchOpts, now: number) {
     this.watchId = watchId;
@@ -879,6 +928,15 @@ export class WatchSession {
     this.stage([{ ts: now, tabId, kind: "tab", event: "added", url }]);
   }
 
+  /** Register a followed tab (a target=_blank / window.open / OAuth-popup child) WITHOUT staging a
+   *  "tab added" - the extension already ships an `opened` event for it, which folds into that action.
+   *  Returns true the first time a tab is seen so the caller can bind it in the registry. */
+  followTab(tabId: number): boolean {
+    if (this.tabs.has(tabId)) return false;
+    this.tabs.add(tabId);
+    return true;
+  }
+
   removeTab(tabId: number, now: number): void {
     if (!this.tabs.delete(tabId)) return;
     const f = this.folds.get(tabId);
@@ -893,10 +951,12 @@ export class WatchSession {
     const f = this.fold(env.tabId);
     for (const ev of events) {
       if (!ev || typeof ev.t !== "number") continue;
+      if (ev.i !== undefined && this.seenEvent(ev.i)) continue; // re-delivered (pagehide flush / retry)
       this.lastEventAt = Math.max(this.lastEventAt, ev.t);
       this.stage(foldEvent(f, env, ev));
     }
     this.commitDue(receivedAt);
+    this.scheduleDrain(receivedAt);
   }
 
   /** Feed network rows from the capture stream. */
@@ -905,6 +965,28 @@ export class WatchSession {
     const f = this.fold(env.tabId);
     for (const row of rows) this.stage(foldNetRow(f, env, row, receivedAt));
     this.commitDue(receivedAt);
+    this.scheduleDrain(receivedAt);
+  }
+
+  /** Remember an event id and report whether it was already seen. Bounded FIFO. */
+  private seenEvent(id: string): boolean {
+    if (this.seenIds.has(id)) return true;
+    this.seenIds.add(id);
+    this.seenIdOrder.push(id);
+    if (this.seenIdOrder.length > 4000) {
+      const old = this.seenIdOrder.shift();
+      if (old !== undefined) this.seenIds.delete(old);
+    }
+    return false;
+  }
+
+  /** The page reports a cumulative overflow-drop count; note each increase as one visible gap so a
+   *  lost stretch of the human's browsing is legible instead of silently missing from the timeline. */
+  notePageDropped(tabId: number, total: number, now: number): void {
+    if (typeof total !== "number") return;
+    const prev = this.pageDropped.get(tabId) ?? 0;
+    this.pageDropped.set(tabId, total);
+    if (total > prev) this.noteGap("ring-evicted", 0, now, tabId, `${total - prev} events dropped from the page buffer (overflow)`);
   }
 
   /**
@@ -931,6 +1013,7 @@ export class WatchSession {
     if (!this.opts.include.has("gap")) return;
     this.stage([{ ts: now, tabId, kind: "gap", reason, ms, note }]);
     this.commitDue(now);
+    this.scheduleDrain(now);
   }
 
   /** Mark a window as agent-driven so the timeline can distinguish the agent's clicks from the human's. */
@@ -982,10 +1065,24 @@ export class WatchSession {
   }
 
   private rememberCause(a: Action): void {
-    if (a.kind === "click") this.lastClick.set(a.tabId, a);
-    else if (a.kind === "submit") this.lastSubmit.set(a.tabId, a);
-    else if (a.kind === "key") this.lastKey.set(a.tabId, a);
-    else if (a.kind === "nav") this.lastNav.set(a.tabId, a);
+    if (a.kind !== "click" && a.kind !== "submit" && a.kind !== "key" && a.kind !== "nav") return;
+    let h = this.history.get(a.tabId);
+    if (!h) this.history.set(a.tabId, (h = []));
+    h.push(a);
+    if (h.length > WatchSession.HISTORY_MAX) h.shift();
+  }
+
+  /** The latest action of one of `kinds` on `tab` that started AT OR BEFORE `ts` and within `ms`. */
+  private recentCause(tab: number, ts: number, kinds: ActionKind[], ms: number): Action | undefined {
+    const h = this.history.get(tab);
+    if (!h) return undefined;
+    let best: Action | undefined;
+    for (const c of h) {
+      if (!kinds.includes(c.kind)) continue;
+      if (c.ts > ts || ts - c.ts > ms) continue; // after the effect, or too far back to have caused it
+      if (!best || c.ts > best.ts) best = c;
+    }
+    return best;
   }
 
   /**
@@ -994,39 +1091,39 @@ export class WatchSession {
    * The rule that matters is CHAINING, not fan-out: once a nav has been attributed to a click, the
    * page load's requests attach to the NAV, not back to the click. Otherwise one click on "Publish"
    * collects eighty stylesheet and image requests and the causal link stops meaning anything.
+   *
+   * Candidates come from a short per-tab HISTORY, not a single last-of-each slot: a request carries
+   * its START time but only arrives at load-finish, so a click that landed before it must still be
+   * findable even after a newer click has happened in between.
    */
   private linkCause(a: Action): void {
     if (a.kind !== "net" && a.kind !== "console" && a.kind !== "nav") return;
     const tab = a.tabId;
-    const click = this.lastClick.get(tab);
-    const submit = this.lastSubmit.get(tab);
-    const key = this.lastKey.get(tab);
-    const nav = this.lastNav.get(tab);
-
-    const within = (c: Action | undefined, ms: number) => (c && a.ts >= c.ts && a.ts - c.ts <= ms ? c : undefined);
 
     if (a.kind === "nav") {
       const cause =
-        within(submit, CAUSE_WINDOW.submitToAny) ?? within(click, CAUSE_WINDOW.clickToNav) ?? within(key, CAUSE_WINDOW.keyToAny);
+        this.recentCause(tab, a.ts, ["submit"], CAUSE_WINDOW.submitToAny) ??
+        this.recentCause(tab, a.ts, ["click"], CAUSE_WINDOW.clickToNav) ??
+        this.recentCause(tab, a.ts, ["key"], CAUSE_WINDOW.keyToAny);
       if (cause) a.causedBy = cause.seq;
       return;
     }
 
     if (a.kind === "console") {
       const cause =
-        within(nav, CAUSE_WINDOW.userToConsole) ??
-        within(click, CAUSE_WINDOW.userToConsole) ??
-        within(submit, CAUSE_WINDOW.userToConsole) ??
-        within(key, CAUSE_WINDOW.userToConsole);
+        this.recentCause(tab, a.ts, ["nav"], CAUSE_WINDOW.userToConsole) ??
+        this.recentCause(tab, a.ts, ["click"], CAUSE_WINDOW.userToConsole) ??
+        this.recentCause(tab, a.ts, ["submit"], CAUSE_WINDOW.userToConsole) ??
+        this.recentCause(tab, a.ts, ["key"], CAUSE_WINDOW.userToConsole);
       if (cause) a.causedBy = cause.seq;
       return;
     }
 
     // net: a nav supersedes whatever caused the nav, for as long as its window lasts.
-    const n = within(nav, CAUSE_WINDOW.navToNet);
-    const s = within(submit, CAUSE_WINDOW.submitToAny);
-    const c = within(click, CAUSE_WINDOW.clickToNet);
-    const k = within(key, CAUSE_WINDOW.keyToAny);
+    const n = this.recentCause(tab, a.ts, ["nav"], CAUSE_WINDOW.navToNet);
+    const s = this.recentCause(tab, a.ts, ["submit"], CAUSE_WINDOW.submitToAny);
+    const c = this.recentCause(tab, a.ts, ["click"], CAUSE_WINDOW.clickToNet);
+    const k = this.recentCause(tab, a.ts, ["key"], CAUSE_WINDOW.keyToAny);
     let best: Action | undefined;
     if (n && (!c || n.ts >= c.ts) && (!s || n.ts >= s.ts)) best = n;
     else best = [s, c, k].filter(Boolean).sort((x, y) => y!.ts - x!.ts)[0];
@@ -1037,6 +1134,49 @@ export class WatchSession {
   pump(now: number, force = false): void {
     for (const f of this.folds.values()) this.stage(foldFlush(f, now, force));
     this.commitDue(force ? Infinity : now);
+  }
+
+  /** Look up a committed action by seq (for watch_detail). */
+  findBySeq(seq: number): Action | undefined {
+    return this.ring.find(seq);
+  }
+
+  /** The earliest wall-clock time at which some staged or coalescing event becomes committable. */
+  private nextDeadline(): number | null {
+    let next: number | null = null;
+    const consider = (t: number) => {
+      if (next === null || t < next) next = t;
+    };
+    for (const s of this.staged) consider(s.ts + this.opts.reorderMs);
+    for (const f of this.folds.values()) {
+      if (f.input) consider(f.input.last + f.opts.inputIdleMs);
+      if (f.keyRun) consider(f.keyRun.last + f.opts.inputIdleMs);
+      if (f.scroll) consider(f.scroll.last + f.opts.scrollIdleMs);
+    }
+    return next;
+  }
+
+  /**
+   * Arm a single timer so held events and idle coalescers commit on their own - and wake any waiting
+   * long-poll - even when no further event ever arrives. Without it a lone click sits in the reorder
+   * buffer (or a finished but unflushed typing burst sits in the coalescer) until the NEXT event or
+   * read, so a single click or one typed query makes a pending watch_read wait out its full timeout.
+   */
+  private scheduleDrain(now: number): void {
+    if (this.stopped || !isFinite(now)) return;
+    const next = this.nextDeadline();
+    if (next === null) return;
+    if (this.flushTimer && this.flushTimerAt <= next) return; // an earlier-or-equal timer already covers it
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flushTimerAt = next;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      this.flushTimerAt = 0;
+      if (this.stopped) return;
+      this.pump(Date.now());
+      this.scheduleDrain(Date.now()); // re-arm if a coalescer is still open
+    }, Math.max(0, next - now));
+    if (typeof this.flushTimer.unref === "function") this.flushTimer.unref();
   }
 
   read(
@@ -1064,6 +1204,8 @@ export class WatchSession {
     if (!extensionConnected) warnings.push("extension disconnected - no events are being captured");
     if (this.browserLost)
       warnings.push("the extension no longer has this watch (it was reloaded or updated) - nothing is being captured; call watch_start again");
+    if (this.recreated)
+      warnings.push("this watch was recovered after a server restart - capture continues, but the on-disk digest and the original options (redaction, network) were not restored");
     if (this.ring.evicted > 0) warnings.push(`${this.ring.evicted} actions evicted from the ring`);
     const age = this.lastEventAt ? now - this.lastEventAt : null;
     return {
@@ -1129,6 +1271,10 @@ export class WatchSession {
   stop(now: number): void {
     this.pump(now, true);
     this.stopped = true;
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
     this.releaseWaiters();
     this.sink?.close();
   }
@@ -1152,6 +1298,29 @@ export class WatchRegistry {
     const s = new WatchSession(watchId, rootTabId, opts, now);
     this.sessions.set(s.watchId, s);
     this.byTab.set(rootTabId, s.watchId);
+    return s;
+  }
+
+  /**
+   * Recover a watch the extension still holds but the server lost (a restart). Idempotent: recreates
+   * the session with default opts (memory-only - the digest path and capture config did not survive)
+   * the first time, and only binds/extends its tabs on later calls. Without this, every page event the
+   * extension keeps re-sending after a restart is dropped as an unknown watchId - total loss.
+   */
+  adopt(watchId: string, rootTabId: number, tabs: number[], now: number): WatchSession {
+    let s = this.sessions.get(watchId);
+    if (!s) {
+      s = new WatchSession(watchId, rootTabId, defaultWatchOpts({ network: true }), now);
+      s.recreated = true;
+      this.sessions.set(watchId, s);
+    }
+    if (rootTabId >= 0) this.byTab.set(rootTabId, watchId);
+    for (const t of tabs) {
+      if (t >= 0) {
+        s.followTab(t);
+        this.byTab.set(t, watchId);
+      }
+    }
     return s;
   }
 
