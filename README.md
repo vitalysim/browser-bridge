@@ -133,6 +133,7 @@ Both Claude Code and Codex drive the same live browser through the same endpoint
 - **Browse & interact** - tabs, navigation, and click / fill / hover / type / scroll with **auto-wait actionability** (found + visible + enabled, auto-escalating to a trusted CDP click when a target is overlay-covered), plus file and image upload - all reaching **into iframes (incl. cross-origin) and open shadow DOM** - and **coordinate-level trusted input** (`input`) for `<canvas>` remote desktops (VNC/RDP/Amazon DCV), games, and drawing apps.
 - **Read & inspect** - rendered page text, interactive-element snapshots with stable refs, screenshots (viewport → full-page retina, element clip, save-to-disk), and JavaScript evaluation that **bypasses strict CSP** via CDP.
 - **DevTools-grade capture** - full request/response **bodies**, response headers, `Set-Cookie`, timings, and **WebSocket/SSE frames** - with durable on-disk persistence and **HAR / MHTML** evidence export.
+- **Emulate the environment** - drive a page as a specific **device** (viewport/DPR/touch/UA presets), **network** (slow-3G → offline), **CPU**, **locale/timezone**, or **geolocation**, then `emulate_reset` back to normal.
 - **Web-security toolkit** - named **identities**, an in-session request **replayer**, **BOLA/IDOR/BFLA** access-control diffing (`authz_matrix`), **Burp-style live interception**, an **intruder-style fuzzer** (sniper/pitchfork/clusterbomb/race), passive header/CORS/**secret** analysis, **JWT** decode, and **copy-as-curl**.
 - **Session & storage** - read/write the **real cookie jar** (incl. `HttpOnly`), `localStorage` / `sessionStorage`, and console + CSP + exception logs.
 - **Watch mode (copilot)** - the inverse of everything above: **you** browse and the agent follows along. A content script emits already-labeled events (`click <button#publish> "Publish"`, typed text, **SPA route changes**) into a cursor-addressable timeline you read with `watch_read({since})` - with requests and console errors folded in and **attributed to the action that caused them**.
@@ -176,6 +177,21 @@ Both Claude Code and Codex drive the same live browser through the same endpoint
 | `net_get_ws_frames` | Captured WebSocket / EventSource frames |
 | `export_har` | Write the tab's captured traffic to a **HAR 1.2** file (import into Burp / DevTools / Playwright); bodies included by default |
 | `debugger_detach` · `debugger_status` | End a session (banner off) / inspect sessions |
+</details>
+
+<details>
+<summary><b>Environment emulation</b> (chrome.debugger - shows the debugging banner)</summary>
+
+| Tool | Description |
+|---|---|
+| `emulate_device` | Set the viewport, DPR, `mobile`, and touch, plus a UA override. Pass a **preset** (`iPhone 15`, `iPhone SE`, `Pixel 8`, `Galaxy S23`, `iPad`, `iPad Pro`, `desktop`, …) or explicit `width`/`height`; explicit fields override the preset |
+| `emulate_network` | Throttle bandwidth/latency or go **offline**. Preset (`slow-3g`, `fast-3g`, `wifi`, `offline`) or explicit `downloadKbps`/`uploadKbps`/`latencyMs`; reload to see a page load under it |
+| `emulate_cpu` | CPU slowdown multiplier (`rate:4` = 4× slower, `1` = none) |
+| `emulate_locale` | Override `locale`, `timezoneId` (IANA), and/or `acceptLanguage` - drives `Intl` / `Date` / `navigator.language` and the request header |
+| `emulate_geolocation` | Override the coordinate returned to `navigator.geolocation` (or `clear:true`). The page's geolocation **permission still applies** |
+| `emulate_reset` | Clear **all** of the above on a tab, returning it to normal |
+
+See [docs/EMULATION.md](docs/EMULATION.md) for the preset tables and lifecycle (overrides are in-memory and revert when the debugger detaches).
 </details>
 
 <details>
