@@ -1256,7 +1256,11 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       tabId: tabIdParam,
       allFrames: z.boolean().optional().describe("Also record cross-origin iframes (default false = top frame + same-origin subframes)"),
       maskInputs: z.boolean().optional().describe("Redact form input values in the recording (default false)"),
-      recordCanvas: z.boolean().optional().describe("Attempt to record <canvas>/WebGL (heavier; default false)"),
+      recordCanvas: z.boolean().optional().describe("Capture <canvas>/WebGL as periodic image frames the replay paints (heavier; default false). See docs/RECORDING.md."),
+      canvasFps: z.number().optional().describe("Canvas frames/sec when recordCanvas (default 4)"),
+      canvasQuality: z.number().optional().describe("Canvas WebP quality 0-1 when recordCanvas (default 0.6)"),
+      canvasMaxDim: z.number().optional().describe("Downscale canvases past this longest edge, px (default 1280)"),
+      canvasBudgetMB: z.number().optional().describe("Total encoded-canvas byte budget in MB; capture stops past it (default 32)"),
       eventsPath: z.string().optional().describe("Absolute path (or ~/…) for the raw events JSONL; default ~/.browser-bridge/recordings/session-<ts>.events.jsonl"),
     },
     async (args) => {
@@ -1273,6 +1277,10 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
           allFrames: !!args.allFrames,
           maskInputs: !!args.maskInputs,
           recordCanvas: !!args.recordCanvas,
+          canvasFps: args.canvasFps,
+          canvasQuality: args.canvasQuality,
+          canvasMaxDim: args.canvasMaxDim,
+          canvasBudgetBytes: args.canvasBudgetMB != null ? Math.round(args.canvasBudgetMB * 1024 * 1024) : undefined,
         });
         if (r?.tabId == null) throw new Error("extension did not return the recorded tabId");
         hub.registerSessionSink(r.tabId, sink);
@@ -1402,6 +1410,15 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
           await sleep(300);
         }
         if (!total) throw new Error("replay export harness not ready (regenerate the replay with v0.14+), or zero duration");
+
+        // Wait for any captured canvas frames to finish decoding before the first seek, so an exported
+        // frame never screenshots a canvas that hasn't been painted yet (older replays lack this and
+        // report ready immediately).
+        for (let i = 0; i < 100; i++) {
+          const r = await evalJs(tabId, "String(!window.__bbExport.framesReady || window.__bbExport.framesReady())");
+          if (r?.value === "true") break;
+          await sleep(100);
+        }
 
         const nframes = Math.max(1, Math.ceil((total / 1000) * fps));
         for (let f = 0; f < nframes; f++) {
@@ -2251,6 +2268,13 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
     var exportMode=false;         // when true, the live rAF trail + event-cast overlay yield to __bbExport.renderAt
     var lastVal = {};             // per-input last value (typed-text fallback / paste detection)
     var hudTokens = [], hudTimer=null;
+    // Canvas/WebGL frames the recorder streamed as CanvasMutation events. rrweb ignores them
+    // (UNSAFE_replayCanvas stays false); WE paint the latest frame at-or-before the play head onto the
+    // replayed <canvas> node, matched by rrweb id. Images are preloaded so export draws synchronously.
+    var canvasFrames = {};        // id -> [{t, img}] sorted by relative time
+    var canvasIds = [];           // Object.keys(canvasFrames) cached
+    var canvasPending = 0, canvasLoaded = 0, liveT = 0;
+    var canvasBase = events.length ? (events[0].timestamp||0) : 0; // player time 0 = first event
 
     function ensure(){
       wrap = document.querySelector('.replayer-wrapper'); // the single scaled element; recorded x/y map into it
@@ -2268,6 +2292,48 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
       requestAnimationFrame(draw);
       buildBar();
       exSetup();
+      buildCanvasIndex();
+      if(canvasIds.length){
+        // Repaint on every time tick (playback + scrub). ui-update-current-time fires after goto() too.
+        player.addEventListener('ui-update-current-time', function(d){ liveT=(d&&d.payload)||0; if(!exportMode) paintCanvasesAt(liveT); });
+        // Frames decode async; repaint until all images are in, so the first painted frame isn't missed.
+        paintCanvasesAt(0);
+        var settle=setInterval(function(){ if(!exportMode) paintCanvasesAt(liveT); if(canvasLoaded>=canvasPending){ clearInterval(settle); } }, 200);
+      }
+    }
+    // Reconstruct each captured frame as a preloaded <img> (Blob object-URL) indexed per canvas id.
+    function b64ToBlob(b64, type){ var bin=atob(b64), n=bin.length, u8=new Uint8Array(n); for(var i=0;i<n;i++) u8[i]=bin.charCodeAt(i); return new Blob([u8],{type:type||'image/webp'}); }
+    function buildCanvasIndex(){
+      for(var i=0;i<events.length;i++){ var e=events[i];
+        if(!e || e.type!==3 || !e.data || e.data.source!==9 || typeof e.data.id!=='number') continue;
+        var cmds=e.data.commands, img64=null, mime='';
+        if(cmds) for(var j=0;j<cmds.length;j++){ var c=cmds[j];
+          if(c && c.property==='drawImage' && c.args && c.args[0] && c.args[0].rr_type==='ImageBitmap'){
+            var bl=c.args[0].args && c.args[0].args[0];
+            if(bl && bl.rr_type==='Blob' && bl.data && bl.data[0] && bl.data[0].rr_type==='ArrayBuffer'){ img64=bl.data[0].base64; mime=bl.type||''; }
+          }
+        }
+        if(!img64) continue;
+        var im=new Image(); canvasPending++;
+        im.onload=function(){ canvasLoaded++; }; im.onerror=function(){ canvasLoaded++; };
+        try{ im.src=URL.createObjectURL(b64ToBlob(img64,mime)); }catch(err){ canvasLoaded++; continue; }
+        var id=e.data.id; if(!canvasFrames[id]) canvasFrames[id]=[];
+        canvasFrames[id].push({t:(e.timestamp||0)-canvasBase, img:im});
+      }
+      for(var k in canvasFrames){ canvasFrames[k].sort(function(a,b){return a.t-b.t;}); }
+      canvasIds=Object.keys(canvasFrames);
+    }
+    // Draw the latest captured frame at-or-before t into each replayed canvas (matched by rrweb id).
+    function paintCanvasesAt(t){
+      if(!canvasIds.length || !replayer || !replayer.getMirror) return;
+      var mirror; try{ mirror=replayer.getMirror(); }catch(e){ return; }
+      for(var i=0;i<canvasIds.length;i++){ var id=canvasIds[i], list=canvasFrames[id], frame=null;
+        for(var j=0;j<list.length;j++){ if(list[j].t<=t) frame=list[j]; else break; }
+        if(!frame || !frame.img.complete || frame.img.naturalWidth===0) continue;
+        var node=mirror.getNode(parseInt(id,10));
+        if(!node || node.nodeName!=='CANVAS') continue;
+        try{ var cx=node.getContext('2d'); if(!cx) continue; cx.clearRect(0,0,node.width,node.height); cx.drawImage(frame.img,0,0,node.width,node.height); }catch(e){}
+      }
     }
     function fmt(ms){ var s=Math.max(0,Math.round(ms/1000)); var m=Math.floor(s/60); s=s%60; return m+':'+(s<10?'0':'')+s; }
     var ICON_PLAY='<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
@@ -2513,8 +2579,12 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
           if(trail.width!==vw||trail.height!==vh){ trail.width=vw; trail.height=vh; }
           ctx.clearRect(0,0,trail.width,trail.height);
           exTrail(ms, cur?cur.x:null, cur?cur.y:null); exClicks(ms); exHud(ms);
+          paintCanvasesAt(ms); // draw the captured canvas frame for this instant (images preloaded)
           return true;
-        }
+        },
+        // True once every captured canvas image has decoded - the exporter waits on this before the
+        // first frame so a seek never screenshots a canvas that hasn't been painted yet.
+        framesReady: function(){ return canvasLoaded>=canvasPending; }
       };
     }
 

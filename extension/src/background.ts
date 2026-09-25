@@ -1548,6 +1548,10 @@ interface RecState {
   allFrames: boolean;
   maskInputs: boolean;
   recordCanvas: boolean;
+  canvasFps?: number;
+  canvasQuality?: number;
+  canvasMaxDim?: number;
+  canvasBudgetBytes?: number;
 }
 const sessionRecordings = new Map<number, RecState>();
 
@@ -1575,7 +1579,18 @@ function injectFrame(tabId: number, frameId: number, rec: RecState, timeoutMs: n
     await chrome.scripting.executeScript({
       target: { tabId, frameIds: [frameId] },
       func: (opts: any) => (window as any).__bbRec?.start(opts),
-      args: [{ allFrames: rec.allFrames, maskInputs: rec.maskInputs, recordCanvas: rec.recordCanvas }],
+      // executeScript rejects `undefined` in args ("Value is unserializable") - coalesce to null.
+      args: [
+        {
+          allFrames: rec.allFrames,
+          maskInputs: rec.maskInputs,
+          recordCanvas: rec.recordCanvas,
+          canvasFps: rec.canvasFps ?? null,
+          canvasQuality: rec.canvasQuality ?? null,
+          canvasMaxDim: rec.canvasMaxDim ?? null,
+          canvasBudgetBytes: rec.canvasBudgetBytes ?? null,
+        },
+      ],
     });
     return true;
   })();
@@ -3352,6 +3367,10 @@ async function dispatch(method: string, params: any): Promise<any> {
         allFrames: !!params.allFrames,
         maskInputs: !!params.maskInputs,
         recordCanvas: !!params.recordCanvas,
+        canvasFps: params.canvasFps,
+        canvasQuality: params.canvasQuality,
+        canvasMaxDim: params.canvasMaxDim,
+        canvasBudgetBytes: params.canvasBudgetBytes,
       };
       await injectRecorder(tabId, rec);
       sessionRecordings.set(tabId, rec);
