@@ -71,10 +71,15 @@ is lost. (Before this design, the recorder became a permanent silent zombie here
 
 ## 7. Server restart
 
-Restart the server while watching, then `watch_read` with the **old** cursor.
+Restart the server while watching, keep browsing (a click or two), then `watch_read` with the **old**
+cursor.
 
 **Expect:** `reset: true` and a note that the cursor belongs to an earlier session — never a silent
-renumbering. The extension's `hello` re-announce should rebind the tabs.
+renumbering. The extension's `hello` re-announce **re-adopts** the watch, so the clicks you made after
+the restart appear (the page held them and re-delivered them); `health.warnings` notes the watch was
+recovered and the digest/options were not restored. Before this, every re-sent event was dropped as an
+unknown watchId — total loss. If you read in the split second before the extension reconnects, the read
+returns `reset:true` with a *recovering* note rather than erroring.
 
 ## 8. Network causality (`network:true`)
 
@@ -116,3 +121,44 @@ Watch real browsing for ~30 minutes.
 
 **Expect:** `watch_status` shows a bounded ring, the service worker's memory does not climb, and the
 digest at `~/.browser-bridge/watch/` stays well under a megabyte.
+
+## 13. Stop one watch, not all
+
+`watch_start` on tab A, then `watch_start` on tab B (a separate tab, so two watches). `watch_stop` tab
+A's `watchId`, then `watch_read` on tab B.
+
+**Expect:** tab B is still `live` and its timeline keeps growing. Before this, stopping one watch sent
+no `watchId` and the extension fell back to stopping **every** watch.
+
+## 14. A lone action wakes a blocked read
+
+With nothing else happening, start `watch_read({ waitMs: 25000 })`, then make **one** click on the
+watched page.
+
+**Expect:** the read returns within ~1s, not after the full 25s. A single click must not sit in the
+reorder buffer until the next event or read.
+
+## 15. Agent vs human
+
+While watching, have the agent itself `click`/`fill` something (a direct tool call, not you).
+
+**Expect:** those lines are tagged `[agent]`; the ones you did are not.
+
+## 16. Search-as-you-type stays one action
+
+On a site that rewrites the URL with `history.replaceState` per keystroke (many search boxes), type a
+query.
+
+**Expect:** **one** `input` action with the whole query — not one `input` per keystroke and not a `nav`
+per keystroke. A `pushState` route change you actually navigate to still shows as `nav … (spa)`.
+
+## 17. Drill into a request (`network:true`)
+
+```
+watch_start({ tabId, network: true })
+```
+Submit a form, note the `net` line's `#seq` (or its `requestId` via `format:"json"`), then
+`watch_detail({ seq })`.
+
+**Expect:** the full request and response — headers, request/response bodies, timing — for that one
+request, read from the on-disk capture, without starting a separate `net_capture_start`.
