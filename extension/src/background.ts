@@ -44,6 +44,7 @@ async function connect() {
         watch: {
           groups: serializeWatch().map((g) => ({
             watchId: g.watchId,
+            rootTabId: g.rootTabId,
             tabs: g.tabs.map((t: WatchTab) => t.tabId),
             swRestarted: gapMs > 45_000,
             gapMs,
@@ -388,7 +389,30 @@ function bbWatchMainShim(mode: string) {
       };
     }
   };
+  // SPA route changes are only observable from the MAIN world: history.pushState/replaceState run in
+  // the page's own JS and fire no event an isolated listener can see (popstate/hashchange are the
+  // only ones that reach the isolated world, and pushState is neither). Patch them here and relay to
+  // the isolated watcher, which emits them as via:"spa" navigations. `replace` is carried through so
+  // the fold can leave a search-as-you-type burst intact instead of splitting it per keystroke.
+  const patchHistory = () => {
+    if (w.__bbWatchHist) return;
+    w.__bbWatchHist = 1;
+    for (const m of ["pushState", "replaceState"] as const) {
+      const orig = (history as any)[m];
+      if (typeof orig !== "function") continue;
+      (history as any)[m] = function (this: History, ...args: any[]) {
+        const r = orig.apply(this, args);
+        try {
+          relay({ kind: "nav", replace: m === "replaceState" });
+        } catch {
+          /* never break the page's navigation */
+        }
+        return r;
+      };
+    }
+  };
   if (w.__bbWatchMain) {
+    patchHistory();
     if (mode === "calls") wrapConsole();
     return true;
   }
@@ -398,6 +422,7 @@ function bbWatchMainShim(mode: string) {
   window.addEventListener("unhandledrejection", (e: any) => {
     relay({ kind: "console", level: "error", text: "Unhandled rejection: " + fmt([e?.reason]) });
   });
+  patchHistory();
   if (mode === "calls") wrapConsole();
   w.__bbWatchMain = 1;
   return true;
@@ -446,7 +471,10 @@ function addTabToGroup(g: WatchGroup, tabId: number, openerTabId?: number): void
   if (g.tabs.has(tabId)) return;
   g.tabs.set(tabId, { tabId, openerTabId, addedAt: Date.now() });
   tabToWatch.set(tabId, g.watchId);
-  shipOrQueue({ type: "watch", watchId: g.watchId, tabId, entries: [{ t: Date.now(), k: "opened" }] }, false);
+  // queue:true - the SW is the ONLY source of this event (unlike page events, which the page holds a
+  // copy of), so if the socket is down it must go to the outbox or the followed tab is never
+  // registered server-side and its whole timeline/network is lost.
+  shipOrQueue({ type: "watch", watchId: g.watchId, tabId, entries: [{ t: Date.now(), k: "opened" }] }, true);
   void persistWatch();
   // The new tab's content script may have run its hello handshake before this membership existed
   // (onCreated and the first document load race), in which case it is sitting dormant. Arm it.
@@ -3443,7 +3471,14 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "watch_stop": {
       await ready();
-      const ids: string[] = params.watchId ? [params.watchId] : [...watchGroups.keys()];
+      // Stop ONLY the named watch. Falling back to ALL groups when a watchId is absent is what made
+      // stopping one watch kill the others. tabIds is the back-compat path: derive the owning groups
+      // from the tabs rather than stopping everything.
+      let ids: string[];
+      if (params.watchId) ids = [params.watchId];
+      else if (Array.isArray(params.tabIds) && params.tabIds.length)
+        ids = [...new Set(params.tabIds.map((t: number) => tabToWatch.get(t)).filter(Boolean) as string[])];
+      else ids = [...watchGroups.keys()];
       const stopped: string[] = [];
       for (const id of ids) {
         const g = watchGroups.get(id);
@@ -3558,7 +3593,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   if (g) {
     g.tabs.delete(tabId);
     tabToWatch.delete(tabId);
-    shipOrQueue({ type: "watch", watchId: g.watchId, tabId, entries: [{ t: Date.now(), k: "closed" }] }, false);
+    // queue:true - SW-only event; hold it in the outbox across a socket blip (see addTabToGroup).
+    shipOrQueue({ type: "watch", watchId: g.watchId, tabId, entries: [{ t: Date.now(), k: "closed" }] }, true);
     void persistWatch();
   }
 });
@@ -3593,6 +3629,9 @@ chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
     g.tabs.set(addedTabId, { tabId: addedTabId, openerTabId: old?.openerTabId, addedAt: Date.now() });
     tabToWatch.set(addedTabId, g.watchId);
     void persistWatch();
+    // Tell the server, or its timeline keeps binding the dead tab id and drops the new tab's net rows
+    // (which arrive keyed only by tabId). The `opened` event binds addedTabId server-side.
+    shipOrQueue({ type: "watch", watchId: g.watchId, tabId: addedTabId, entries: [{ t: Date.now(), k: "opened" }] }, true);
   });
 });
 // Which tab the human is actually looking at - the difference between "activity across 6 tabs" and
@@ -3610,7 +3649,7 @@ chrome.tabs.onActivated.addListener((info) => {
     }
     shipOrQueue(
       { type: "watch", watchId: g.watchId, tabId: info.tabId, entries: [{ t: Date.now(), k: "visible", url }] },
-      false
+      true // SW-only event - hold it across a socket blip (see addTabToGroup)
     );
   });
 });
@@ -3639,7 +3678,7 @@ chrome.webNavigation.onHistoryStateUpdated.addListener((d) => {
     if (!g) return;
     shipOrQueue(
       { type: "watch", watchId: g.watchId, tabId: d.tabId, entries: [{ t: Date.now(), k: "nav", url: d.url, via: "hint" }] },
-      false
+      true // SW-only event - hold it across a socket blip (see addTabToGroup)
     );
   });
 });
@@ -3698,7 +3737,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           entries: msg.events || [],
           dropped: msg.dropped || 0,
         },
-        false // the page keeps custody until this returns true
+        // Normally the page keeps custody until this returns true. But a pagehide flush (final:true)
+        // comes from a dying document that will NOT retry, so hold it in the outbox instead of losing
+        // it when the socket is down; per-event ids let the server drop any duplicate.
+        msg.final === true
       );
       sendResponse({ ok: true, shipped, armed: true });
     });
