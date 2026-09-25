@@ -171,10 +171,10 @@ Both Claude Code and Codex drive the same live browser through the same endpoint
 | Tool | Description |
 |---|---|
 | `net_capture_start` | Begin capturing; then navigate/reload to record load traffic. `excludeExtensionTraffic:true` drops non-http(s) requests - your OTHER installed extensions inject scripts and fonts into every page and can outnumber the page's own requests 20:1. `maxEntries` sizes the in-memory ring (default 500, max 5000); `persist:true` + `savePath` also **streams** each finished request/WS frame to a JSON-Lines file on disk (durable - survives the ring cap and, up to the last batch, a service-worker crash; `persistBodies:true` includes bodies) |
-| `net_get_requests` | Requests with headers, `Set-Cookie`, timings, and (opt-in) response **bodies** |
-| `net_get_body` | Fetch one response body on demand |
+| `net_get_requests` | Requests with headers, `Set-Cookie`, timings, and (opt-in) response **bodies**. **Redirect hops** are kept as distinct entries (each 302 carries its own status + `redirectLocation`); the final response attaches to the last hop. A body over the size cap reports `truncated`/`originalLength` instead of an in-band marker (base64 stays decodable) |
+| `net_get_body` | Fetch one response body on demand; returns `truncated`/`originalLength` when size-capped |
 | `net_get_ws_frames` | Captured WebSocket / EventSource frames |
-| `export_har` | Write the tab's captured traffic to a **HAR 1.2** file (import into Burp / DevTools / Playwright); bodies included by default |
+| `export_har` | Write the tab's captured traffic to a **HAR 1.2** file (import into Burp / DevTools / Playwright); bodies included by default. `maxBodyBytes` caps each inlined body (real size kept in `content.size`, capped count reported); the on-disk byte size is returned so a huge capture is never a silent write |
 | `debugger_detach` · `debugger_status` | End a session (banner off) / inspect sessions |
 </details>
 
