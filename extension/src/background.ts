@@ -1,5 +1,7 @@
 /// <reference types="chrome" />
 
+import { NetRing, applyRedirectResponse, capBody, Semaphore, type NetEntry } from "./net-capture.js";
+
 // Injected at build time by build.mjs (esbuild define) from extension/package.json - single
 // source of truth shared with manifest.json, so the version can't drift.
 declare const __BB_VERSION__: string;
@@ -1120,23 +1122,12 @@ async function navByHistory(tab: chrome.tabs.Tab, direction: "back" | "forward")
 const CDP_VERSION = "1.3";
 const NET_MAX_ENTRIES = 500;
 const BODY_CAP = 512 * 1024; // chars returned to the agent per body
+// Bound eager response-body fetches: on an asset-heavy page every loadingFinished would otherwise
+// fire Network.getResponseBody at once, each buffering a whole body in the worker (memory spike).
+const bodyFetchSem = new Semaphore(6);
 const IDLE_DETACH_MS = 5 * 60_000;
 
-interface NetEntry {
-  requestId: string;
-  method?: string;
-  url?: string;
-  type?: string;
-  status?: number;
-  mimeType?: string;
-  requestHeaders?: Record<string, string>;
-  responseHeaders?: Record<string, string>;
-  requestBody?: string;
-  timing?: any;
-  finished?: boolean;
-  failed?: string;
-  ts?: number;
-}
+// NetEntry lives in net-capture.ts (with the ring that holds it).
 
 interface ExtraInfo {
   reqHeaders?: Record<string, string>;
@@ -1189,7 +1180,7 @@ interface LogEntry {
 interface Session {
   attachedAt: number;
   lastUsedAt: number;
-  net: NetEntry[];
+  net: NetRing; // bounded request ring with a requestId index (see net-capture.ts)
   netOn: boolean;
   netFilter?: string; // if set, only buffer requests whose URL contains this
   excludeExtensionTraffic?: boolean; // drop non-http(s) requests (other extensions' own traffic)
@@ -1278,7 +1269,7 @@ async function ensureAttached(tabId: number): Promise<Session> {
       const s: Session = {
         attachedAt: Date.now(),
         lastUsedAt: Date.now(),
-        net: [],
+        net: new NetRing(NET_MAX_ENTRIES),
         netOn: false,
         netMax: NET_MAX_ENTRIES,
         persist: false,
@@ -1355,7 +1346,7 @@ function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, param
   if (s.logOn && (method === "Runtime.consoleAPICalled" || method === "Runtime.exceptionThrown" || method === "Log.entryAdded"))
     return onLogEvent(s, method, params);
   if (!s.netOn) return;
-  const find = (id: string) => s.net.find((e) => e.requestId === id);
+  const find = (id: string) => s.net.get(id); // latest hop for the id (redirect-aware, O(1))
   if (method === "Network.requestWillBeSent") {
     const url = params.request?.url ?? "";
     if (s.netFilter && !url.includes(s.netFilter)) return;
@@ -1364,13 +1355,14 @@ function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, param
     // Acrobat/Pocket/etc bundles and base64 font blobs. With persistBodies on, that noise dominates
     // the capture file. Excluded at the source so it never reaches the ring, the JSONL, or a HAR.
     if (s.excludeExtensionTraffic && !/^https?:/i.test(url)) return;
-    // Evict the oldest ring entry AND its side data together, or s.extra grows unbounded past the
-    // ring cap and eventually OOM-kills the MV3 service worker (silently ending a long capture).
-    if (s.net.length >= s.netMax) {
-      const ev = s.net.shift();
-      if (ev) s.extra.delete(ev.requestId);
-    }
-    s.net.push({
+    // A redirect hop re-fires requestWillBeSent with the SAME requestId and a redirectResponse for
+    // the hop that just finished. Finalize that prior hop (its status/headers/Location) and keep it
+    // as its own entry; the new entry below becomes the latest hop the requestId resolves to.
+    if (params.redirectResponse) applyRedirectResponse(s.net.get(params.requestId), params.redirectResponse, url);
+    // push() evicts the oldest entry when at cap and returns the requestId that thereby left the ring
+    // entirely (a still-live redirect hop keeps it), so we drop its side data in lockstep - else
+    // s.extra grows past the ring cap and eventually OOM-kills the MV3 service worker.
+    const gone = s.net.push({
       requestId: params.requestId,
       method: params.request?.method,
       url: params.request?.url,
@@ -1379,6 +1371,7 @@ function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, param
       requestBody: params.request?.postData ? String(params.request.postData).slice(0, BODY_CAP) : undefined,
       ts: Date.now(),
     });
+    if (gone) s.extra.delete(gone);
   } else if (method === "Network.responseReceived") {
     const e = find(params.requestId);
     if (e) {
@@ -1413,9 +1406,13 @@ function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, param
           void (async () => {
             const row = captureNetRow(s, e);
             try {
-              const b = await getResponseBody(tabId, e.requestId);
+              const b = await bodyFetchSem.run(() => getResponseBody(tabId, e.requestId));
               row.responseBody = b.body;
               row.responseBodyBase64 = b.base64;
+              if (b.truncated) {
+                row.responseBodyTruncated = true;
+                row.responseBodyOriginalLength = b.originalLength;
+              }
             } catch (err) {
               row.bodyError = err instanceof Error ? err.message : String(err);
             }
@@ -1476,11 +1473,11 @@ function wsFrame(s: Session, params: any, dir: "sent" | "received"): WsFrame {
   };
 }
 
-async function getResponseBody(tabId: number, requestId: string): Promise<{ body: string; base64: boolean }> {
+async function getResponseBody(tabId: number, requestId: string): Promise<ReturnType<typeof capBody>> {
   const r = await cmd(tabId, "Network.getResponseBody", { requestId });
-  let body = r?.body ?? "";
-  if (typeof body === "string" && body.length > BODY_CAP) body = body.slice(0, BODY_CAP) + "\n…[truncated]";
-  return { body, base64: !!r?.base64Encoded };
+  // capBody reports truncation as {truncated, originalLength} and keeps a base64 body decodable
+  // (cut to a multiple of 4) instead of appending a marker that corrupts it.
+  return capBody(typeof r?.body === "string" ? r.body : "", !!r?.base64Encoded, BODY_CAP);
 }
 
 function djb2(s: string): string {
@@ -1586,19 +1583,22 @@ function injectFrame(tabId: number, frameId: number, rec: RecState, timeoutMs: n
 }
 
 // (Re)inject + start the recorder in a tab's frames. Called on start and on navigation-complete.
-async function injectRecorder(tabId: number, rec: RecState) {
+// Returns whether the TOP frame was injected (the mandatory one: it carries the Meta+FullSnapshot the
+// replay is built from). Subframes are best-effort.
+async function injectRecorder(tabId: number, rec: RecState): Promise<boolean> {
   // Top frame is mandatory (own origin, always injectable) and gets a generous budget.
-  await injectFrame(tabId, 0, rec, 8000);
-  if (!rec.allFrames) return;
+  const top = await injectFrame(tabId, 0, rec, 8000);
+  if (!rec.allFrames) return top;
   // Cross-origin iframes: inject each independently and in parallel, each with its own short timeout,
   // so a frame that never responds is simply skipped (best-effort) instead of blocking record-start.
   let frames: { frameId: number }[] = [];
   try {
     frames = (await chrome.webNavigation.getAllFrames({ tabId })) ?? [];
   } catch {
-    return; // no webNavigation result -> top-frame recording only
+    return top; // no webNavigation result -> top-frame recording only
   }
   await Promise.all(frames.filter((f) => f.frameId !== 0).map((f) => injectFrame(tabId, f.frameId, rec, 4000)));
+  return top;
 }
 
 // scheme + host only, no path/query/fragment - for compact tab listings where the path may carry
@@ -1632,7 +1632,7 @@ async function doReplay(tab: chrome.tabs.Tab, params: any): Promise<any> {
   };
   if (params.requestId) {
     const s = sessions.get(tabId);
-    const e = s?.net.find((x) => x.requestId === params.requestId);
+    const e = s?.net.get(params.requestId);
     if (!e) throw new Error("requestId not found in this tab's capture buffer");
     base = {
       url: e.url,
@@ -2737,7 +2737,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       const s = await ensureAttached(tab.id!);
       finalizeCapture(tab.id!); // close any prior persist sink on this tab before (re)starting
       await cmd(tab.id!, "Network.enable");
-      s.net = [];
+      s.net = new NetRing(NET_MAX_ENTRIES);
       s.extra = new Map();
       s.wsUrls = new Map();
       s.wsFrames = [];
@@ -2745,6 +2745,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       s.netFilter = params.urlFilter || undefined;
       s.excludeExtensionTraffic = !!params.excludeExtensionTraffic;
       s.netMax = Math.max(1, Math.min(params.maxEntries ?? NET_MAX_ENTRIES, 5000));
+      s.net.max = s.netMax;
       if (s.flushTimer) {
         clearTimeout(s.flushTimer);
         s.flushTimer = null;
@@ -2761,7 +2762,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       if (!s) throw new Error("Not capturing on this tab - call net_capture_start first.");
       s.lastUsedAt = Date.now();
       const filter: string | undefined = params.urlFilter;
-      let entries = s.net.filter((e) => !filter || (e.url ?? "").includes(filter));
+      let entries = s.net.list().filter((e) => !filter || (e.url ?? "").includes(filter));
       const limit = params.limit ?? 100;
       if (entries.length > limit) entries = entries.slice(-limit);
       const out: any[] = [];
@@ -2783,18 +2784,23 @@ async function dispatch(method: string, params: any): Promise<any> {
         };
         if (x?.setCookie) row.setCookie = x.setCookie;
         if (e.requestBody) row.requestBody = e.requestBody;
+        if (e.redirectLocation) row.redirectLocation = e.redirectLocation;
         if (params.includeBodies && e.finished && !e.failed) {
           try {
-            const b = await getResponseBody(tab.id!, e.requestId);
+            const b = await bodyFetchSem.run(() => getResponseBody(tab.id!, e.requestId));
             row.responseBody = b.body;
             row.responseBodyBase64 = b.base64;
+            if (b.truncated) {
+              row.responseBodyTruncated = true;
+              row.responseBodyOriginalLength = b.originalLength;
+            }
           } catch (err) {
             row.responseBodyError = err instanceof Error ? err.message : String(err);
           }
         }
         out.push(row);
       }
-      return { count: out.length, totalBuffered: s.net.length, requests: out };
+      return { count: out.length, totalBuffered: s.net.size, requests: out };
     }
 
     case "net_get_body": {
@@ -2802,8 +2808,8 @@ async function dispatch(method: string, params: any): Promise<any> {
       const s = sessions.get(tab.id!);
       if (!s) throw new Error("Not capturing on this tab - call net_capture_start first.");
       s.lastUsedAt = Date.now();
-      const b = await getResponseBody(tab.id!, params.requestId);
-      return { requestId: params.requestId, base64: b.base64, body: b.body };
+      const b = await bodyFetchSem.run(() => getResponseBody(tab.id!, params.requestId));
+      return { requestId: params.requestId, base64: b.base64, body: b.body, truncated: !!b.truncated, originalLength: b.originalLength };
     }
 
     case "net_get_ws_frames": {
@@ -2849,8 +2855,9 @@ async function dispatch(method: string, params: any): Promise<any> {
       let bearer: string | undefined;
       const s = sessions.get(tab.id!);
       if (s) {
-        for (let i = s.net.length - 1; i >= 0 && !bearer; i--) {
-          const h = s.extra.get(s.net[i].requestId)?.reqHeaders ?? s.net[i].requestHeaders;
+        const list = s.net.list();
+        for (let i = list.length - 1; i >= 0 && !bearer; i--) {
+          const h = s.extra.get(list[i].requestId)?.reqHeaders ?? list[i].requestHeaders;
           if (h) bearer = (h as any).authorization ?? (h as any).Authorization;
         }
       }
@@ -2885,7 +2892,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       const tab = await targetTab(params.tabId);
       const s = sessions.get(tab.id!);
       if (params.requestId) {
-        const e = s?.net.find((x) => x.requestId === params.requestId);
+        const e = s?.net.get(params.requestId);
         if (!e) throw new Error("requestId not found in this tab's capture buffer");
         const method = (e.method || "GET").toUpperCase();
         let body = e.requestBody;
@@ -2910,7 +2917,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       const s = sessions.get(tab.id!);
       const rows: any[] = [];
       const runOne = async (rid: string, urlOverride?: string, label?: string) => {
-        const e = s?.net.find((x) => x.requestId === rid);
+        const e = s?.net.get(rid);
         const cells: any[] = [];
         for (const ident of idents) {
           try {
@@ -2936,7 +2943,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       for (const rid of reqIds) {
         await runOne(rid);
         if (params.mutateIds) {
-          const e = s?.net.find((x) => x.requestId === rid);
+          const e = s?.net.get(rid);
           const nb = e?.url ? neighborUrl(e.url) : null;
           if (nb) await runOne(rid, nb, "id+1 neighbor");
         }
@@ -2955,14 +2962,14 @@ async function dispatch(method: string, params: any): Promise<any> {
         const s = sessions.get(params.tabId);
         const detach = lastDetach.get(params.tabId);
         return s
-          ? { tabId: params.tabId, attached: true, capturing: s.netOn, bufferedRequests: s.net.length, deepRefs: s.refNodes.size, idleMs: Date.now() - s.lastUsedAt }
+          ? { tabId: params.tabId, attached: true, capturing: s.netOn, bufferedRequests: s.net.size, deepRefs: s.refNodes.size, idleMs: Date.now() - s.lastUsedAt }
           : { tabId: params.tabId, attached: false, lastDetach: detach };
       }
       return {
         sessions: [...sessions.entries()].map(([tabId, s]) => ({
           tabId,
           capturing: s.netOn,
-          bufferedRequests: s.net.length,
+          bufferedRequests: s.net.size,
           idleMs: Date.now() - s.lastUsedAt,
         })),
         // Why a capture stopped, when it stopped on its own. "canceled_by_user" = the human dismissed
@@ -3353,8 +3360,21 @@ async function dispatch(method: string, params: any): Promise<any> {
         maskInputs: !!params.maskInputs,
         recordCanvas: !!params.recordCanvas,
       };
-      await injectRecorder(tabId, rec);
+      // Register BEFORE injecting: with allFrames the inject can take seconds, and the top frame's
+      // first batch (Meta + FullSnapshot) arrives via sendMessage/bb-rec meanwhile - if the state
+      // isn't there yet that base snapshot is dropped and the replay has nothing to build from.
       sessionRecordings.set(tabId, rec);
+      let injected = false;
+      try {
+        injected = await injectRecorder(tabId, rec);
+      } catch (e) {
+        sessionRecordings.delete(tabId);
+        throw e;
+      }
+      if (!injected) {
+        sessionRecordings.delete(tabId); // top-frame injection failed - don't strand a dead state
+        throw new Error("could not inject the session recorder into the top frame");
+      }
       return { recording: true, tabId, allFrames: rec.allFrames, url: tab.url };
     }
 
