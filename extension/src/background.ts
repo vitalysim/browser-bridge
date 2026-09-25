@@ -1,5 +1,10 @@
 /// <reference types="chrome" />
 
+// Self-contained injected page helpers, kept in their own files so the two hot files stay small:
+// bbAct is the ONE find-and-act helper the interaction tools share; bbAxSnapshot is the ARIA walker.
+import { bbAct, type BbActParams } from "./dom-act";
+import { bbAxSnapshot } from "./ax";
+
 // Injected at build time by build.mjs (esbuild define) from extension/package.json - single
 // source of truth shared with manifest.json, so the version can't drift.
 declare const __BB_VERSION__: string;
@@ -530,6 +535,41 @@ async function injectAllAggregate(tab: chrome.tabs.Tab, func: (...args: any[]) =
   throw new Error(stale ? "Ref matched an element that was since removed/re-rendered - take a fresh snapshot" : "Element not found in any frame - take a fresh snapshot");
 }
 
+// bbAct across every frame, tracking WHICH frame owns the element so the auto-wait retry can
+// re-inject into just that frame instead of walking every frame's DOM again each tick. Unlike
+// injectAllAggregate it does NOT throw on not-found/stale - it returns a structured result the retry
+// loop interprets (a real {error} still throws). frameId is null when no frame located the element.
+async function actAllFrames(tab: chrome.tabs.Tab, args: any[]): Promise<{ result: any; frameId: number | null }> {
+  const results = await injectAllFrames(tab, bbAct, args);
+  let acted: any = null;
+  let ownerFrame: number | null = null;
+  let stale = false;
+  for (const r of results) {
+    const v: any = r?.result;
+    if (!v || typeof v !== "object") continue;
+    if (typeof v.error === "string") throw new Error(v.error);
+    if (v.staleRef) { stale = true; continue; }
+    if (v.notFound) continue;
+    acted = v;
+    ownerFrame = r.frameId; // this frame owns the element (result may be notActionable)
+  }
+  if (acted) return { result: acted, frameId: ownerFrame };
+  return { result: stale ? { staleRef: true } : { notFound: true }, frameId: null };
+}
+
+// A retry once the owning frame is known: run bbAct in just that one frame.
+async function actInFrame(tab: chrome.tabs.Tab, frameId: number, args: any[]): Promise<any> {
+  const res = await chrome.scripting.executeScript({
+    target: { tabId: tab.id!, frameIds: [frameId] },
+    world: "ISOLATED",
+    func: bbAct as any,
+    args: clean(args),
+  });
+  const v: any = res?.[0]?.result;
+  if (v && typeof v === "object" && typeof v.error === "string") throw new Error(v.error);
+  return v ?? { notFound: true };
+}
+
 // ---------- injected page functions ----------
 // These are serialized and run IN THE PAGE, so each must be fully self-contained:
 // no references to module-scope helpers (esbuild would leave dangling names). Shadow-DOM
@@ -658,356 +698,6 @@ function bbSnapshot(refOffset: number) {
   };
   walk(document);
   return { url: location.href, count: items.length, elements: items };
-}
-
-function bbInteract(action: string, ref: number | null, sel: string | null, value: string | null) {
-  // Self-contained shadow-piercing finder (injected funcs may not reference module-scope helpers).
-  const deepFind = (pred: (e: Element) => boolean): HTMLElement | null => {
-    const stack: (Document | ShadowRoot)[] = [document];
-    while (stack.length) {
-      const root = stack.pop()!;
-      let els: NodeListOf<Element>;
-      try {
-        els = root.querySelectorAll("*");
-      } catch {
-        continue;
-      }
-      for (const el of Array.from(els)) {
-        try {
-          if (pred(el)) return el as HTMLElement;
-        } catch {}
-        const sr = (el as HTMLElement).shadowRoot;
-        if (sr) stack.push(sr);
-      }
-    }
-    return null;
-  };
-  // Resolve a ref via the ISOLATED-world registry (window.__bbRefs) that bbSnapshot builds -
-  // no data-bb-ref DOM mutation. A ref that matched but whose element was since removed/re-rendered
-  // returns {staleRef} so the caller retries with a fresh snapshot. CSS selectors still deep-find.
-  let el: HTMLElement | null = null;
-  if (ref != null) {
-    const reg = (window as any).__bbRefs as Map<number, Element> | undefined;
-    const hit = reg && reg.get(ref);
-    if (!hit) return { notFound: true };
-    if (!(hit as Element).isConnected) return { staleRef: true };
-    el = hit as HTMLElement;
-  } else {
-    el = deepFind((e) => {
-      try {
-        return (e as HTMLElement).matches(sel!);
-      } catch {
-        return false;
-      }
-    });
-    if (!el) return { notFound: true };
-  }
-
-  const setNativeValue = (target: HTMLElement, v: string): boolean => {
-    if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
-      const proto = target instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
-      if (setter) setter.call(target, v);
-      else (target as any).value = v;
-    } else if (target instanceof HTMLSelectElement) {
-      (target as HTMLSelectElement).value = v;
-    } else if (target.isContentEditable) {
-      target.textContent = v;
-    } else {
-      return false;
-    }
-    return true;
-  };
-
-  const tag = el.tagName.toLowerCase();
-  // --- actionability preflight (returns {notActionable, reason} so the caller can retry/report) ---
-  const cs = getComputedStyle(el);
-  const rect0 = el.getBoundingClientRect();
-  const visible =
-    (!!rect0.width || !!rect0.height) &&
-    cs.visibility !== "hidden" &&
-    cs.display !== "none" &&
-    ((el as any).checkVisibility ? (el as any).checkVisibility() : true);
-  const disabled = !!(el as any).disabled || el.getAttribute("aria-disabled") === "true";
-  if (!visible) return { notActionable: true, reason: "hidden", tag };
-  if (disabled && action !== "hover") return { notActionable: true, reason: "disabled", tag };
-
-  if (action === "click" || action === "hover") {
-    el.scrollIntoView({ block: "center", inline: "center" });
-    const r = el.getBoundingClientRect();
-    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-    if (action === "click") {
-      const top = document.elementFromPoint(cx, cy) as HTMLElement | null;
-      const covered = !!top && top !== el && !el.contains(top) && !top.contains(el);
-      if (covered) {
-        const by = top!.tagName.toLowerCase() + (top!.id ? "#" + top!.id : top!.className && typeof top!.className === "string" ? "." + top!.className.trim().split(/\s+/)[0] : "");
-        return { notActionable: true, reason: "covered", coveredBy: by, tag };
-      }
-      el.click();
-      return { clicked: true, via: "synthetic", tag, label: (el.innerText || "").trim().slice(0, 80) };
-    }
-    const base: any = { bubbles: true, cancelable: true, clientX: cx, clientY: cy };
-    el.dispatchEvent(new PointerEvent("pointerover", base));
-    el.dispatchEvent(new MouseEvent("mouseover", base));
-    el.dispatchEvent(new MouseEvent("mouseenter", base));
-    el.dispatchEvent(new MouseEvent("mousemove", base));
-    return { hovered: true, tag };
-  }
-  if (action === "fill") {
-    el.focus();
-    if (el.isContentEditable) {
-      // rich editors (ProseMirror/Quill/Lit/React) require beforeinput - execCommand fires it
-      try {
-        document.execCommand("selectAll", false);
-        document.execCommand("insertText", false, value ?? "");
-      } catch {
-        el.textContent = value ?? "";
-      }
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      return { filled: true, via: "execCommand", tag };
-    }
-    if (!setNativeValue(el, value ?? "")) return { error: `Element <${tag}> is not fillable` };
-    el.dispatchEvent(new Event("input", { bubbles: true }));
-    el.dispatchEvent(new Event("change", { bubbles: true }));
-    return { filled: true, tag };
-  }
-  if (action === "type") {
-    el.focus();
-    const text = value ?? "";
-    if (el.isContentEditable) {
-      for (const ch of Array.from(text)) {
-        el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, bubbles: true, cancelable: true }));
-        try {
-          document.execCommand("insertText", false, ch);
-        } catch {
-          el.textContent = (el.textContent ?? "") + ch;
-        }
-        el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, bubbles: true, cancelable: true }));
-      }
-      return { typed: text.length, via: "execCommand", tag };
-    }
-    let cur = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? el.value : el.textContent ?? "";
-    for (const ch of Array.from(text)) {
-      const opts: any = { key: ch, bubbles: true, cancelable: true };
-      el.dispatchEvent(new KeyboardEvent("keydown", opts));
-      el.dispatchEvent(new KeyboardEvent("keypress", opts));
-      cur += ch;
-      setNativeValue(el, cur);
-      el.dispatchEvent(new InputEvent("input", { bubbles: true, data: ch, inputType: "insertText" }));
-      el.dispatchEvent(new KeyboardEvent("keyup", opts));
-    }
-    el.dispatchEvent(new Event("change", { bubbles: true }));
-    return { typed: text.length, tag };
-  }
-  return { error: `Unknown action: ${action}` };
-}
-
-function bbFileUpload(sel: string | null, ref: number | null, filename: string, mimeType: string | null, b64: string) {
-  const deepFind = (pred: (e: Element) => boolean): HTMLElement | null => {
-    const stack: (Document | ShadowRoot)[] = [document];
-    while (stack.length) {
-      const root = stack.pop()!;
-      let els: NodeListOf<Element>;
-      try {
-        els = root.querySelectorAll("*");
-      } catch {
-        continue;
-      }
-      for (const el of Array.from(els)) {
-        try {
-          if (pred(el)) return el as HTMLElement;
-        } catch {}
-        const sr = (el as HTMLElement).shadowRoot;
-        if (sr) stack.push(sr);
-      }
-    }
-    return null;
-  };
-  // Resolve a ref via the ISOLATED-world registry (window.__bbRefs) that bbSnapshot builds -
-  // no data-bb-ref DOM mutation. A ref that matched but whose element was since removed/re-rendered
-  // returns {staleRef} so the caller retries with a fresh snapshot. CSS selectors still deep-find.
-  let el: HTMLElement | null = null;
-  if (ref != null) {
-    const reg = (window as any).__bbRefs as Map<number, Element> | undefined;
-    const hit = reg && reg.get(ref);
-    if (!hit) return { notFound: true };
-    if (!(hit as Element).isConnected) return { staleRef: true };
-    el = hit as HTMLElement;
-  } else {
-    el = deepFind((e) => {
-      try {
-        return (e as HTMLElement).matches(sel!);
-      } catch {
-        return false;
-      }
-    });
-    if (!el) return { notFound: true };
-  }
-  if (!(el instanceof HTMLInputElement) || el.type !== "file") return { error: "Target is not an <input type=file>" };
-  let bytes: Uint8Array;
-  try {
-    const bin = atob(b64);
-    bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  } catch {
-    return { error: "Invalid base64 content" };
-  }
-  const file = new File([bytes as BlobPart], filename, { type: mimeType || "application/octet-stream" });
-  const dt = new DataTransfer();
-  dt.items.add(file);
-  (el as HTMLInputElement).files = dt.files;
-  el.dispatchEvent(new Event("input", { bubbles: true }));
-  el.dispatchEvent(new Event("change", { bubbles: true }));
-  return { uploaded: filename, size: bytes.length };
-}
-
-// Paste (or drop) an image into a rich text / contenteditable field via synthetic clipboard/drag events.
-function bbPasteImage(sel: string | null, ref: number | null, b64: string, mimeType: string, method: string) {
-  const deepFind = (pred: (e: Element) => boolean): HTMLElement | null => {
-    const stack: (Document | ShadowRoot)[] = [document];
-    while (stack.length) {
-      const root = stack.pop()!;
-      let els: NodeListOf<Element>;
-      try {
-        els = root.querySelectorAll("*");
-      } catch {
-        continue;
-      }
-      for (const el of Array.from(els)) {
-        try {
-          if (pred(el)) return el as HTMLElement;
-        } catch {}
-        const sr = (el as HTMLElement).shadowRoot;
-        if (sr) stack.push(sr);
-      }
-    }
-    return null;
-  };
-  // Resolve a ref via the ISOLATED-world registry (window.__bbRefs) that bbSnapshot builds -
-  // no data-bb-ref DOM mutation. A ref that matched but whose element was since removed/re-rendered
-  // returns {staleRef} so the caller retries with a fresh snapshot. CSS selectors still deep-find.
-  let el: HTMLElement | null = null;
-  if (ref != null) {
-    const reg = (window as any).__bbRefs as Map<number, Element> | undefined;
-    const hit = reg && reg.get(ref);
-    if (!hit) return { notFound: true };
-    if (!(hit as Element).isConnected) return { staleRef: true };
-    el = hit as HTMLElement;
-  } else {
-    el = deepFind((e) => {
-      try {
-        return (e as HTMLElement).matches(sel!);
-      } catch {
-        return false;
-      }
-    });
-    if (!el) return { notFound: true };
-  }
-  let bytes: Uint8Array;
-  try {
-    const bin = atob(b64);
-    bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  } catch {
-    return { error: "Invalid base64 content" };
-  }
-  const type = mimeType || "image/png";
-  const ext = (type.split("/")[1] || "png").split("+")[0];
-  const file = new File([bytes as BlobPart], `image.${ext}`, { type });
-  const makeDT = () => {
-    const dt = new DataTransfer();
-    dt.items.add(file);
-    return dt;
-  };
-
-  el.focus();
-  const did: string[] = [];
-  if (method === "paste" || method === "both") {
-    const dt = makeDT();
-    let ev: ClipboardEvent;
-    try {
-      ev = new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true });
-    } catch {
-      ev = new Event("paste", { bubbles: true, cancelable: true }) as ClipboardEvent;
-    }
-    if (!ev.clipboardData) {
-      try {
-        Object.defineProperty(ev, "clipboardData", { value: dt });
-      } catch {}
-    }
-    el.dispatchEvent(ev);
-    did.push("paste");
-  }
-  if (method === "drop" || method === "both") {
-    const r = el.getBoundingClientRect();
-    const base: any = { bubbles: true, cancelable: true, composed: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
-    for (const t of ["dragenter", "dragover", "drop"]) {
-      const dt = makeDT();
-      let de: DragEvent;
-      try {
-        de = new DragEvent(t, { ...base, dataTransfer: dt });
-      } catch {
-        de = new Event(t, base) as DragEvent;
-        try {
-          Object.defineProperty(de, "dataTransfer", { value: dt });
-        } catch {}
-      }
-      el.dispatchEvent(de);
-    }
-    did.push("drop");
-  }
-  return { pasted: true, method: did.join("+") || method, tag: el.tagName.toLowerCase(), size: bytes.length };
-}
-
-// Locate an element (by data-bb-ref or CSS selector, piercing open shadow roots), scroll it into view,
-// and return its viewport-center coordinates - for the trusted (CDP Input) paste path.
-function bbLocate(sel: string | null, ref: number | null) {
-  const deepFind = (pred: (e: Element) => boolean): HTMLElement | null => {
-    const stack: (Document | ShadowRoot)[] = [document];
-    while (stack.length) {
-      const root = stack.pop()!;
-      let els: NodeListOf<Element>;
-      try {
-        els = root.querySelectorAll("*");
-      } catch {
-        continue;
-      }
-      for (const el of Array.from(els)) {
-        try {
-          if (pred(el)) return el as HTMLElement;
-        } catch {}
-        const sr = (el as HTMLElement).shadowRoot;
-        if (sr) stack.push(sr);
-      }
-    }
-    return null;
-  };
-  // Resolve a ref via the ISOLATED-world registry (window.__bbRefs) that bbSnapshot builds -
-  // no data-bb-ref DOM mutation. A ref that matched but whose element was since removed/re-rendered
-  // returns {staleRef} so the caller retries with a fresh snapshot. CSS selectors still deep-find.
-  let el: HTMLElement | null = null;
-  if (ref != null) {
-    const reg = (window as any).__bbRefs as Map<number, Element> | undefined;
-    const hit = reg && reg.get(ref);
-    if (!hit) return { notFound: true };
-    if (!(hit as Element).isConnected) return { staleRef: true };
-    el = hit as HTMLElement;
-  } else {
-    el = deepFind((e) => {
-      try {
-        return (e as HTMLElement).matches(sel!);
-      } catch {
-        return false;
-      }
-    });
-    if (!el) return { notFound: true };
-  }
-  el.scrollIntoView({ block: "center", inline: "center" });
-  try {
-    (el as HTMLElement).focus();
-  } catch {}
-  const r = el.getBoundingClientRect();
-  return { x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height };
 }
 
 // Put an image on the REAL OS clipboard as image/png (converting via canvas if needed). Async; the
@@ -2271,7 +1961,7 @@ async function trustedPasteImage(tab: chrome.tabs.Tab, params: any): Promise<any
   }
 
   // find the target element's on-screen center (CSP-safe function injection; handles plain refs + shadow)
-  const loc = await inject(tab, bbLocate, [params.selector ?? null, params.ref ?? null]);
+  const loc = await inject(tab, bbAct, ["locate", { sel: params.selector ?? null, ref: params.ref ?? null }]);
   if (!loc || loc.notFound || loc.staleRef) throw new Error("Target not found (or since re-rendered) for trusted paste - take a fresh snapshot or check the selector.");
   await sleep(150);
 
@@ -2546,6 +2236,41 @@ async function shallowSnapshot(tab: chrome.tabs.Tab): Promise<any> {
   return { url: tab.url, count: all.length, elements: all };
 }
 
+// Banner-free accessibility-tree snapshot, injected per-frame (same scheme as shallowSnapshot: each
+// frame gets a disjoint ref-offset stride, and each interactive node is registered in that frame's
+// window.__bbRefs so its ref works with click/fill/hover/type). The extension returns the structured
+// per-frame trees; the server renders the compact text (server/src/ax.ts).
+async function axSnapshot(tab: chrome.tabs.Tab): Promise<any> {
+  assertScriptable(tab);
+  let frames: { frameId: number }[];
+  try {
+    frames = (await chrome.webNavigation.getAllFrames({ tabId: tab.id! })) ?? [{ frameId: 0 }];
+  } catch {
+    frames = [{ frameId: 0 }];
+  }
+  const FRAME_REF_STRIDE = 500;
+  const results = await Promise.all(
+    frames.map(async (f, i) => {
+      try {
+        const res = await chrome.scripting.executeScript({
+          target: { tabId: tab.id!, frameIds: [f.frameId] },
+          func: bbAxSnapshot as any,
+          args: [i * FRAME_REF_STRIDE],
+        });
+        return { frameId: f.frameId, v: res?.[0]?.result as any };
+      } catch {
+        return null; // frame not injectable (about:blank, sandboxed, gone)
+      }
+    })
+  );
+  const outFrames: any[] = [];
+  for (const r of results) {
+    if (!r || !r.v) continue;
+    outFrames.push({ frameId: r.frameId, url: r.v.url, root: r.v.root ?? null, truncated: !!r.v.truncated });
+  }
+  return { url: tab.url, frames: outFrames };
+}
+
 // Optionally attaches a fresh shallow snapshot to an interaction result (params.withSnapshot),
 // so a caller doing e.g. click-then-observe can skip a separate follow-up snapshot() call.
 // A snapshot failure is reported inline rather than masking the (already-succeeded) action result.
@@ -2567,15 +2292,19 @@ async function withSnapshotIfRequested(tab: chrome.tabs.Tab, params: any, result
 async function interact(tab: chrome.tabs.Tab, action: string, ref: number | null, sel: string | null, value: string | null, params: any): Promise<any> {
   const timeoutMs = params.timeoutMs ?? 5000;
   const deadline = Date.now() + timeoutMs;
+  const args: any[] = [action, { ref, sel, value } satisfies BbActParams];
   let last: any = null;
+  let ownerFrame: number | null = null; // once a frame owns the element, retry only there
   for (;;) {
-    try {
-      last = await injectAllAggregate(tab, bbInteract, [action, ref, sel, value]);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (/not found in any frame|removed\/re-rendered/i.test(msg)) last = { notFound: true };
-      else throw e; // real error (e.g. "not fillable") - surface it
+    if (ownerFrame == null) {
+      const r = await actAllFrames(tab, args);
+      last = r.result;
+      ownerFrame = r.frameId;
+    } else {
+      last = await actInFrame(tab, ownerFrame, args);
+      if (last?.notFound) ownerFrame = null; // the frame lost the element - re-search all frames
     }
+    if (last?.staleRef) last = { notFound: true }; // a dead ref won't recover; report as not found
     const retryable = last && (last.notFound || (last.notActionable && last.reason !== "covered"));
     if (!retryable || Date.now() >= deadline) break;
     await sleep(150);
@@ -2703,24 +2432,30 @@ async function dispatch(method: string, params: any): Promise<any> {
         await cmd(tab.id!, "DOM.setFileInputFiles", { files: [params.path], nodeId });
         return { uploaded: params.path, trusted: true };
       }
-      return injectAllAggregate(tab, bbFileUpload, [
-        params.selector,
-        params.ref,
-        params.filename,
-        params.mimeType,
-        params.base64,
+      return injectAllAggregate(tab, bbAct, [
+        "upload",
+        {
+          sel: params.selector ?? null,
+          ref: params.ref ?? null,
+          filename: params.filename ?? null,
+          mimeType: params.mimeType ?? null,
+          b64: params.base64 ?? null,
+        } satisfies BbActParams,
       ]);
     }
 
     case "paste_image": {
       const tab = await targetTab(params.tabId);
       if (params.trusted) return trustedPasteImage(tab, params);
-      return injectAllAggregate(tab, bbPasteImage, [
-        params.selector ?? null,
-        params.ref ?? null,
-        params.base64,
-        params.mimeType ?? "image/png",
-        params.method ?? "paste",
+      return injectAllAggregate(tab, bbAct, [
+        "pasteImage",
+        {
+          sel: params.selector ?? null,
+          ref: params.ref ?? null,
+          b64: params.base64 ?? null,
+          mimeType: params.mimeType ?? "image/png",
+          method: params.method ?? "paste",
+        } satisfies BbActParams,
       ]);
     }
 
@@ -3508,6 +3243,11 @@ async function dispatch(method: string, params: any): Promise<any> {
         outbox: { envelopes: outbox.length, bytes: outboxBytes, dropped: outboxDropped },
         wsConnected: !!ws && ws.readyState === WebSocket.OPEN,
       };
+    }
+
+    case "ax_snapshot": {
+      const tab = await targetTab(params.tabId);
+      return axSnapshot(tab);
     }
 
     default:
