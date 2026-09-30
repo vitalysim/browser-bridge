@@ -860,6 +860,48 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const MIN_CAPTURE_INTERVAL_MS = 550;
 const lastCaptureAt = new Map<number, number>(); // windowId -> last captureVisibleTab timestamp
 const captureChain = new Map<number, Promise<unknown>>(); // windowId -> tail of the serialized queue
+// tabId|format|quality -> a capture already in flight. Concurrent agents watching the SAME page used
+// to queue behind each other and each pay a full activate+paint+capture; since their requests overlap
+// in time, one frame is a legitimate answer for all of them. Only ever shared while the capture is
+// still running - nothing is cached past completion, so a later call always gets a fresh frame.
+const captureInFlight = new Map<string, Promise<{ dataUrl: string; meta: any }>>();
+
+/**
+ * Wait until a just-activated tab has actually PAINTED, instead of sleeping a fixed 350ms.
+ *
+ * A backgrounded tab doesn't run requestAnimationFrame; once it becomes visible it does, so two rAF
+ * ticks are a real signal that the compositor produced a frame - typically ~16-33ms rather than 350.
+ * Because captures of different tabs in one window must serialize (captureVisibleTab only ever shoots
+ * the ACTIVE tab), that fixed sleep was the dominant cost of concurrent screenshotting: it set the
+ * floor for every queued capture.
+ *
+ * Deliberately polls a flag rather than relying on executeScript awaiting a returned promise: if that
+ * assumption were wrong the call would resolve instantly and we'd capture an unpainted frame, which is
+ * exactly the kind of silent wrongness this whole path just got fixed for. Polling is correct either
+ * way, and it can never be slower than the old behaviour - if the flag never arrives (throttled or
+ * occluded tab) the remaining budget is still slept.
+ */
+async function awaitPaint(tab: chrome.tabs.Tab, budgetMs: number): Promise<void> {
+  const deadline = Date.now() + budgetMs;
+  try {
+    await inject(tab, () => {
+      const w = window as any;
+      w.__bbPaint = 0;
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => {
+          w.__bbPaint = 1;
+        })
+      );
+    });
+    while (Date.now() < deadline) {
+      if (await inject(tab, () => !!(window as any).__bbPaint)) return;
+      await sleep(8);
+    }
+  } catch {
+    const left = deadline - Date.now(); // not scriptable - fall back to the blind wait
+    if (left > 0) await sleep(left);
+  }
+}
 
 /**
  * Run a captureVisibleTab through a per-window SERIAL queue. A bare timestamp check was not enough:
@@ -3029,9 +3071,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       // own. That is silently wrong data rather than an error, which for an agent is the worst kind of
       // bug: it would reason confidently about a page it never asked for. Everything from re-reading
       // the tab to the capture now happens inside the window queue.
-      let dataUrl = "";
-      let meta: any = {};
-      const grab = async (): Promise<void> => {
+      const grab = async (): Promise<{ dataUrl: string; meta: any }> => {
         let cur = await chrome.tabs.get(tab.id!); // may have navigated or closed while queued
         // A queued capture can wait seconds for its turn, and by then the tab may be mid-navigation
         // with no committed url yet - captureVisibleTab then refuses with "Cannot access contents of
@@ -3043,7 +3083,7 @@ async function dispatch(method: string, params: any): Promise<any> {
         const win = await chrome.windows.get(cur.windowId!);
         if (!cur.active) {
           await chrome.tabs.update(cur.id!, { active: true });
-          await sleep(350); // tab switch - let the newly-shown tab paint
+          await awaitPaint(cur, 350); // real paint signal, not a blind 350ms - see awaitPaint
         }
         if (!win.focused) {
           await chrome.windows.update(cur.windowId!, { focused: true }).catch(() => {});
@@ -3051,11 +3091,23 @@ async function dispatch(method: string, params: any): Promise<any> {
         }
         // Started here so it overlaps the capture but still reflects the tab we are actually shooting.
         const metaPromise = viewportMeta(cur);
-        dataUrl = await chrome.tabs.captureVisibleTab(cur.windowId!, capOpts);
-        meta = await metaPromise;
+        const url = await chrome.tabs.captureVisibleTab(cur.windowId!, capOpts);
+        return { dataUrl: url, meta: await metaPromise };
       };
+      // Share an identical capture that is already running (see captureInFlight).
+      const dedupeKey = `${tab.id}|${fmt}|${capOpts.quality ?? ""}`;
+      const once = (): Promise<{ dataUrl: string; meta: any }> => {
+        const running = captureInFlight.get(dedupeKey);
+        if (running) return running;
+        const mine = serializeCapture(tab.windowId!, grab).finally(() => {
+          if (captureInFlight.get(dedupeKey) === mine) captureInFlight.delete(dedupeKey);
+        });
+        captureInFlight.set(dedupeKey, mine);
+        return mine;
+      };
+      let shot: { dataUrl: string; meta: any };
       try {
-        await serializeCapture(tab.windowId!, grab);
+        shot = await once();
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         // Transient: the compositor can fail a readback, and the quota can still bite after an SW
@@ -3064,12 +3116,12 @@ async function dispatch(method: string, params: any): Promise<any> {
         // never hard-fail just because the window was busy a moment ago.
         if (!/quota|readback|Failed to capture|Cannot access contents/i.test(msg)) throw e;
         try {
-          await serializeCapture(tab.windowId!, grab);
+          shot = await serializeCapture(tab.windowId!, grab);
         } catch {
           return cdpScreenshot(tab, { ...params, format: fmt });
         }
       }
-      return { base64: dataUrl.replace(/^data:image\/(png|jpeg);base64,/, ""), format: fmt, ...meta };
+      return { base64: shot.dataUrl.replace(/^data:image\/(png|jpeg);base64,/, ""), format: fmt, ...shot.meta };
     }
 
     case "eval_js": {
