@@ -11,6 +11,7 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { ExtensionHub } from "./hub.js";
 import { registerTools, startWatchNetCapture } from "./tools.js";
 import { renderActions, watchRegistry } from "./watch.js";
+import { sessionsToReap, type SessionState } from "./session-reaper.js";
 
 const PORT = Number(process.env.BRIDGE_PORT ?? 8765);
 const HOST = "127.0.0.1";
@@ -141,6 +142,29 @@ function buildMcpServer(): McpServer {
 
 // sessionId -> transport (each MCP client gets its own session; all share the hub)
 const transports = new Map<string, StreamableHTTPServerTransport>();
+// Liveness per session, so sessions whose client vanished without a DELETE can be reclaimed. Each
+// one retains its own McpServer + every registered tool, so leaking them grows the heap by ~1.2MB
+// apiece - enough to OOM a long-lived server. Kept alongside `transports`, same keys.
+const sessionState = new Map<string, SessionState>();
+const servers = new Map<string, McpServer>(); // needed to close the server, not just the transport
+
+function reapIdleSessions(now = Date.now()): void {
+  for (const sid of sessionsToReap(sessionState, now)) {
+    const t = transports.get(sid);
+    const s = servers.get(sid);
+    // Drop our bookkeeping first: transport.close() fires onclose, which would otherwise re-enter.
+    transports.delete(sid);
+    sessionState.delete(sid);
+    servers.delete(sid);
+    void Promise.resolve()
+      .then(() => t?.close())
+      .then(() => s?.close())
+      .catch(() => undefined); // already gone
+    console.error(`[mcp] session reaped (idle): ${sid}`);
+  }
+}
+// Unref'd so the sweep never holds the process open.
+setInterval(() => reapIdleSessions(), 5 * 60 * 1000).unref();
 
 function authorized(req: express.Request): boolean {
   const host = (req.headers.host ?? "").split(":")[0];
@@ -167,16 +191,32 @@ app.all("/mcp", async (req, res) => {
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (sid) => {
           transports.set(sid, transport!);
+          sessionState.set(sid, { lastSeen: Date.now(), inflight: 0 });
+          servers.set(sid, server);
           console.error(`[mcp] session initialized: ${sid}`);
         },
       });
       transport.onclose = () => {
-        if (transport!.sessionId) {
-          transports.delete(transport!.sessionId);
-          console.error(`[mcp] session closed: ${transport!.sessionId}`);
+        const sid = transport!.sessionId;
+        if (sid && transports.has(sid)) {
+          transports.delete(sid);
+          sessionState.delete(sid);
+          servers.delete(sid);
+          console.error(`[mcp] session closed: ${sid}`);
         }
       };
-      await buildMcpServer().connect(transport);
+      const server = buildMcpServer();
+      await server.connect(transport);
+    } else if (sessionId) {
+      // 404 (not 400) is what tells an MCP client its session is gone and it should re-initialize.
+      // Reaping idle sessions is only safe because of this: a client that comes back gets one 404
+      // and transparently starts a new session.
+      res.status(404).json({
+        jsonrpc: "2.0",
+        error: { code: -32001, message: "Session not found or expired: re-initialize." },
+        id: null,
+      });
+      return;
     } else {
       res.status(400).json({
         jsonrpc: "2.0",
@@ -187,7 +227,22 @@ app.all("/mcp", async (req, res) => {
     }
   }
 
-  await transport.handleRequest(req, res, req.body);
+  // Mark activity for the whole life of the request, so a long poll (watch_read waits ~25s) is
+  // never mistaken for an idle session and reaped mid-flight.
+  const sid = transport.sessionId;
+  const st = sid ? sessionState.get(sid) : undefined;
+  if (st) {
+    st.lastSeen = Date.now();
+    st.inflight++;
+  }
+  try {
+    await transport.handleRequest(req, res, req.body);
+  } finally {
+    if (st) {
+      st.inflight--;
+      st.lastSeen = Date.now();
+    }
+  }
 });
 
 app.get("/health", (_req, res) => {
