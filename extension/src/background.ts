@@ -2503,7 +2503,22 @@ async function interact(tab: chrome.tabs.Tab, action: string, ref: number | null
       last = await actInFrame(tab, ownerFrame, args);
       if (last?.notFound) ownerFrame = null; // the frame lost the element - re-search all frames
     }
-    if (last?.staleRef) last = { notFound: true }; // a dead ref won't recover; report as not found
+    // A ref that no frame can resolve will NOT recover by waiting: window.__bbRefs is only
+    // repopulated by a new snapshot, and a detached node never reattaches. Retrying it just burned
+    // the whole timeout (measured 5107ms) to return the same failure, so fail fast and say what to
+    // do about it. A SELECTOR miss still retries - that element can legitimately appear later - and
+    // notActionable (hidden/disabled) keeps retrying in both modes, which is the useful auto-wait.
+    if (ref != null && (last?.staleRef || last?.notFound)) {
+      const stale = !!last?.staleRef;
+      return {
+        notActionable: true,
+        reason: stale ? "stale-ref" : "unknown-ref",
+        detail: stale
+          ? "the element this ref pointed at is gone from the DOM (re-render/navigation) - take a new snapshot"
+          : "this ref is not in the page's ref registry (it was reset by a navigation, or a newer snapshot replaced it) - take a new snapshot",
+        ref,
+      };
+    }
     const retryable = last && (last.notFound || (last.notActionable && last.reason !== "covered"));
     if (!retryable || Date.now() >= deadline) break;
     await sleep(150);
@@ -2700,6 +2715,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       const limit = params.limit ?? 100;
       if (entries.length > limit) entries = entries.slice(-limit);
       const out: any[] = [];
+      const bodyJobs: { row: any; requestId: string }[] = [];
       for (const e of entries) {
         const x = s.extra.get(e.requestId);
         const row: any = {
@@ -2719,20 +2735,32 @@ async function dispatch(method: string, params: any): Promise<any> {
         if (x?.setCookie) row.setCookie = x.setCookie;
         if (e.requestBody) row.requestBody = e.requestBody;
         if (e.redirectLocation) row.redirectLocation = e.redirectLocation;
-        if (params.includeBodies && e.finished && !e.failed) {
-          try {
-            const b = await bodyFetchSem.run(() => getResponseBody(tab.id!, e.requestId));
-            row.responseBody = b.body;
-            row.responseBodyBase64 = b.base64;
-            if (b.truncated) {
-              row.responseBodyTruncated = true;
-              row.responseBodyOriginalLength = b.originalLength;
-            }
-          } catch (err) {
-            row.responseBodyError = err instanceof Error ? err.message : String(err);
-          }
-        }
+        // Bodies are fetched AFTER the rows are built, concurrently - see below.
+        if (params.includeBodies && e.finished && !e.failed) bodyJobs.push({ row, requestId: e.requestId });
         out.push(row);
+      }
+      // `await` inside the row loop serialized every fetch, so the 6-slot semaphore never actually
+      // ran anything in parallel (100 bodies = 100 sequential CDP round trips). Starting them all and
+      // awaiting together lets the semaphore do its job; row order is untouched because each job
+      // mutates the row object it captured.
+      if (bodyJobs.length) {
+        await Promise.all(
+          bodyJobs.map(({ row, requestId }) =>
+            bodyFetchSem
+              .run(() => getResponseBody(tab.id!, requestId))
+              .then((b) => {
+                row.responseBody = b.body;
+                row.responseBodyBase64 = b.base64;
+                if (b.truncated) {
+                  row.responseBodyTruncated = true;
+                  row.responseBodyOriginalLength = b.originalLength;
+                }
+              })
+              .catch((err) => {
+                row.responseBodyError = err instanceof Error ? err.message : String(err);
+              })
+          )
+        );
       }
       return { count: out.length, totalBuffered: s.net.size, requests: out };
     }
@@ -2957,7 +2985,10 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "screenshot": {
       const tab = await targetTab(params.tabId);
-      const rich = params.fullPage || params.selector || params.scale || (params.format && params.format !== "png");
+      // captureVisibleTab supports jpeg + quality natively, so only fullPage/selector/scale actually
+      // need CDP. Routing a plain jpeg through CDP cost a debugger attach (and the banner) for nothing.
+      const fmt: "png" | "jpeg" = params.format === "jpeg" ? "jpeg" : "png";
+      const rich = params.fullPage || params.selector || params.scale || (params.format && params.format !== "png" && params.format !== "jpeg");
       if (rich) return cdpScreenshot(tab, params);
       // default: banner-free visible-viewport PNG. captureVisibleTab grabs the ACTIVE tab of the given
       // window, so what it actually requires is that our tab is active in its own window - not that
@@ -2977,19 +3008,27 @@ async function dispatch(method: string, params: any): Promise<any> {
       // The returned meta already reports visibilityState/hidden, so a caller capturing an occluded
       // or minimized window is still warned that the frame may be throttled or stale.
       await throttleCapture(tab.windowId!);
+      // jpeg carries a quality; png ignores it (Chrome rejects quality on png).
+      const capOpts =
+        fmt === "jpeg"
+          ? { format: "jpeg" as const, quality: Math.max(1, Math.min(params.quality ?? 80, 100)) }
+          : { format: "png" as const };
+      // Kick the viewport-meta read off in parallel: it is an independent injected call, and awaiting
+      // it after the capture just added its round trip to every screenshot.
+      const metaPromise = viewportMeta(tab);
       let dataUrl: string;
       try {
-        dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId!, { format: "png" });
+        dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId!, capOpts);
       } catch (e) {
         // Belt-and-braces: the throttle's timestamps live in service-worker memory, so an SW respawn
         // between captures can still land inside the quota window. One spaced retry covers it.
         if (!/quota/i.test(e instanceof Error ? e.message : String(e))) throw e;
         await sleep(MIN_CAPTURE_INTERVAL_MS);
         lastCaptureAt.set(tab.windowId!, Date.now());
-        dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId!, { format: "png" });
+        dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId!, capOpts);
       }
-      const meta = await viewportMeta(tab);
-      return { base64: dataUrl.replace(/^data:image\/png;base64,/, ""), format: "png", ...meta };
+      const meta = await metaPromise;
+      return { base64: dataUrl.replace(/^data:image\/(png|jpeg);base64,/, ""), format: fmt, ...meta };
     }
 
     case "eval_js": {

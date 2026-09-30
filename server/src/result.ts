@@ -72,11 +72,7 @@ function truncateArrayPayload(value: unknown, maxChars: number): string | null {
   if (Array.isArray(value)) {
     return fitArray(
       (k) =>
-        JSON.stringify(
-          { truncated: true, returned: k, total: value.length, hint: HINT, items: value.slice(0, k) },
-          null,
-          2
-        ),
+        JSON.stringify({ truncated: true, returned: k, total: value.length, hint: HINT, items: value.slice(0, k) }),
       value.length,
       maxChars
     );
@@ -99,11 +95,7 @@ function truncateArrayPayload(value: unknown, maxChars: number): string | null {
     return fitArray(
       (k) => {
         rest[field!] = arr.slice(0, k);
-        return JSON.stringify(
-          { ...rest, truncated: true, returned: k, total: arr.length, truncatedField: field, hint: HINT },
-          null,
-          2
-        );
+        return JSON.stringify({ ...rest, truncated: true, returned: k, total: arr.length, truncatedField: field, hint: HINT });
       },
       arr.length,
       maxChars
@@ -126,23 +118,21 @@ export function truncateForText(value: unknown, maxChars: number): Truncation {
     const keep = Math.max(0, maxChars - 60);
     return { text: value.slice(0, keep) + `\n…[truncated: ${keep} of ${value.length} chars]`, truncated: true };
   }
-  const full = JSON.stringify(value, null, 2);
+  // Compact, not pretty: indentation added 36-96% characters (measured) to every JSON result, which
+  // is pure token cost for the agent reading it and wasted budget before truncation kicks in.
+  const full = JSON.stringify(value);
   if (full.length <= maxChars) return { text: full, truncated: false };
 
   const arrayCut = truncateArrayPayload(value, maxChars);
   if (arrayCut) return { text: arrayCut, truncated: true };
 
   const budget = Math.max(0, maxChars - 200);
-  const text = JSON.stringify(
-    {
-      truncated: true,
-      bytes: full.length,
-      hint: HINT,
-      note: "result too large; showing a prefix of the JSON",
-      preview: full.slice(0, budget),
-    },
-    null,
-    2
-  );
+  const text = JSON.stringify({
+    truncated: true,
+    bytes: full.length,
+    hint: HINT,
+    note: "result too large; showing a prefix of the JSON",
+    preview: full.slice(0, budget),
+  });
   return { text, truncated: true };
 }

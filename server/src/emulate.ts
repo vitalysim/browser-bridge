@@ -14,7 +14,7 @@ type ToolFn = (
 ) => void;
 
 function ok(value: unknown) {
-  return { content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] };
+  return { content: [{ type: "text" as const, text: JSON.stringify(value) }] };
 }
 
 const tabIdParam = z.number().optional().describe("Target tab id (from tabs_list). Defaults to the active tab.");
