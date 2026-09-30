@@ -298,6 +298,7 @@
   document.addEventListener(
     "click",
     (e) => {
+      if (dormant) return; // BEFORE ref(): selector+label work is the expensive part
       const hit = actual(e);
       const el = ref(interactive(hit));
       if (!el) return;
@@ -309,6 +310,7 @@
   document.addEventListener(
     "input",
     (e) => {
+      if (dormant) return;
       const h = actual(e);
       if (!h) return;
       const i = h as HTMLInputElement;
@@ -321,6 +323,7 @@
   document.addEventListener(
     "change",
     (e) => {
+      if (dormant) return;
       const h = actual(e);
       if (!h) return;
       const i = h as HTMLInputElement;
@@ -332,6 +335,7 @@
   document.addEventListener(
     "submit",
     (e) => {
+      if (dormant) return; // skip FormData + ref() entirely on an unwatched tab
       const form = actual(e) as HTMLFormElement | null;
       if (!form) return;
       const fields: any[] = [];
@@ -359,6 +363,7 @@
   document.addEventListener(
     "keydown",
     (e) => {
+      if (dormant) return;
       const ke = e as KeyboardEvent;
       // Printable, unmodified keys are deliberately not reported: the coalesced input action already
       // carries the typed text, and a per-character stream is both noisy and the password-leak path.
@@ -369,13 +374,14 @@
     true
   );
 
-  document.addEventListener("focusin", (e) => push({ t: now(), k: "focus", el: ref(actual(e)) }), true);
-  document.addEventListener("focusout", () => push({ t: now(), k: "blur" }), true);
+  document.addEventListener("focusin", (e) => { if (dormant) return; push({ t: now(), k: "focus", el: ref(actual(e)) }); }, true);
+  document.addEventListener("focusout", () => { if (dormant) return; push({ t: now(), k: "blur" }); }, true);
 
   for (const k of ["copy", "paste"] as const) {
     document.addEventListener(
       k,
       (e) => {
+        if (dormant) return;
         let text = "";
         try {
           text = (e as ClipboardEvent).clipboardData?.getData("text") ?? "";
@@ -392,7 +398,7 @@
   document.addEventListener(
     "scroll",
     () => {
-      if (scrollTimer) return; // throttle at the source; the server coalesces runs on top of this
+      if (dormant || scrollTimer) return; // throttle at the source; the server coalesces runs on top of this
       scrollTimer = setTimeout(() => {
         scrollTimer = null;
         push({ t: now(), k: "scroll", y: Math.round(window.scrollY) });
