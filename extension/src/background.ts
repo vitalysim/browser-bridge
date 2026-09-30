@@ -3018,41 +3018,50 @@ async function dispatch(method: string, params: any): Promise<any> {
       // needs a real repaint before capture, whereas raising an already-visible window does not, and
       // gating the settle on window focus meant a multi-window setup (or Chrome simply not being the
       // frontmost app) paid the full 350ms on every single screenshot.
-      const win = await chrome.windows.get(tab.windowId!);
-      if (!tab.active) {
-        await chrome.tabs.update(tab.id!, { active: true });
-        await sleep(350); // tab switch - let the newly-shown tab paint
-      }
-      if (!win.focused) {
-        await chrome.windows.update(tab.windowId!, { focused: true }).catch(() => {});
-        await sleep(60); // window raise - compositor only, no layout
-      }
-      // The returned meta already reports visibilityState/hidden, so a caller capturing an occluded
-      // or minimized window is still warned that the frame may be throttled or stale.
       // jpeg carries a quality; png ignores it (Chrome rejects quality on png).
       const capOpts =
         fmt === "jpeg"
           ? { format: "jpeg" as const, quality: Math.max(1, Math.min(params.quality ?? 80, 100)) }
           : { format: "png" as const };
-      // Kick the viewport-meta read off in parallel: it is an independent injected call, and awaiting
-      // it after the capture just added its round trip to every screenshot.
-      const metaPromise = viewportMeta(tab);
-      let dataUrl: string;
+      // ACTIVATION AND CAPTURE MUST BE ATOMIC PER WINDOW. captureVisibleTab shoots whatever tab is
+      // ACTIVE in the window, so doing the activate outside the lock let a second caller activate its
+      // own tab in between - and the first caller then got the OTHER tab pixels back, labelled as its
+      // own. That is silently wrong data rather than an error, which for an agent is the worst kind of
+      // bug: it would reason confidently about a page it never asked for. Everything from re-reading
+      // the tab to the capture now happens inside the window queue.
+      let dataUrl = "";
+      let meta: any = {};
+      const grab = async (): Promise<void> => {
+        const cur = await chrome.tabs.get(tab.id!); // may have navigated or closed while queued
+        const win = await chrome.windows.get(cur.windowId!);
+        if (!cur.active) {
+          await chrome.tabs.update(cur.id!, { active: true });
+          await sleep(350); // tab switch - let the newly-shown tab paint
+        }
+        if (!win.focused) {
+          await chrome.windows.update(cur.windowId!, { focused: true }).catch(() => {});
+          await sleep(60); // window raise - compositor only, no layout
+        }
+        // Started here so it overlaps the capture but still reflects the tab we are actually shooting.
+        const metaPromise = viewportMeta(cur);
+        dataUrl = await chrome.tabs.captureVisibleTab(cur.windowId!, capOpts);
+        meta = await metaPromise;
+      };
       try {
-        dataUrl = await serializeCapture(tab.windowId!, () => chrome.tabs.captureVisibleTab(tab.windowId!, capOpts));
+        await serializeCapture(tab.windowId!, grab);
       } catch (e) {
-        if (!/quota/i.test(e instanceof Error ? e.message : String(e))) throw e;
-        // The queue timestamps live in service-worker memory, so an SW respawn mid-burst can still
-        // land inside the quota window. Retry once through the queue, then fall back to CDP:
-        // Page.captureScreenshot has no such quota, and a screenshot should never hard-fail just
-        // because something else captured a moment ago.
+        const msg = e instanceof Error ? e.message : String(e);
+        // Transient: the compositor can fail a readback, and the quota can still bite after an SW
+        // respawn lost the queue timestamps. Retry once through the queue, then fall back to CDP -
+        // Page.captureScreenshot has no quota and targets the tab directly, so a screenshot should
+        // never hard-fail just because the window was busy a moment ago.
+        if (!/quota|readback|Failed to capture/i.test(msg)) throw e;
         try {
-          dataUrl = await serializeCapture(tab.windowId!, () => chrome.tabs.captureVisibleTab(tab.windowId!, capOpts));
+          await serializeCapture(tab.windowId!, grab);
         } catch {
           return cdpScreenshot(tab, { ...params, format: fmt });
         }
       }
-      const meta = await metaPromise;
       return { base64: dataUrl.replace(/^data:image\/(png|jpeg);base64,/, ""), format: fmt, ...meta };
     }
 
