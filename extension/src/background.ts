@@ -3032,7 +3032,14 @@ async function dispatch(method: string, params: any): Promise<any> {
       let dataUrl = "";
       let meta: any = {};
       const grab = async (): Promise<void> => {
-        const cur = await chrome.tabs.get(tab.id!); // may have navigated or closed while queued
+        let cur = await chrome.tabs.get(tab.id!); // may have navigated or closed while queued
+        // A queued capture can wait seconds for its turn, and by then the tab may be mid-navigation
+        // with no committed url yet - captureVisibleTab then refuses with "Cannot access contents of
+        // url \"\"". That is a not-ready tab, not a permission problem, so give it a moment to commit.
+        for (let i = 0; i < 10 && !cur.url; i++) {
+          await sleep(100);
+          cur = await chrome.tabs.get(tab.id!);
+        }
         const win = await chrome.windows.get(cur.windowId!);
         if (!cur.active) {
           await chrome.tabs.update(cur.id!, { active: true });
@@ -3055,7 +3062,7 @@ async function dispatch(method: string, params: any): Promise<any> {
         // respawn lost the queue timestamps. Retry once through the queue, then fall back to CDP -
         // Page.captureScreenshot has no quota and targets the tab directly, so a screenshot should
         // never hard-fail just because the window was busy a moment ago.
-        if (!/quota|readback|Failed to capture/i.test(msg)) throw e;
+        if (!/quota|readback|Failed to capture|Cannot access contents/i.test(msg)) throw e;
         try {
           await serializeCapture(tab.windowId!, grab);
         } catch {
