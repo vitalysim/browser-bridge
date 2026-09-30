@@ -859,11 +859,33 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // which is not subject to this quota, so cdpScreenshot deliberately doesn't throttle.
 const MIN_CAPTURE_INTERVAL_MS = 550;
 const lastCaptureAt = new Map<number, number>(); // windowId -> last captureVisibleTab timestamp
+const captureChain = new Map<number, Promise<unknown>>(); // windowId -> tail of the serialized queue
 
-async function throttleCapture(windowId: number): Promise<void> {
-  const wait = MIN_CAPTURE_INTERVAL_MS - (Date.now() - (lastCaptureAt.get(windowId) ?? 0));
-  if (wait > 0) await sleep(wait);
-  lastCaptureAt.set(windowId, Date.now());
+/**
+ * Run a captureVisibleTab through a per-window SERIAL queue. A bare timestamp check was not enough:
+ * concurrent callers (several agents, or one agent with parallel tool calls) all read the same stale
+ * timestamp, all computed the same wait, and then all fired at once - tripping Chrome's
+ * MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND quota. Observed 4 hard failures out of 24 screenshots at 8
+ * concurrent clients. Chaining makes concurrent callers queue and spacing is enforced per capture, so
+ * they wait instead of failing.
+ */
+function serializeCapture<T>(windowId: number, fn: () => Promise<T>): Promise<T> {
+  const prev = captureChain.get(windowId) ?? Promise.resolve();
+  const mine = prev.then(async () => {
+    const wait = MIN_CAPTURE_INTERVAL_MS - (Date.now() - (lastCaptureAt.get(windowId) ?? 0));
+    if (wait > 0) await sleep(wait);
+    try {
+      return await fn();
+    } finally {
+      lastCaptureAt.set(windowId, Date.now()); // space the NEXT capture from when this one finished
+    }
+  });
+  // Keep the chain alive past a rejection, or one failed capture would poison the window's queue.
+  captureChain.set(
+    windowId,
+    mine.catch(() => undefined)
+  );
+  return mine;
 }
 
 // Back/forward via the page's own history - chrome.tabs.goBack/goForward fail spuriously
@@ -3007,7 +3029,6 @@ async function dispatch(method: string, params: any): Promise<any> {
       }
       // The returned meta already reports visibilityState/hidden, so a caller capturing an occluded
       // or minimized window is still warned that the frame may be throttled or stale.
-      await throttleCapture(tab.windowId!);
       // jpeg carries a quality; png ignores it (Chrome rejects quality on png).
       const capOpts =
         fmt === "jpeg"
@@ -3018,14 +3039,18 @@ async function dispatch(method: string, params: any): Promise<any> {
       const metaPromise = viewportMeta(tab);
       let dataUrl: string;
       try {
-        dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId!, capOpts);
+        dataUrl = await serializeCapture(tab.windowId!, () => chrome.tabs.captureVisibleTab(tab.windowId!, capOpts));
       } catch (e) {
-        // Belt-and-braces: the throttle's timestamps live in service-worker memory, so an SW respawn
-        // between captures can still land inside the quota window. One spaced retry covers it.
         if (!/quota/i.test(e instanceof Error ? e.message : String(e))) throw e;
-        await sleep(MIN_CAPTURE_INTERVAL_MS);
-        lastCaptureAt.set(tab.windowId!, Date.now());
-        dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId!, capOpts);
+        // The queue timestamps live in service-worker memory, so an SW respawn mid-burst can still
+        // land inside the quota window. Retry once through the queue, then fall back to CDP:
+        // Page.captureScreenshot has no such quota, and a screenshot should never hard-fail just
+        // because something else captured a moment ago.
+        try {
+          dataUrl = await serializeCapture(tab.windowId!, () => chrome.tabs.captureVisibleTab(tab.windowId!, capOpts));
+        } catch {
+          return cdpScreenshot(tab, { ...params, format: fmt });
+        }
       }
       const meta = await metaPromise;
       return { base64: dataUrl.replace(/^data:image\/(png|jpeg);base64,/, ""), format: fmt, ...meta };
@@ -3083,13 +3108,27 @@ async function dispatch(method: string, params: any): Promise<any> {
         return { slept: timeoutMs };
       }
       const deadline = Date.now() + timeoutMs;
+      let lastErr: string | null = null;
       while (Date.now() < deadline) {
-        const found = await inject(tab, (sel: string) => !!document.querySelector(sel), [params.selector]);
-        if (found) return { found: true, selector: params.selector };
+        // A poll that lands while the page is committing a navigation throws ("Frame with ID 0 was
+        // removed") - which is the single most common way to call wait_for: click a link, then wait
+        // for the next page's element. Treating that as a hard failure made the tool fail ~7 times
+        // in 12 under concurrent load, telling the agent its step broke when the page was merely
+        // still loading. A failed poll is just "not there yet"; only the deadline is fatal, and the
+        // last error rides along so a genuinely dead tab still reports why.
+        try {
+          const found = await inject(tab, (sel: string) => !!document.querySelector(sel), [params.selector]);
+          if (found) return { found: true, selector: params.selector };
+          lastErr = null;
+        } catch (e) {
+          lastErr = e instanceof Error ? e.message : String(e);
+        }
         await sleep(100); // 250ms meant ~125ms of average overshoot past the element appearing
-
       }
-      throw new Error(`Timed out after ${timeoutMs}ms waiting for selector: ${params.selector}`);
+      throw new Error(
+        `Timed out after ${timeoutMs}ms waiting for selector: ${params.selector}` +
+          (lastErr ? ` (last poll failed: ${lastErr})` : "")
+      );
     }
 
     case "download_resource": {
