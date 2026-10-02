@@ -67,7 +67,8 @@ const PLAYBOOK_INSTRUCTIONS =
   "something happens. Trust health.state: 'blind' means capture is down, not that the user is idle. See docs/WATCH.md.";
 
 const app = express();
-app.use(express.json({ limit: "10mb" }));
+// A supported 10 MB image grows to about 13.4 MB when encoded as base64 in an MCP request.
+app.use(express.json({ limit: "20mb" }));
 
 const httpServer = createServer(app);
 const hub = new ExtensionHub(httpServer, token, VERSION);
