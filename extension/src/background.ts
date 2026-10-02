@@ -2606,14 +2606,24 @@ async function dispatch(method: string, params: any): Promise<any> {
       if (params?.short) {
         return tabs.map((t) => ({ id: t.id, title: t.title, origin: safeOrigin(t.url), active: t.active }));
       }
-      return tabs.map((t) => ({ id: t.id, title: t.title, url: t.url, active: t.active, windowId: t.windowId }));
+      return tabs.map((t) => ({ id: t.id, title: t.title, url: t.url, active: t.active, windowId: t.windowId, incognito: t.incognito }));
     }
 
     case "tab_new": {
-      const tab = await chrome.tabs.create({ url: params.url });
+      let tab: chrome.tabs.Tab;
+      if (params.regularWindow) {
+        const windows = await chrome.windows.getAll({ windowTypes: ["normal"] });
+        const regular = windows.find(w => !w.incognito && w.focused) ?? windows.find(w => !w.incognito);
+        if (regular?.id !== undefined) tab = await chrome.tabs.create({ url: params.url, windowId: regular.id });
+        else {
+          const window = await chrome.windows.create({ url: params.url, incognito: false, focused: true });
+          if (!window.tabs?.[0]?.id) throw new Error("Could not create a regular browser tab");
+          tab = window.tabs[0];
+        }
+      } else tab = await chrome.tabs.create({ url: params.url });
       await waitForComplete(tab.id!);
       const fresh = await chrome.tabs.get(tab.id!);
-      return { tabId: fresh.id, title: fresh.title, url: fresh.url };
+      return { tabId: fresh.id, title: fresh.title, url: fresh.url, incognito: fresh.incognito };
     }
 
     case "tab_activate": {
@@ -2644,7 +2654,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       await chrome.tabs.update(tab.id!, { url: params.url });
       await waitForComplete(tab.id!);
       const fresh = await chrome.tabs.get(tab.id!);
-      return { tabId: fresh.id, title: fresh.title, url: fresh.url };
+      return { tabId: fresh.id, title: fresh.title, url: fresh.url, incognito: fresh.incognito };
     }
 
     case "get_page_text": {
@@ -2720,6 +2730,23 @@ async function dispatch(method: string, params: any): Promise<any> {
           b64: params.base64 ?? null,
         } satisfies BbActParams,
       ]);
+    }
+
+    case "paste_html": {
+      const tab = await targetTab(params.tabId);
+      const tabId = tab.id!;
+      await ensureAttached(tabId);
+      await chrome.tabs.update(tabId, { active: true });
+      await chrome.windows.update(tab.windowId!, { focused: true });
+      await sleep(150);
+      const html = JSON.stringify(String(params.html ?? ""));
+      const text = JSON.stringify(String(params.text ?? ""));
+      await cdpEvaluate(tabId, `(async () => { await navigator.clipboard.write([new ClipboardItem({"text/html":new Blob([${html}],{type:"text/html"}),"text/plain":new Blob([${text}],{type:"text/plain"})})]); return true; })()`);
+      const isMac = /Mac/i.test(navigator.userAgent);
+      const key = { key: "v", code: "KeyV", windowsVirtualKeyCode: 86, nativeVirtualKeyCode: 86, modifiers: isMac ? 4 : 2 };
+      await cmd(tabId, "Input.dispatchKeyEvent", { type: "rawKeyDown", ...key, commands: ["Paste"] });
+      await cmd(tabId, "Input.dispatchKeyEvent", { type: "keyUp", ...key });
+      return { pasted: true, trusted: true };
     }
 
     case "paste_image": {

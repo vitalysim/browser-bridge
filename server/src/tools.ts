@@ -42,7 +42,7 @@ const MAX_BATCH_ACTIONS = 50;
 // click/input and the reorder hold (see WatchSession.reorderMs).
 const AGENT_ACTION_TOOLS = new Set([
   "click", "fill", "type", "press_key", "navigate", "scroll", "hover",
-  "go_back", "go_forward", "input", "file_upload", "paste_image",
+  "go_back", "go_forward", "input", "file_upload", "paste_image", "paste_html",
 ]);
 const AGENT_ACTION_SLACK_MS = 1500;
 
@@ -324,8 +324,8 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
   tool(
     "tab_new",
     "Open a new browser tab. Returns the new tab's id once the page finishes loading.",
-    { url: z.string().describe("URL to open") },
-    async ({ url }) => textResult(await hub.call("tab_new", { url }))
+    { url: z.string().describe("URL to open"), regularWindow: z.boolean().optional().describe("Open in a regular, non-incognito window regardless of which window is active") },
+    async ({ url, regularWindow }) => textResult(await hub.call("tab_new", { url, regularWindow }))
   );
 
   tool(
@@ -542,6 +542,13 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       if (!base64 && !path) throw new Error("Provide either base64 (contents) or path (local file path)");
       return textResult(await hub.call("file_upload", { base64, filename, path, mimeType, ref, selector, tabId }));
     }
+  );
+
+  tool(
+    "paste_html",
+    "Paste formatted HTML through the real clipboard into the focused rich-text editor. Uses a trusted paste so the platform saves its editor model. Replaces the clipboard; never submits a form.",
+    { html: z.string().max(1000000), text: z.string().max(1000000), tabId: tabIdParam },
+    async ({ html, text, tabId }) => textResult(await hub.call("paste_html", { html, text, tabId }, 45000))
   );
 
   tool(
