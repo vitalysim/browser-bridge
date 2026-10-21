@@ -1,0 +1,13 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Core Text</title></head>
+<body>
+<h1>Visible heading CORE_VISIBLE_TEXT</h1>
+<div id="hidden" style="display:none">CORE_HIDDEN_TEXT inside a collapsed panel</div>
+<div id="long"></div>
+<p>CORE_END_MARKER</p>
+<script>
+  // Deterministic ~6000 chars of text so paging with a small maxChars needs several pages.
+  let s = "";
+  for (let i = 0; i < 200; i++) s += "line-" + String(i).padStart(3, "0") + " lorem ipsum dolor.\n";
+  document.getElementById("long").innerText = s;
+</script>
+</body></html>

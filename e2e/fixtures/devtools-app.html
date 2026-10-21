@@ -1,0 +1,57 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>devtools app</title>
+</head>
+<body>
+  <h1>DevTools fixture app</h1>
+  <p>Same-origin page for the devtools e2e scenarios: fetch helpers, a WebSocket echo client, console noise.</p>
+  <script>
+    // Awaitable fetch: resolves {status, body} (or {error}).
+    window.api = async (path, opts) => {
+      try {
+        const r = await fetch(path, opts);
+        return { status: r.status, body: await r.text() };
+      } catch (e) {
+        return { error: String(e) };
+      }
+    };
+    // Fire-and-forget fetch for interception: the result lands in window.__r[key] when it settles.
+    window.__r = {};
+    window.fire = (key, path, opts) => {
+      window.__r[key] = "pending";
+      window.api(path, opts).then((v) => (window.__r[key] = v));
+      return key;
+    };
+    // Open /ws/echo, send each message, resolve with the echoes once all came back, then close.
+    window.wsRoundtrip = (msgs) =>
+      new Promise((resolve, reject) => {
+        const ws = new WebSocket(`ws://${location.host}/ws/echo`);
+        const got = [];
+        const timer = setTimeout(() => reject(new Error("ws timeout, got " + JSON.stringify(got))), 5000);
+        ws.onopen = () => msgs.forEach((m) => ws.send(m));
+        ws.onmessage = (ev) => {
+          got.push(String(ev.data));
+          if (got.length === msgs.length) {
+            clearTimeout(timer);
+            ws.close(1000, "done");
+            resolve(got);
+          }
+        };
+        ws.onerror = () => reject(new Error("ws error"));
+      });
+    // Console noise at every level, plus one uncaught exception.
+    window.doLogs = (tag) => {
+      console.log(`bb-log ${tag}`);
+      console.info(`bb-info ${tag}`);
+      console.warn(`bb-warn ${tag}`);
+      console.error(`bb-error ${tag}`);
+      setTimeout(() => {
+        throw new Error(`bb-uncaught ${tag}`);
+      }, 0);
+      return true;
+    };
+  </script>
+</body>
+</html>

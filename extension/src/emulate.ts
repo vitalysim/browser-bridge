@@ -24,6 +24,9 @@ interface Applied {
   geolocation?: boolean;
 }
 const applied = new Map<number, Applied>();
+// The user agent emulate_device set per tab, so a later locale override (which must also go through
+// Network.setUserAgentOverride to reach navigator.language) keeps it instead of reverting the UA.
+const deviceUA = new Map<number, string>();
 function mark(tabId: number, ...keys: (keyof Applied)[]) {
   const a = applied.get(tabId) ?? {};
   for (const k of keys) a[k] = true;
@@ -46,6 +49,7 @@ export function emulationState(tabId: number): string[] {
 /** The debugger detached: CDP dropped every override, so drop the bookkeeping too. */
 export function forgetEmulation(tabId: number): void {
   applied.delete(tabId);
+  deviceUA.delete(tabId);
 }
 
 export interface DeviceParams {
@@ -61,6 +65,7 @@ export async function emulateDevice(tabId: number, params: DeviceParams, cmd: Cm
   if (params.userAgent) {
     await cmd(tabId, "Network.enable");
     await cmd(tabId, "Network.setUserAgentOverride", { userAgent: params.userAgent });
+    deviceUA.set(tabId, params.userAgent);
   }
   mark(tabId, "device", "touch");
   if (params.userAgent) mark(tabId, "userAgent");
@@ -123,9 +128,18 @@ export async function emulateLocale(tabId: number, params: LocaleParams, cmd: Cm
     await cmd(tabId, "Emulation.setTimezoneOverride", { timezoneId: params.timezoneId });
     mark(tabId, "timezone");
   }
-  if (params.acceptLanguage != null) {
+  // Emulation.setLocaleOverride only drives Intl; navigator.language(s) and the Accept-Language header
+  // come from the user-agent override's acceptLanguage. Default it to the locale so emulate_locale does
+  // what EMULATION.md promises, keeping any device user agent (or the browser's own) unchanged.
+  const lang = params.acceptLanguage ?? params.locale;
+  if (lang != null) {
     await cmd(tabId, "Network.enable");
-    await cmd(tabId, "Network.setExtraHTTPHeaders", { headers: { "Accept-Language": params.acceptLanguage } });
+    let userAgent = deviceUA.get(tabId);
+    if (!userAgent) {
+      const r = await cmd(tabId, "Runtime.evaluate", { expression: "navigator.userAgent", returnByValue: true });
+      userAgent = String(r?.result?.value ?? "");
+    }
+    await cmd(tabId, "Network.setUserAgentOverride", { userAgent, acceptLanguage: lang });
     mark(tabId, "acceptLanguage");
   }
   return {
@@ -133,7 +147,7 @@ export async function emulateLocale(tabId: number, params: LocaleParams, cmd: Cm
     applied: "locale",
     locale: params.locale ?? null,
     timezoneId: params.timezoneId ?? null,
-    acceptLanguage: params.acceptLanguage ?? null,
+    acceptLanguage: lang ?? null,
   };
 }
 
@@ -177,5 +191,6 @@ export async function emulateReset(tabId: number, cmd: CmdFn): Promise<any> {
   await cmd(tabId, "Network.setExtraHTTPHeaders", { headers: {} });
   await cmd(tabId, "Network.setUserAgentOverride", { userAgent: "" });
   applied.delete(tabId);
+  deviceUA.delete(tabId);
   return { tabId, reset: true, wasApplied };
 }

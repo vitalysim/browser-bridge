@@ -1,0 +1,19 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Core Hover</title>
+<style>
+  #menu { position: relative; display: inline-block; padding: 10px; background: #eee; margin: 40px; }
+  #menu .sub { display: none; position: absolute; top: 100%; left: 0; background: #ccd; padding: 8px; }
+  #menu:hover .sub { display: block; }
+</style></head>
+<body>
+<div id="menu" tabindex="0">Products menu
+  <div class="sub" id="sub"><a href="#" id="sub-item">Widgets</a></div>
+</div>
+<div id="js-hover" style="margin:40px;padding:10px;background:#efe;display:inline-block">JS hover target</div>
+<script>
+  window.__hover = { enter: 0, over: 0, move: 0, trusted: [] };
+  const t = document.getElementById("js-hover");
+  t.addEventListener("mouseenter", (e) => { window.__hover.enter++; window.__hover.trusted.push(e.isTrusted); });
+  t.addEventListener("mouseover", () => window.__hover.over++);
+  t.addEventListener("mousemove", () => window.__hover.move++);
+</script>
+</body></html>

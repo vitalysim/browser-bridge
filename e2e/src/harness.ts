@@ -55,10 +55,208 @@ async function freePort(): Promise<number> {
 
 const MIME: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css", ".png": "image/png" };
 
+// ---- devtools test routes ----
+// Dynamic routes for e2e/src/devtools.test.ts (network/identity/authz/intercept/fuzz/WS/JWT/analyze).
+// Deliberately vulnerable where a scenario needs it (BOLA, reflected XSS, weak headers). Loopback only.
+import { createHash as dtCreateHash, createHmac as dtCreateHmac } from "node:crypto";
+
+const DT_TOKENS: Record<string, string> = { "alice-token": "alice", "bob-token": "bob" };
+const DT_SESSIONS: Record<string, string> = { "sess-alice": "alice", "sess-bob": "bob" };
+const DT_ITEMS: Record<string, { id: number; owner: string; note: string }> = {
+  "1": { id: 1, owner: "alice", note: "alice-private-note" },
+  "2": { id: 2, owner: "bob", note: "bob-private-note" },
+  "3": { id: 3, owner: "alice", note: "alice-second-note" },
+};
+const DT_JWT_SECRET = "devtools-e2e-secret";
+
+function dtCookies(req: IncomingMessage): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const part of String(req.headers.cookie ?? "").split(";")) {
+    const i = part.indexOf("=");
+    if (i > 0) out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+  }
+  return out;
+}
+
+/** Bearer first, then the sid session cookie. Returns {user, via} or undefined. */
+function dtUser(req: IncomingMessage): { user: string; via: "bearer" | "cookie" } | undefined {
+  const m = /^Bearer\s+(.+)$/i.exec(String(req.headers.authorization ?? ""));
+  if (m && DT_TOKENS[m[1]]) return { user: DT_TOKENS[m[1]], via: "bearer" };
+  const sid = dtCookies(req).sid;
+  if (sid && DT_SESSIONS[sid]) return { user: DT_SESSIONS[sid], via: "cookie" };
+  return undefined;
+}
+
+const dtB64u = (b: Buffer | string) => Buffer.from(b).toString("base64url");
+function dtJwt(payload: object, alg: "HS256" | "none"): string {
+  const head = dtB64u(JSON.stringify({ alg, typ: "JWT" }));
+  const body = dtB64u(JSON.stringify(payload));
+  if (alg === "none") return `${head}.${body}.`;
+  return `${head}.${body}.${dtB64u(dtCreateHmac("sha256", DT_JWT_SECRET).update(`${head}.${body}`).digest())}`;
+}
+
+function dtJson(res: ServerResponse, status: number, obj: unknown, headers: Record<string, string | string[]> = {}) {
+  res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", ...headers });
+  res.end(JSON.stringify(obj));
+}
+
+function dtReadBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolveBody) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => resolveBody(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", () => resolveBody(""));
+  });
+}
+
+/** True when the path belongs to the devtools routes (handled asynchronously by devtoolsRoute). */
+function isDevtoolsRoute(pathname: string): boolean {
+  return pathname.startsWith("/api/") || pathname.startsWith("/devtools/");
+}
+
+async function devtoolsRoute(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  const p = url.pathname;
+  const body = await dtReadBody(req);
+  // Login: cookie session (sid HttpOnly) + a readable prefs cookie, and the user's bearer token.
+  if (p === "/api/login") {
+    const user = url.searchParams.get("user") ?? "";
+    if (user !== "alice" && user !== "bob") return dtJson(res, 400, { error: "unknown user" });
+    return dtJson(res, 200, { user, token: `${user}-token` }, {
+      "set-cookie": [`sid=sess-${user}; Path=/; HttpOnly; SameSite=Lax`, `prefs=theme-${user}; Path=/; SameSite=Lax`],
+    });
+  }
+  if (p === "/api/me") {
+    const u = dtUser(req);
+    return u ? dtJson(res, 200, { user: u.user, via: u.via }) : dtJson(res, 401, { error: "unauthorized" });
+  }
+  // BOLA: any authenticated user can read any item - no ownership check.
+  let m = /^\/api\/items\/(\d+)$/.exec(p);
+  if (m) {
+    if (!dtUser(req)) return dtJson(res, 401, { error: "unauthorized" });
+    const item = DT_ITEMS[m[1]];
+    return item ? dtJson(res, 200, item) : dtJson(res, 404, { error: "no such item" });
+  }
+  // Correctly protected twin (negative control for authz_matrix).
+  m = /^\/api\/secure-items\/(\d+)$/.exec(p);
+  if (m) {
+    const u = dtUser(req);
+    if (!u) return dtJson(res, 401, { error: "unauthorized" });
+    const item = DT_ITEMS[m[1]];
+    if (!item) return dtJson(res, 404, { error: "no such item" });
+    return item.owner === u.user ? dtJson(res, 200, item) : dtJson(res, 403, { error: "forbidden" });
+  }
+  // Echo: what the server actually received.
+  if (p === "/api/echo") {
+    return dtJson(res, 200, { method: req.method, url: req.url, headers: req.headers, cookies: dtCookies(req), body });
+  }
+  // Reflected parameter (unescaped). A quote breaks the "query" with a 500 + long SQL error.
+  if (p === "/api/search") {
+    const q = url.searchParams.get("q") ?? "";
+    if (q.includes("'")) {
+      res.writeHead(500, { "content-type": "text/plain" });
+      res.end(`SQL syntax error near '${q}': ` + "You have an error in your SQL syntax; check the manual. ".repeat(12));
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+    res.end(`<p>Results for: ${q}</p>` + `<ul>${"<li>static result row</li>".repeat(10)}</ul>`);
+    return;
+  }
+  // JWT issuer: HS256 by default; alg=none and exp=past for the risky variants.
+  if (p === "/api/jwt") {
+    const now = Math.floor(Date.now() / 1000);
+    const sub = url.searchParams.get("sub") ?? "alice";
+    const exp = url.searchParams.get("exp") === "past" ? now - 3600 : now + 3600;
+    const alg = url.searchParams.get("alg") === "none" ? "none" : "HS256";
+    return dtJson(res, 200, { token: dtJwt({ sub, role: sub === "alice" ? "admin" : "user", iat: now, exp }, alg) });
+  }
+  // A page with weak security headers, a non-HttpOnly session cookie, and leaked secrets in the body.
+  if (p === "/devtools/analyze") {
+    const jwt = dtJwt({ sub: "leak", iat: 1700000000 }, "HS256");
+    res.writeHead(200, {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "content-security-policy": "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+      "access-control-allow-origin": "*",
+      "access-control-allow-credentials": "true",
+      "x-powered-by": "Express 4.18.2",
+      server: "nginx/1.18.0",
+      "set-cookie": ["session_token=abc123; Path=/"],
+    });
+    res.end(
+      `<!doctype html><html><head><title>analyze target</title><script src="/devtools/analyze-bundle.js"></script></head>` +
+        `<body><h1>Analyze me</h1><script>window.cfg = {awsKey: "AKIAIOSFODNN7EXAMPLE", session: "${jwt}"};</script></body></html>`
+    );
+    return;
+  }
+  if (p === "/devtools/analyze-bundle.js") {
+    res.writeHead(200, { "content-type": "text/javascript", "cache-control": "no-store" });
+    res.end(`window.bundleToken = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab";`);
+    return;
+  }
+  dtJson(res, 404, { error: "no such devtools route" });
+}
+
+/** Minimal RFC 6455 echo server on /ws/echo: text frames come back as "echo:<payload>". */
+function devtoolsUpgrade(req: IncomingMessage, socket: Socket): void {
+  const url = new URL(req.url ?? "/", "http://x");
+  const key = req.headers["sec-websocket-key"];
+  if (url.pathname !== "/ws/echo" || typeof key !== "string") {
+    socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+    return;
+  }
+  const accept = dtCreateHash("sha1").update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
+  socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+  const send = (opcode: number, payload: Buffer) => {
+    const len = payload.length;
+    const head = len < 126 ? Buffer.from([0x80 | opcode, len]) : Buffer.from([0x80 | opcode, 126, len >> 8, len & 0xff]);
+    socket.write(Buffer.concat([head, payload]));
+  };
+  let buf = Buffer.alloc(0);
+  socket.on("error", () => undefined);
+  socket.on("data", (chunk: Buffer) => {
+    buf = Buffer.concat([buf, chunk]);
+    for (;;) {
+      if (buf.length < 2) return;
+      const opcode = buf[0] & 0x0f;
+      const masked = (buf[1] & 0x80) !== 0;
+      let len = buf[1] & 0x7f;
+      let off = 2;
+      if (len === 126) {
+        if (buf.length < 4) return;
+        len = buf.readUInt16BE(2);
+        off = 4;
+      } else if (len === 127) {
+        socket.destroy(); // 64-bit lengths are not needed by the scenarios
+        return;
+      }
+      const maskOff = off;
+      if (masked) off += 4;
+      if (buf.length < off + len) return;
+      const payload = Buffer.from(buf.subarray(off, off + len));
+      if (masked) for (let i = 0; i < len; i++) payload[i] ^= buf[maskOff + (i % 4)];
+      buf = buf.subarray(off + len);
+      if (opcode === 0x1) send(0x1, Buffer.from("echo:" + payload.toString("utf8")));
+      else if (opcode === 0x9) send(0xa, payload);
+      else if (opcode === 0x8) {
+        send(0x8, payload.subarray(0, 2));
+        socket.end();
+        return;
+      }
+    }
+  });
+}
+// ---- end devtools test routes ----
+
 function startFixtureServer(): Promise<{ server: Server; sockets: Set<Socket>; port: number }> {
   const sockets = new Set<Socket>();
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? "/", "http://x");
+    // ---- devtools test routes ----
+    if (isDevtoolsRoute(url.pathname)) {
+      void devtoolsRoute(req, res, url).catch(() => res.destroy());
+      return;
+    }
+    // ---- end devtools test routes ----
     if (url.pathname === "/hang") {
       // Send headers + part of a document, then never finish. The socket is destroyed at teardown.
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
@@ -75,6 +273,9 @@ function startFixtureServer(): Promise<{ server: Server; sockets: Set<Socket>; p
     res.writeHead(200, { "content-type": MIME[extname(file)] ?? "application/octet-stream", "cache-control": "no-store" });
     res.end(readFileSync(file));
   });
+  // ---- devtools test routes ----
+  server.on("upgrade", (req, socket) => devtoolsUpgrade(req, socket as Socket));
+  // ---- end devtools test routes ----
   server.on("connection", (s) => {
     sockets.add(s);
     s.on("close", () => sockets.delete(s));
@@ -335,12 +536,16 @@ export class Harness {
     try {
       // Belt and braces: the SDK's own request timeout (which also sends notifications/cancelled), and
       // a race in case the transport itself wedges.
+      // The race timer is cleared once the call settles (and unref'd), so a long per-call timeout can't
+      // keep the test process alive for minutes after teardown.
+      let wedge: ReturnType<typeof setTimeout> | undefined;
       const res: any = await Promise.race([
         this.client.callTool({ name, arguments: args }, undefined, { timeout: timeoutMs }),
-        sleep(timeoutMs + 2_000).then(() => {
-          throw Object.assign(new Error("transport wedged"), { code: -32001 });
+        new Promise((_, reject) => {
+          wedge = setTimeout(() => reject(Object.assign(new Error("transport wedged"), { code: -32001 })), timeoutMs + 2_000);
+          wedge.unref?.();
         }),
-      ]);
+      ]).finally(() => clearTimeout(wedge));
       const text = (res.content ?? []).find((c: any) => c.type === "text")?.text ?? "";
       let json: any;
       try {

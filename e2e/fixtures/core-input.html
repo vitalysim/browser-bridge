@@ -1,0 +1,20 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Core Input</title>
+<style>body{margin:0} #pad{position:absolute;left:50px;top:50px;width:400px;height:300px;background:#def} #txt{position:absolute;left:50px;top:400px;width:200px}</style></head>
+<body>
+<div id="pad"></div>
+<input id="txt">
+<script>
+  window.__ev = [];
+  const pad = document.getElementById("pad");
+  for (const t of ["mousedown", "mouseup", "click", "dblclick", "contextmenu", "auxclick", "wheel", "mousemove"]) {
+    pad.addEventListener(t, (e) => {
+      // collapse runs of mousemove so the log stays small
+      if (t === "mousemove" && window.__ev.length && window.__ev[window.__ev.length - 1].t === "mousemove") window.__ev.pop();
+      window.__ev.push({ t, x: e.clientX, y: e.clientY, b: e.button, trusted: e.isTrusted, dy: e.deltaY || 0, detail: e.detail });
+      if (t === "contextmenu") e.preventDefault();
+    }, { passive: false });
+  }
+  window.__keys = [];
+  document.getElementById("txt").addEventListener("keydown", (e) => window.__keys.push({ key: e.key, trusted: e.isTrusted }));
+</script>
+</body></html>
