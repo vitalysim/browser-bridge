@@ -15,6 +15,7 @@ export const TOOL_GROUPS: Readonly<Record<string, Toolset>> = {
   tab_activate: "core",
   tab_close: "core",
   navigate: "core",
+  handle_dialog: "core",
   go_back: "core",
   go_forward: "core",
   get_page_text: "core",

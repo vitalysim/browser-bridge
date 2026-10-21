@@ -14,7 +14,14 @@ declare const __BB_BUILD__: string;
 const VERSION = __BB_VERSION__;
 const BUILD_AT = __BB_BUILD__;
 const PING_INTERVAL_MS = 20_000; // WS traffic resets the MV3 service-worker idle timer (Chrome 116+)
-const RECONNECT_MAX_MS = 30_000;
+// Capped low: the server waits only ~3s for a reconnect before failing a call, and most SW restarts
+// reconnect within ~1s, so a long backoff just turned a server blip into minutes of NO_EXTENSION.
+const RECONNECT_MAX_MS = 5_000;
+// The server closes the OLDER socket with 4000 when another connection with the same token arrives
+// (e.g. two Chrome profiles both configured). Reconnecting immediately would just evict the other one
+// again, forever - so back off for a long while instead.
+const REPLACED_CLOSE_CODE = 4000;
+const RECONNECT_REPLACED_MS = 60_000;
 
 let ws: WebSocket | null = null;
 let pingTimer: ReturnType<typeof setInterval> | null = null;
@@ -35,8 +42,102 @@ function setStatus(status: string, detail = "") {
   chrome.storage.local.set({ bbStatus: status, bbDetail: detail, bbUpdated: Date.now() });
 }
 
+// ---- timeouts ----
+// No chrome.* call is guaranteed to settle: executeScript blocks while the page shows a JS dialog
+// (alert/confirm/prompt/beforeunload) or its renderer is hung, and debugger commands can wedge the same
+// way. Every such call goes through withTimeout so the agent gets an actionable error instead of a hang.
+
+class TimeoutError extends Error {
+  code = "TIMEOUT";
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string | (() => string)): Promise<T> {
+  if (!(ms > 0) || !Number.isFinite(ms)) return p;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const t = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new TimeoutError(typeof label === "function" ? label() : label)), ms);
+  });
+  p.catch(() => undefined); // the loser of the race must not surface as an unhandled rejection
+  return Promise.race([p, t]).finally(() => clearTimeout(timer));
+}
+
+const isTimeout = (e: unknown): boolean => e instanceof TimeoutError;
+
+const INJECT_TOP_MS = 10_000; // top frame of a tab
+const INJECT_CHILD_MS = 3_000; // child frames: best-effort, a wedged ad/embed is skipped and reported
+const CDP_CMD_MS = 15_000; // default per debugger command
+const ATTACH_MS = 10_000; // debugger attach + DOM/Page enable
+const CAPTURE_STEP_MS = 10_000; // one captureVisibleTab grab inside the per-window queue
+
+// JavaScript dialogs currently open, per tab. Only observable while the debugger is attached with
+// Page.enable (ensureAttached does that); recorded from Page.javaScriptDialogOpening/Closed.
+interface PendingDialog {
+  type: string;
+  message: string;
+  url?: string;
+  defaultPrompt?: string;
+  at: number;
+}
+const pendingDialogs = new Map<number, PendingDialog>();
+
+function onDialogEvent(tabId: number, method: string, params: any): void {
+  if (method === "Page.javaScriptDialogOpening") {
+    pendingDialogs.set(tabId, {
+      type: String(params?.type ?? "alert"),
+      message: String(params?.message ?? ""),
+      url: params?.url,
+      defaultPrompt: params?.defaultPrompt,
+      at: Date.now(),
+    });
+  } else if (method === "Page.javaScriptDialogClosed") {
+    pendingDialogs.delete(tabId);
+  }
+}
+
+function dialogHint(tabId: number | undefined): string {
+  const d = tabId != null ? pendingDialogs.get(tabId) : undefined;
+  if (d) {
+    const msg = d.message.length > 120 ? d.message.slice(0, 120) + "…" : d.message;
+    return `the page is showing a JavaScript ${d.type} dialog ("${msg}") - call handle_dialog (accept:true/false) to close it`;
+  }
+  return "the page may be showing a JavaScript dialog (alert/confirm/prompt/beforeunload) - call handle_dialog - or the tab may be hung or still loading";
+}
+
+/** The actionable message every bounded tab operation throws on timeout. */
+function tabTimeoutMsg(tabId: number | undefined, ms: number, what = ""): string {
+  const who = tabId != null ? `tab ${tabId}` : "the tab";
+  return `${who} did not respond${what ? ` to ${what}` : ""} within ${Math.round(ms / 100) / 10}s - ${dialogHint(tabId)}`;
+}
+
+// Server-side timeouts send {type:"cancel", id}. Long-running loops check isCancelled(params) and stop;
+// the eventual reply for a cancelled id is dropped rather than sent or queued.
+const cancelledCalls = new Map<string, number>(); // id -> cancelledAt
+const callIds = new WeakMap<object, string>(); // dispatch params object -> call id
+
+function markCancelled(id: string): void {
+  cancelledCalls.set(id, Date.now());
+  // Bounded: an id whose reply never comes (dispatch still wedged) must not leak forever.
+  while (cancelledCalls.size > 500) {
+    const oldest = cancelledCalls.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    cancelledCalls.delete(oldest);
+  }
+}
+
+/** True once the server gave up on the call these params belong to (pass dispatch's `params`). */
+function isCancelled(paramsOrId: object | string | null | undefined): boolean {
+  if (!paramsOrId) return false;
+  const id = typeof paramsOrId === "string" ? paramsOrId : callIds.get(paramsOrId);
+  return !!id && cancelledCalls.has(id);
+}
+
+// While > now, keepalive/alarm-driven connect() calls stand down (we were replaced - see onclose).
+// A token/port change or an explicit reconnect request clears it.
+let replacedUntil = 0;
+
 async function connect() {
   if (connecting) return;
+  if (Date.now() < replacedUntil) return;
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   connecting = true;
   try {
@@ -96,10 +197,16 @@ async function connectNow() {
       return;
     }
     if (msg.type === "pong") return;
+    if (msg.type === "cancel") {
+      if (typeof msg.id === "string") markCancelled(msg.id);
+      return;
+    }
     if (!msg.id || !msg.method) return;
     let reply: any;
+    const params = msg.params ?? {};
+    if (params && typeof params === "object") callIds.set(params, msg.id);
     try {
-      const result = await dispatch(msg.method, msg.params ?? {});
+      const result = await dispatch(msg.method, params);
       reply = { id: msg.id, ok: true, result };
     } catch (err) {
       reply = { id: msg.id, ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -117,16 +224,30 @@ async function connectNow() {
       };
       json = JSON.stringify(reply);
     }
-    replyOrQueue(socket, json, reply);
+    // The server already gave up on this call (and failed it to the agent) - don't ship a late reply.
+    if (cancelledCalls.delete(msg.id)) return;
+    replyOrQueue(socket, json);
   };
 
-  socket.onclose = () => {
+  socket.onclose = (ev) => {
     if (ws !== socket) return; // a superseded/replaced socket closing must not disturb the live one
     if (pingTimer) {
       clearInterval(pingTimer);
       pingTimer = null;
     }
     ws = null;
+    if (ev?.code === REPLACED_CLOSE_CODE) {
+      // Another connection with this token took over (a second browser/profile). Don't fight it.
+      console.warn(
+        `[bb] server replaced this connection with another one (close ${ev.code}). Is the token configured in ` +
+          `two browsers/profiles? Backing off ${RECONNECT_REPLACED_MS / 1000}s instead of reconnecting immediately.`
+      );
+      setStatus("replaced", "Another browser/profile with the same token took over the connection. Retrying in 60s.");
+      replacedUntil = Date.now() + RECONNECT_REPLACED_MS - 1_000; // the keepalive alarm must not undercut it
+      reconnectDelay = RECONNECT_REPLACED_MS;
+      scheduleReconnect();
+      return;
+    }
     setStatus("disconnected", "Will retry automatically.");
     scheduleReconnect();
   };
@@ -209,20 +330,17 @@ function pumpOutbox(): void {
   }
 }
 
-// Send a dispatch reply on the socket it arrived on, or - when that socket is no longer OPEN
-// (superseded by a reconnect, or closing) - hand it to the outbox instead of calling send() on a dead
-// socket. A reply the server no longer awaits is ignored by id, so routing a late one is harmless.
-// `json` is the already-serialized reply (sent as-is); `obj` is the same value for the outbox path.
-function replyOrQueue(socket: WebSocket, json: string, obj: any): void {
-  if (socket.readyState === WebSocket.OPEN) {
-    try {
-      socket.send(json);
-      return;
-    } catch {
-      /* fall through to the outbox */
-    }
+// Send a dispatch reply on the socket it arrived on. When that socket is no longer OPEN the reply is
+// DROPPED, not queued: the server rejects every call pending on a socket the moment it closes, so
+// nobody awaits it - and one huge late reply (screenshot, MHTML) in the outbox would evict every
+// queued capture/watch event to fit under the outbox byte cap.
+function replyOrQueue(socket: WebSocket, json: string): void {
+  if (socket.readyState !== WebSocket.OPEN) return;
+  try {
+    socket.send(json);
+  } catch {
+    /* socket going away - the server already failed this call */
   }
-  shipOrQueue(obj);
 }
 
 // ---------- watch mode ----------
@@ -572,14 +690,33 @@ function assertScriptable(tab: chrome.tabs.Tab) {
 // coalesce to null (which the injected funcs treat the same via `!= null` / falsy checks).
 const clean = (args: any[]) => args.map((a) => (a === undefined ? null : a));
 
-async function inject<T>(tab: chrome.tabs.Tab, func: (...args: any[]) => T, args: any[] = [], world: "ISOLATED" | "MAIN" = "ISOLATED"): Promise<T> {
+// opts.timeoutMs bounds the call (default INJECT_TOP_MS); opts.immediate sets injectImmediately for
+// read-only funcs that need not wait for document_idle (the tab may be stuck loading).
+interface InjectOpts {
+  timeoutMs?: number;
+  immediate?: boolean;
+}
+
+async function inject<T>(
+  tab: chrome.tabs.Tab,
+  func: (...args: any[]) => T,
+  args: any[] = [],
+  world: "ISOLATED" | "MAIN" = "ISOLATED",
+  opts: InjectOpts = {}
+): Promise<T> {
   assertScriptable(tab);
-  const [result] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id! },
-    world,
-    func: func as any,
-    args: clean(args),
-  });
+  const ms = opts.timeoutMs ?? INJECT_TOP_MS;
+  const [result] = await withTimeout(
+    chrome.scripting.executeScript({
+      target: { tabId: tab.id! },
+      world,
+      func: func as any,
+      args: clean(args),
+      injectImmediately: !!opts.immediate,
+    }),
+    ms,
+    () => tabTimeoutMsg(tab.id, ms)
+  );
   const value = result?.result as any;
   // Injected functions signal failure by RETURNING { error } - never by throwing, because
   // Chrome swallows exceptions thrown inside executeScript and resolves with null instead.
@@ -591,19 +728,75 @@ async function inject<T>(tab: chrome.tabs.Tab, func: (...args: any[]) => T, args
 
 // Inject into every frame of the tab; returns the raw per-frame InjectionResults ({ frameId, result }).
 // <all_urls> host permission lets executeScript reach cross-origin iframes that page JS can't.
+//
+// Injected PER FRAME, each raced against its own timeout (the scheme injectFrame uses for the session
+// recorder): a single allFrames:true executeScript waits on the slowest frame, so one wedged
+// cross-origin ad/embed - or a page showing a JS dialog - hung the whole call. The top frame gets
+// INJECT_TOP_MS and its timeout fails the call with an actionable error; a child frame that times out
+// is SKIPPED and listed on the returned array's `skippedFrames` property instead.
+type FrameResults = chrome.scripting.InjectionResult[] & { skippedFrames?: { frameId: number; url?: string; reason: string }[] };
+
 async function injectAllFrames(
   tab: chrome.tabs.Tab,
   func: (...args: any[]) => any,
   args: any[] = [],
-  world: "ISOLATED" | "MAIN" = "ISOLATED"
-): Promise<chrome.scripting.InjectionResult[]> {
+  world: "ISOLATED" | "MAIN" = "ISOLATED",
+  opts: InjectOpts = {}
+): Promise<FrameResults> {
   assertScriptable(tab);
-  return chrome.scripting.executeScript({
-    target: { tabId: tab.id!, allFrames: true },
-    world,
-    func: func as any,
-    args: clean(args),
-  });
+  const tabId = tab.id!;
+  let frames: { frameId: number; url?: string }[] | null = null;
+  try {
+    frames = (await withTimeout(chrome.webNavigation.getAllFrames({ tabId }), 3_000, "getAllFrames")) ?? null;
+  } catch {
+    frames = null;
+  }
+  if (!frames || !frames.length) {
+    // No frame list - fall back to one allFrames call, still bounded.
+    const ms = opts.timeoutMs ?? INJECT_TOP_MS;
+    return withTimeout(
+      chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        world,
+        func: func as any,
+        args: clean(args),
+        injectImmediately: !!opts.immediate,
+      }),
+      ms,
+      () => tabTimeoutMsg(tabId, ms)
+    );
+  }
+  const cleaned = clean(args);
+  const skipped: { frameId: number; url?: string; reason: string }[] = [];
+  const settled = await Promise.all(
+    frames.map(async (f) => {
+      const top = f.frameId === 0;
+      const ms = top ? opts.timeoutMs ?? INJECT_TOP_MS : INJECT_CHILD_MS;
+      try {
+        const res = await withTimeout(
+          chrome.scripting.executeScript({
+            target: { tabId, frameIds: [f.frameId] },
+            world,
+            func: func as any,
+            args: cleaned,
+            injectImmediately: !!opts.immediate,
+          }),
+          ms,
+          () => tabTimeoutMsg(tabId, ms, top ? "" : `frame ${f.frameId}`)
+        );
+        return res?.[0] ?? null;
+      } catch (e) {
+        if (top) throw e; // the top frame is the page - its failure is the call's failure
+        // Not injectable (about:blank, sandboxed, gone mid-call) is silently omitted, as allFrames did;
+        // only a frame that HUNG is worth telling the agent about.
+        if (isTimeout(e)) skipped.push({ frameId: f.frameId, url: f.url, reason: "timeout" });
+        return null;
+      }
+    })
+  );
+  const out = settled.filter((r): r is chrome.scripting.InjectionResult => r != null) as FrameResults;
+  if (skipped.length) out.skippedFrames = skipped;
+  return out;
 }
 
 // Run an element-interaction func in every frame; exactly the frame that owns the element acts.
@@ -648,12 +841,17 @@ async function actAllFrames(tab: chrome.tabs.Tab, args: any[]): Promise<{ result
 
 // A retry once the owning frame is known: run bbAct in just that one frame.
 async function actInFrame(tab: chrome.tabs.Tab, frameId: number, args: any[]): Promise<any> {
-  const res = await chrome.scripting.executeScript({
-    target: { tabId: tab.id!, frameIds: [frameId] },
-    world: "ISOLATED",
-    func: bbAct as any,
-    args: clean(args),
-  });
+  const ms = INJECT_TOP_MS;
+  const res = await withTimeout(
+    chrome.scripting.executeScript({
+      target: { tabId: tab.id!, frameIds: [frameId] },
+      world: "ISOLATED",
+      func: bbAct as any,
+      args: clean(args),
+    }),
+    ms,
+    () => tabTimeoutMsg(tab.id, ms, frameId ? `frame ${frameId}` : "")
+  );
   const v: any = res?.[0]?.result;
   if (v && typeof v === "object" && typeof v.error === "string") throw new Error(v.error);
   return v ?? { notFound: true };
@@ -818,35 +1016,142 @@ async function bbClipboardWriteImage(b64: string, mimeType: string) {
 // whose event fired before we attached. A 250ms grace lets a real cross-document nav flip to 'loading'
 // first, so we don't resolve on the previous page's lingering 'complete'. The listener still wins for
 // normal loads (no added latency); the poll only becomes the resolver in the fast/no-op cases.
-function waitForComplete(tabId: number, timeoutMs = 20_000): Promise<void> {
-  return new Promise((resolve) => {
-    const deadline = Date.now() + timeoutMs;
-    let done = false;
-    const finish = () => {
-      if (done) return;
-      done = true;
-      chrome.tabs.onUpdated.removeListener(listener);
-      resolve();
-    };
-    const listener = (id: number, info: chrome.tabs.TabChangeInfo) => {
-      if (id === tabId && info.status === "complete") finish();
-    };
-    chrome.tabs.onUpdated.addListener(listener);
-    void (async () => {
-      await sleep(250); // grace: let a real cross-document nav flip to 'loading' before we poll
-      while (!done && Date.now() < deadline) {
-        let status: string | undefined;
-        try {
-          status = (await chrome.tabs.get(tabId)).status;
-        } catch {
-          return finish(); // tab closed/gone
-        }
-        if (status === "complete") return finish();
-        await sleep(150);
+//
+// Event-driven: listeners are registered BEFORE the navigation is issued (startLoadWait returns a
+// handle; call .wait() after triggering the nav) so a fast load can't slip past. webNavigation tells us
+// when a top-frame navigation actually started, so the no-op case (hash/same URL/bfcache) resolves on
+// the first status check instead of a fixed sleep, and 'domcontentloaded' resolves on the real event.
+// A slow status poll stays as a backstop for events that fired before we were listening.
+type WaitUntil = "load" | "domcontentloaded" | "none";
+interface LoadWaitResult {
+  loadTimedOut?: boolean;
+  dialog?: PendingDialog; // a JS dialog (e.g. beforeunload) opened while we waited
+}
+
+function startLoadWait(
+  tabId: number,
+  opts: { waitUntil?: WaitUntil; timeoutMs?: number; cancelKey?: object } = {}
+): { wait(): Promise<LoadWaitResult>; dispose(): void } {
+  const waitUntil: WaitUntil = opts.waitUntil ?? "load";
+  const timeoutMs = opts.timeoutMs ?? 20_000;
+  let started = false; // a top-frame navigation (or 'loading' status) was observed
+  let reached = false; // the waitUntil milestone was observed
+  let wake: (() => void) | null = null;
+  const poke = () => wake?.();
+  const mine = (id: number) => id === tabId;
+
+  const onUpdated = (id: number, info: chrome.tabs.TabChangeInfo) => {
+    if (!mine(id)) return;
+    if (info.status === "loading") started = true;
+    if (info.status === "complete" && started) reached = true;
+    poke();
+  };
+  const onBefore = (d: { tabId: number; frameId: number }) => {
+    if (mine(d.tabId) && d.frameId === 0) {
+      started = true;
+      poke();
+    }
+  };
+  const onDcl = (d: { tabId: number; frameId: number }) => {
+    if (mine(d.tabId) && d.frameId === 0 && started && waitUntil === "domcontentloaded") {
+      reached = true;
+      poke();
+    }
+  };
+  // Only a load that belongs to a navigation we saw START counts, so a lingering event from the
+  // previous document can't resolve the wait early.
+  const onDone = (d: { tabId: number; frameId: number }) => {
+    if (mine(d.tabId) && d.frameId === 0 && started) {
+      reached = true;
+      poke();
+    }
+  };
+  // Same-document navigations never fire 'complete' - they are done the moment they happen.
+  const onSameDoc = (d: { tabId: number; frameId: number }) => {
+    if (mine(d.tabId) && d.frameId === 0) {
+      reached = true;
+      poke();
+    }
+  };
+  const listen = waitUntil !== "none";
+  if (listen) {
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.webNavigation.onBeforeNavigate.addListener(onBefore);
+    chrome.webNavigation.onDOMContentLoaded.addListener(onDcl);
+    chrome.webNavigation.onCompleted.addListener(onDone);
+    chrome.webNavigation.onErrorOccurred.addListener(onDone);
+    chrome.webNavigation.onReferenceFragmentUpdated.addListener(onSameDoc);
+    chrome.webNavigation.onHistoryStateUpdated.addListener(onSameDoc);
+  }
+  const cleanup = () => {
+    if (!listen) return;
+    chrome.tabs.onUpdated.removeListener(onUpdated);
+    chrome.webNavigation.onBeforeNavigate.removeListener(onBefore);
+    chrome.webNavigation.onDOMContentLoaded.removeListener(onDcl);
+    chrome.webNavigation.onCompleted.removeListener(onDone);
+    chrome.webNavigation.onErrorOccurred.removeListener(onDone);
+    chrome.webNavigation.onReferenceFragmentUpdated.removeListener(onSameDoc);
+    chrome.webNavigation.onHistoryStateUpdated.removeListener(onSameDoc);
+  };
+
+  return {
+    dispose: cleanup,
+    async wait(): Promise<LoadWaitResult> {
+      if (!listen) {
+        cleanup();
+        return {};
       }
-      finish(); // timeout ceiling - resolve anyway; caller can read a partial page
-    })();
-  });
+      const t0 = Date.now();
+      const deadline = t0 + timeoutMs;
+      try {
+        for (;;) {
+          if (reached) return {};
+          const dialog = pendingDialogs.get(tabId);
+          if (dialog) return { dialog }; // nothing will load while a dialog holds the page
+          if (isCancelled(opts.cancelKey)) return {};
+          let status: string | undefined;
+          try {
+            status = (await chrome.tabs.get(tabId)).status;
+          } catch {
+            return {}; // tab closed/gone
+          }
+          if (status === "loading") started = true;
+          // 'complete' only counts once a navigation started - or, if none starts within a short
+          // grace, the nav was a no-op (same URL / hash / bfcache) and the page is already there.
+          if (status === "complete" && (started || Date.now() - t0 > 250)) return {};
+          if (Date.now() >= deadline) return { loadTimedOut: true };
+          // Sleep until an event pokes us, with a backstop poll for events we missed.
+          await new Promise<void>((r) => {
+            const timer = setTimeout(done, started ? 500 : 100);
+            function done() {
+              clearTimeout(timer);
+              wake = null;
+              r();
+            }
+            wake = done;
+          });
+        }
+      } finally {
+        cleanup();
+      }
+    },
+  };
+}
+
+const parseWaitUntil = (v: any): WaitUntil => (v === "none" || v === "domcontentloaded" ? v : "load");
+
+// Same page for navigate's "did the URL change?" check (a reload of the current URL is not a failure).
+function sameUrl(a: string | undefined, b: string | undefined): boolean {
+  if (!a || !b) return false;
+  try {
+    const x = new URL(a);
+    const y = new URL(b);
+    x.hash = "";
+    y.hash = "";
+    return x.href.replace(/\/$/, "") === y.href.replace(/\/$/, "");
+  } catch {
+    return a === b;
+  }
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -883,18 +1188,27 @@ const captureInFlight = new Map<string, Promise<{ dataUrl: string; meta: any }>>
  */
 async function awaitPaint(tab: chrome.tabs.Tab, budgetMs: number): Promise<void> {
   const deadline = Date.now() + budgetMs;
+  // Each inject is bounded by what is left of the budget: a page frozen by a JS dialog would otherwise
+  // hold executeScript - and with it the whole per-window capture queue - forever.
+  const left = () => Math.max(50, deadline - Date.now());
   try {
-    await inject(tab, () => {
-      const w = window as any;
-      w.__bbPaint = 0;
-      requestAnimationFrame(() =>
-        requestAnimationFrame(() => {
-          w.__bbPaint = 1;
-        })
-      );
-    });
+    await inject(
+      tab,
+      () => {
+        const w = window as any;
+        w.__bbPaint = 0;
+        requestAnimationFrame(() =>
+          requestAnimationFrame(() => {
+            w.__bbPaint = 1;
+          })
+        );
+      },
+      [],
+      "ISOLATED",
+      { timeoutMs: left(), immediate: true }
+    );
     while (Date.now() < deadline) {
-      if (await inject(tab, () => !!(window as any).__bbPaint)) return;
+      if (await inject(tab, () => !!(window as any).__bbPaint, [], "ISOLATED", { timeoutMs: left(), immediate: true })) return;
       await sleep(8);
     }
   } catch {
@@ -917,7 +1231,10 @@ function serializeCapture<T>(windowId: number, fn: () => Promise<T>): Promise<T>
     const wait = MIN_CAPTURE_INTERVAL_MS - (Date.now() - (lastCaptureAt.get(windowId) ?? 0));
     if (wait > 0) await sleep(wait);
     try {
-      return await fn();
+      // Hard cap so the chain ALWAYS advances: one wedged grab (dialog-frozen page, hung compositor)
+      // used to block every later screenshot in this window - and captureInFlight handed that stuck
+      // promise to every repeat caller. The caller falls back to CDP on this timeout.
+      return await withTimeout(fn(), CAPTURE_STEP_MS, `screenshot capture in window ${windowId} did not complete within ${CAPTURE_STEP_MS / 1000}s`);
     } finally {
       lastCaptureAt.set(windowId, Date.now()); // space the NEXT capture from when this one finished
     }
@@ -933,8 +1250,10 @@ function serializeCapture<T>(windowId: number, fn: () => Promise<T>): Promise<T>
 // Back/forward via the page's own history - chrome.tabs.goBack/goForward fail spuriously
 // ("Cannot find a next page in history") even when history exists. Polls for the URL change
 // so bfcache (instant) restores don't wait on a load-complete event that never fires.
-async function navByHistory(tab: chrome.tabs.Tab, direction: "back" | "forward"): Promise<any> {
+async function navByHistory(tab: chrome.tabs.Tab, direction: "back" | "forward", params: any = {}): Promise<any> {
   const before = (await chrome.tabs.get(tab.id!)).url;
+  // Listen before triggering, so a bfcache restore's events can't be missed.
+  const load = startLoadWait(tab.id!, { waitUntil: parseWaitUntil(params.waitUntil), timeoutMs: 10_000, cancelKey: params });
   await inject(tab, (dir: string) => {
     if (dir === "back") history.back();
     else history.forward();
@@ -943,17 +1262,29 @@ async function navByHistory(tab: chrome.tabs.Tab, direction: "back" | "forward")
   let navigated = false;
   // Check BEFORE sleeping: a bfcache restore is effectively instant, and sleeping first charged it a
   // flat 150ms it never needed.
-  while (Date.now() < deadline) {
+  while (Date.now() < deadline && !isCancelled(params)) {
     const t = await chrome.tabs.get(tab.id!);
     if (t.url && t.url !== before) {
       navigated = true;
-      await sleep(300); // brief settle
       break;
     }
-    await sleep(150);
+    if (pendingDialogs.has(tab.id!)) break; // a beforeunload dialog is holding the navigation
+    await sleep(100);
   }
+  // Settle on the real load signal (instant for bfcache) instead of a fixed 300ms sleep.
+  let waited: LoadWaitResult = {};
+  if (navigated) waited = await load.wait();
+  else load.dispose();
   const fresh = await chrome.tabs.get(tab.id!);
-  return { tabId: fresh.id, title: fresh.title, url: fresh.url, navigated };
+  const dialog = waited.dialog ?? pendingDialogs.get(tab.id!);
+  return {
+    tabId: fresh.id,
+    title: fresh.title,
+    url: fresh.url,
+    navigated,
+    ...(waited.loadTimedOut ? { loadTimedOut: true } : {}),
+    ...(dialog ? { dialog, hint: "a JavaScript dialog is open on this tab - call handle_dialog" } : {}),
+  };
 }
 
 // ---------- chrome.debugger (CDP) session layer ----------
@@ -1077,14 +1408,26 @@ async function restoreIdentities(): Promise<void> {
   }
 }
 
-function cmd(tabId: number, method: string, params?: any): Promise<any> {
-  return new Promise((resolve, reject) => {
+// Default timeout per CDP method. A command that legitimately runs long gets more; one whose duration
+// the CALLER controls (Runtime.evaluate awaiting a user promise, bounded by the tool's own timeoutMs on
+// the server) gets none - the server-side timeout + cancel governs it.
+function cdpTimeoutFor(method: string, params?: any): number {
+  if (method === "Runtime.evaluate" || (method === "Runtime.callFunctionOn" && params?.awaitPromise)) return 0; // user code: the tool's own timeoutMs governs
+  if (method === "Page.captureScreenshot") return 25_000; // inside the server's 30s screenshot budget
+  if (method === "Page.captureSnapshot" || method === "Page.printToPDF") return 60_000;
+  if (method === "Network.getResponseBody" || method === "Fetch.getResponseBody") return 30_000;
+  return CDP_CMD_MS;
+}
+
+function cmd(tabId: number, method: string, params?: any, timeoutMs = cdpTimeoutFor(method, params)): Promise<any> {
+  const p = new Promise<any>((resolve, reject) => {
     chrome.debugger.sendCommand({ tabId }, method, params ?? {}, (result) => {
       const err = chrome.runtime.lastError;
       if (err) reject(new Error(err.message));
       else resolve(result);
     });
   });
+  return withTimeout(p, timeoutMs, () => tabTimeoutMsg(tabId, timeoutMs, `debugger command ${method}`));
 }
 
 function attach(tabId: number): Promise<void> {
@@ -1119,12 +1462,21 @@ async function ensureAttached(tabId: number): Promise<Session> {
   }
   let p = attaching.get(tabId);
   if (!p) {
-    p = (async () => {
+    // Bounded: attach or an enable that never answers used to leave this shared entry pending forever,
+    // wedging EVERY later debugger-backed call on the tab. On timeout the entry is cleared (below), the
+    // half-made attach is detached, and a late success is torn down instead of resurrecting a session.
+    let abandoned = false;
+    const run = (async () => {
       await attach(tabId);
+      if (abandoned) {
+        await detachSession(tabId).catch(() => {});
+        throw new Error("attach abandoned after timeout");
+      }
       // If an enable fails AFTER a successful attach, detach so we don't strand an orphaned debugger
       // (stuck "being debugged" banner + a leaked attach that nothing will ever clean up).
       try {
-        await Promise.all([cmd(tabId, "DOM.enable"), cmd(tabId, "Page.enable")]);
+        await Promise.all([cmd(tabId, "DOM.enable", undefined, ATTACH_MS), cmd(tabId, "Page.enable", undefined, ATTACH_MS)]);
+        if (abandoned) throw new Error("attach abandoned after timeout");
       } catch (e) {
         await detachSession(tabId).catch(() => {});
         throw e;
@@ -1153,6 +1505,14 @@ async function ensureAttached(tabId: number): Promise<Session> {
       sessions.set(tabId, s);
       return s;
     })();
+    p = withTimeout(run, ATTACH_MS + 2_000, () => tabTimeoutMsg(tabId, ATTACH_MS + 2_000, "the debugger attach")).catch(async (e) => {
+      if (isTimeout(e)) {
+        abandoned = true;
+        if (attaching.get(tabId) === p) attaching.delete(tabId);
+        await withTimeout(detachSession(tabId), 3_000, "detach").catch(() => {});
+      }
+      throw e;
+    });
     attaching.set(tabId, p);
     // Clear on settle either way: a failed attach must not be cached, or the tab could never retry.
     void p.catch(() => {}).then(() => attaching.delete(tabId));
@@ -1165,6 +1525,7 @@ async function ensureAttached(tabId: number): Promise<Session> {
 async function detachSession(tabId: number): Promise<void> {
   finalizeCapture(tabId); // flush + close the on-disk sink before the session goes away
   sessions.delete(tabId);
+  pendingDialogs.delete(tabId); // no longer observable once detached - don't report a stale one
   try {
     await new Promise<void>((resolve) => chrome.debugger.detach({ tabId }, () => resolve()));
   } catch {
@@ -1226,6 +1587,7 @@ function capExtra(s: Session): void {
 function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, params: any) {
   const tabId = source.tabId;
   if (tabId == null) return;
+  if (method === "Page.javaScriptDialogOpening" || method === "Page.javaScriptDialogClosed") onDialogEvent(tabId, method, params);
   const s = sessions.get(tabId);
   if (!s) return;
   // Fetch interception + console/log capture run independently of Network capture (netOn).
@@ -2099,7 +2461,7 @@ async function viewportMeta(tab: chrome.tabs.Tab): Promise<any> {
       visibilityState: document.visibilityState,
       hidden: document.hidden,
       hasFocus: document.hasFocus(),
-    }), []);
+    }), [], "ISOLATED", { timeoutMs: 2_000, immediate: true }); // read-only; never hold up a capture
     if (v && v.hidden) {
       v.warning =
         "Tab is hidden/occluded - the compositor may be throttling its frames, so this capture can be stale " +
@@ -2479,13 +2841,19 @@ async function shallowSnapshot(tab: chrome.tabs.Tab): Promise<any> {
   const results = await Promise.all(
     frames.map(async (f, i) => {
       try {
-        const res = await chrome.scripting.executeScript({
-          target: { tabId: tab.id!, frameIds: [f.frameId] },
-          func: bbSnapshot as any,
-          args: [i * FRAME_REF_STRIDE],
-        });
+        const ms = f.frameId === 0 ? INJECT_TOP_MS : INJECT_CHILD_MS;
+        const res = await withTimeout(
+          chrome.scripting.executeScript({
+            target: { tabId: tab.id!, frameIds: [f.frameId] },
+            func: bbSnapshot as any,
+            args: [i * FRAME_REF_STRIDE],
+          }),
+          ms,
+          () => tabTimeoutMsg(tab.id, ms)
+        );
         return { frameId: f.frameId, v: res?.[0]?.result as any };
-      } catch {
+      } catch (e) {
+        if (f.frameId === 0 && isTimeout(e)) throw e; // a hung top frame is an error, not an empty page
         return null; // frame not injectable (about:blank, sandboxed, gone)
       }
     })
@@ -2515,13 +2883,19 @@ async function axSnapshot(tab: chrome.tabs.Tab): Promise<any> {
   const results = await Promise.all(
     frames.map(async (f, i) => {
       try {
-        const res = await chrome.scripting.executeScript({
-          target: { tabId: tab.id!, frameIds: [f.frameId] },
-          func: bbAxSnapshot as any,
-          args: [i * FRAME_REF_STRIDE],
-        });
+        const ms = f.frameId === 0 ? INJECT_TOP_MS : INJECT_CHILD_MS;
+        const res = await withTimeout(
+          chrome.scripting.executeScript({
+            target: { tabId: tab.id!, frameIds: [f.frameId] },
+            func: bbAxSnapshot as any,
+            args: [i * FRAME_REF_STRIDE],
+          }),
+          ms,
+          () => tabTimeoutMsg(tab.id, ms)
+        );
         return { frameId: f.frameId, v: res?.[0]?.result as any };
-      } catch {
+      } catch (e) {
+        if (f.frameId === 0 && isTimeout(e)) throw e; // a hung top frame is an error, not an empty page
         return null; // frame not injectable (about:blank, sandboxed, gone)
       }
     })
@@ -2603,10 +2977,15 @@ async function dispatch(method: string, params: any): Promise<any> {
   switch (method) {
     case "tabs_list": {
       const tabs = await chrome.tabs.query({});
+      // A tab frozen by a JS dialog is otherwise invisible until a tool times out on it.
+      const dlg = (t: chrome.tabs.Tab) => {
+        const d = t.id != null ? pendingDialogs.get(t.id) : undefined;
+        return d ? { dialog: { type: d.type, message: d.message } } : {};
+      };
       if (params?.short) {
-        return tabs.map((t) => ({ id: t.id, title: t.title, origin: safeOrigin(t.url), active: t.active }));
+        return tabs.map((t) => ({ id: t.id, title: t.title, origin: safeOrigin(t.url), active: t.active, ...dlg(t) }));
       }
-      return tabs.map((t) => ({ id: t.id, title: t.title, url: t.url, active: t.active, windowId: t.windowId, incognito: t.incognito }));
+      return tabs.map((t) => ({ id: t.id, title: t.title, url: t.url, active: t.active, windowId: t.windowId, incognito: t.incognito, ...dlg(t) }));
     }
 
     case "tab_new": {
@@ -2621,9 +3000,17 @@ async function dispatch(method: string, params: any): Promise<any> {
           tab = window.tabs[0];
         }
       } else tab = await chrome.tabs.create({ url: params.url });
-      await waitForComplete(tab.id!);
+      const load = startLoadWait(tab.id!, { waitUntil: parseWaitUntil(params.waitUntil), cancelKey: params });
+      const waited = await load.wait();
       const fresh = await chrome.tabs.get(tab.id!);
-      return { tabId: fresh.id, title: fresh.title, url: fresh.url, incognito: fresh.incognito };
+      return {
+        tabId: fresh.id,
+        title: fresh.title,
+        url: fresh.url,
+        incognito: fresh.incognito,
+        ...(waited.loadTimedOut ? { loadTimedOut: true } : {}),
+        ...(waited.dialog ? { dialog: waited.dialog } : {}),
+      };
     }
 
     case "tab_activate": {
@@ -2651,10 +3038,35 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "navigate": {
       const tab = await targetTab(params.tabId);
-      await chrome.tabs.update(tab.id!, { url: params.url });
-      await waitForComplete(tab.id!);
+      const before = tab.url;
+      // Listen BEFORE issuing the navigation so a fast load can't complete unseen.
+      const load = startLoadWait(tab.id!, { waitUntil: parseWaitUntil(params.waitUntil), cancelKey: params });
+      try {
+        await chrome.tabs.update(tab.id!, { url: params.url });
+      } catch (e) {
+        load.dispose();
+        throw e;
+      }
+      const waited = await load.wait();
       const fresh = await chrome.tabs.get(tab.id!);
-      return { tabId: fresh.id, title: fresh.title, url: fresh.url, incognito: fresh.incognito };
+      const out: any = { tabId: fresh.id, title: fresh.title, url: fresh.url, incognito: fresh.incognito };
+      if (waited.loadTimedOut) out.loadTimedOut = true;
+      const dialog = waited.dialog ?? pendingDialogs.get(tab.id!);
+      // A beforeunload ("Leave site?") dialog holds or cancels the navigation and the tab stays on the
+      // old page. Reporting plain success there had agents reasoning about a page that never loaded.
+      if (dialog) {
+        out.navigated = false;
+        out.dialog = dialog;
+        out.error =
+          `navigation is blocked by a JavaScript ${dialog.type} dialog ("${dialog.message.slice(0, 120)}") - ` +
+          `call handle_dialog (accept:true to leave the page, false to stay), then retry if needed`;
+      } else if (params.waitUntil !== "none" && fresh.url === before && !fresh.pendingUrl && !sameUrl(before, params.url)) {
+        out.navigated = false;
+        out.warning =
+          "the tab's URL did not change - a beforeunload ('Leave site?') dialog may have blocked the navigation " +
+          "(call handle_dialog), or the site redirected back to the same page";
+      }
+      return out;
     }
 
     case "get_page_text": {
@@ -2765,10 +3177,33 @@ async function dispatch(method: string, params: any): Promise<any> {
     }
 
     case "go_back":
-      return navByHistory(await targetTab(params.tabId), "back");
+      return navByHistory(await targetTab(params.tabId), "back", params);
 
     case "go_forward":
-      return navByHistory(await targetTab(params.tabId), "forward");
+      return navByHistory(await targetTab(params.tabId), "forward", params);
+
+    case "handle_dialog": {
+      const tab = await targetTab(params.tabId);
+      const tabId = tab.id!;
+      await ensureAttached(tabId);
+      const known = pendingDialogs.get(tabId);
+      const accept = params.accept !== false;
+      try {
+        await cmd(tabId, "Page.handleJavaScriptDialog", {
+          accept,
+          ...(typeof params.promptText === "string" ? { promptText: params.promptText } : {}),
+        });
+      } catch (e) {
+        const m = e instanceof Error ? e.message : String(e);
+        if (/no dialog/i.test(m)) {
+          pendingDialogs.delete(tabId);
+          return { handled: false, tabId, message: `no JavaScript dialog is showing on tab ${tabId}` };
+        }
+        throw e;
+      }
+      pendingDialogs.delete(tabId);
+      return { handled: true, tabId, accepted: accept, type: known?.type, message: known?.message, url: known?.url };
+    }
 
     // ---- chrome.debugger (CDP) tools ----
 
@@ -3141,6 +3576,9 @@ async function dispatch(method: string, params: any): Promise<any> {
         // respawn lost the queue timestamps. Retry once through the queue, then fall back to CDP -
         // Page.captureScreenshot has no quota and targets the tab directly, so a screenshot should
         // never hard-fail just because the window was busy a moment ago.
+        // A grab that hit the queue's hard timeout (wedged / dialog-frozen tab) goes straight to CDP:
+        // retrying it through the same queue would only wait out another timeout.
+        if (isTimeout(e)) return cdpScreenshot(tab, { ...params, format: fmt });
         if (!/quota|readback|Failed to capture|Cannot access contents/i.test(msg)) throw e;
         try {
           shot = await serializeCapture(tab.windowId!, grab);
@@ -3256,6 +3694,10 @@ async function dispatch(method: string, params: any): Promise<any> {
         mime: item.mime,
         error: item.error,
         exists: item.exists,
+        // A dangerous-file verdict or a pause holds a download indefinitely; the server fails fast on them.
+        danger: item.danger,
+        paused: item.paused,
+        canResume: item.canResume,
       };
     }
 
@@ -3730,8 +4172,14 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   lastDetach.set(source.tabId, { reason: String(reason ?? "unknown"), at: Date.now() });
   finalizeCapture(source.tabId); // flush + close the sink (user closed banner / DevTools opened / tab gone)
   sessions.delete(source.tabId);
+  pendingDialogs.delete(source.tabId);
+});
+// A committed top-frame navigation means any dialog the old document showed is gone.
+chrome.webNavigation.onCommitted.addListener((d) => {
+  if (d.frameId === 0) pendingDialogs.delete(d.tabId);
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
+  pendingDialogs.delete(tabId);
   finalizeCapture(tabId);
   sessions.delete(tabId);
   const rec = sessionRecordings.get(tabId);
@@ -3857,6 +4305,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && (changes.token || changes.port)) {
     ws?.close();
     reconnectDelay = 1_000;
+    replacedUntil = 0;
     connect();
   }
 });
@@ -3864,6 +4313,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.cmd === "reconnect") {
     ws?.close();
     reconnectDelay = 1_000;
+    replacedUntil = 0;
     connect();
     sendResponse({ ok: true });
     return false;

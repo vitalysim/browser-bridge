@@ -16,6 +16,8 @@ import { versionSkewWarning } from "./version.js";
 import { buildHar, parseSessionEventsStream } from "./capture-format.js";
 import { renderAxSnapshot, type AxSnapshot } from "./ax.js";
 import { registerEmulateTools } from "./emulate.js";
+import { downloadVerdict, DEFAULT_STALL_MS } from "./download-watch.js";
+import { inputHubTimeout, SCREENSHOT_HUB_TIMEOUT_MS } from "./timeouts.js";
 import {
   DEFAULT_INCLUDE,
   defaultWatchOpts,
@@ -315,6 +317,15 @@ const timeoutMsParam = z
 // `+5_000` slack. Math.max so the budget can only ever GROW: the default stays exactly CALL_TIMEOUT_MS.
 const actionHubTimeout = (t?: number) => Math.max(CALL_TIMEOUT_MS, (t ?? 5_000) + 5_000);
 
+const waitUntilParam = z
+  .enum(["load", "domcontentloaded", "none"])
+  .optional()
+  .describe(
+    "When to return: 'load' (default) waits for the full load event, 'domcontentloaded' for the DOM to be parsed, " +
+      "'none' returns as soon as the navigation is issued. Waiting is capped at ~20s; if the cap is hit the result " +
+      "has loadTimedOut:true (the page may still be usable)."
+  );
+
 export interface RegisterOptions {
   /** Which tool groups to register (see toolsets.ts). Defaults to BRIDGE_TOOLSETS, i.e. all when unset. */
   toolsets?: ToolsetSelection;
@@ -403,9 +414,13 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
 
   tool(
     "tab_new",
-    "Open a new browser tab. Returns the new tab's id once the page finishes loading.",
-    { url: z.string().describe("URL to open"), regularWindow: z.boolean().optional().describe("Open in a regular, non-incognito window regardless of which window is active") },
-    async ({ url, regularWindow }) => textResult(await hub.call("tab_new", { url, regularWindow }))
+    "Open a new browser tab. Returns the new tab's id once the page finishes loading (see waitUntil).",
+    {
+      url: z.string().describe("URL to open"),
+      regularWindow: z.boolean().optional().describe("Open in a regular, non-incognito window regardless of which window is active"),
+      waitUntil: waitUntilParam,
+    },
+    async ({ url, regularWindow, waitUntil }) => textResult(await hub.call("tab_new", { url, regularWindow, waitUntil }))
   );
 
   tool(
@@ -431,9 +446,10 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
 
   tool(
     "navigate",
-    "Navigate a tab to a URL and wait for the page to finish loading.",
-    { url: z.string().describe("URL to navigate to"), tabId: tabIdParam },
-    async ({ url, tabId }) => textResult(await hub.call("navigate", { url, tabId }))
+    "Navigate a tab to a URL and wait for the page to finish loading (see waitUntil). If the page's beforeunload " +
+      "dialog blocks the navigation this reports it (navigated:false) instead of success - resolve it with handle_dialog.",
+    { url: z.string().describe("URL to navigate to"), tabId: tabIdParam, waitUntil: waitUntilParam },
+    async ({ url, tabId, waitUntil }) => textResult(await hub.call("navigate", { url, tabId, waitUntil }))
   );
 
   tool(
@@ -600,7 +616,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         throw new Error(`input action '${args.action}' requires x and y (CSS viewport pixels)`);
       if (args.action === "type" && args.text === undefined) throw new Error("input action 'type' requires text");
       if (args.action === "key" && !args.key && !args.code) throw new Error("input action 'key' requires key or code");
-      return textResult(await hub.call("input", args, 120_000));
+      return textResult(await hub.call("input", args, inputHubTimeout(args)));
     }
   );
 
@@ -616,6 +632,19 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     "Navigate the tab forward in its history (like the browser Forward button).",
     { tabId: tabIdParam },
     async ({ tabId }) => textResult(await hub.call("go_forward", { tabId }))
+  );
+
+  tool(
+    "handle_dialog",
+    "Accept or dismiss a JavaScript dialog (alert/confirm/prompt/beforeunload) that is blocking a tab. While a " +
+      "dialog is open the page's JS is frozen, so injected tools time out - their error says to call this. Uses " +
+      "chrome.debugger (shows the banner). Returns {handled:true, type, message} or {handled:false} when no dialog is showing.",
+    {
+      tabId: tabIdParam,
+      accept: z.boolean().optional().describe("true (default) = OK/Leave; false = Cancel/Stay"),
+      promptText: z.string().optional().describe("Text to enter into a prompt() dialog before accepting"),
+    },
+    async ({ tabId, accept, promptText }) => textResult(await hub.call("handle_dialog", { tabId, accept, promptText }))
   );
 
   tool(
@@ -711,7 +740,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       savePath: z.string().optional().describe("Absolute path to write the image to (returns metadata, not the image)"),
     },
     async ({ tabId, fullPage, scale, format, quality, selector, savePath }) => {
-      const r = await hub.call("screenshot", { tabId, fullPage, scale, format, quality, selector }, 120_000);
+      const r = await hub.call("screenshot", { tabId, fullPage, scale, format, quality, selector }, SCREENSHOT_HUB_TIMEOUT_MS);
       const buf = Buffer.from(r.base64, "base64");
       const dims = imageDims(buf);
       const mimeType = r.format === "jpeg" ? ("image/jpeg" as const) : ("image/png" as const);
@@ -748,23 +777,27 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       savePath: z.string().optional().describe("Absolute destination path; if omitted, the file stays wherever Chrome's Downloads folder puts it"),
       filename: z.string().optional().describe("Initial relative filename/subpath within Chrome's Downloads directory"),
       headers: z.record(z.string()).optional().describe("Extra request headers, e.g. Authorization"),
-      maxBytes: z.number().optional().describe("Cancel the download if size exceeds this (bytes). Default 100 MB; pass a bigger value or omit for unlimited."),
+      maxBytes: z.number().optional().describe("Cancel the download if size exceeds this (bytes). Omit for unlimited (the default)."),
       timeoutMs: z.number().optional().describe("Max time to wait for completion (default 600000 = 10 min; large/slow downloads may need more)"),
+      stallTimeoutMs: z
+        .number()
+        .optional()
+        .describe(`Fail if no bytes arrive for this long (default ${DEFAULT_STALL_MS}; 0 disables). A dangerous-file prompt or a paused download fails immediately.`),
     },
-    async ({ url, savePath, filename, headers, maxBytes, timeoutMs }) => {
+    async ({ url, savePath, filename, headers, maxBytes, timeoutMs, stallTimeoutMs }) => {
       const start = await hub.call("download_resource", { url, filename, headers }, 20_000);
-      const cap = maxBytes ?? 100 * 1024 * 1024;
+      const cap = maxBytes; // undefined = unlimited, as documented
       const overallTimeout = timeoutMs ?? 600_000;
       const deadline = Date.now() + overallTimeout;
+      const progress = { lastBytes: 0, lastProgressAt: Date.now() };
       let status: any;
       while (true) {
         status = await hub.call("download_status", { downloadId: start.downloadId }, 10_000);
-        if (status.state === "complete") break;
-        if (status.state === "interrupted") throw new Error(`Download interrupted: ${status.error ?? "unknown reason"}`);
-        const seen = status.totalBytes > 0 ? status.totalBytes : status.bytesReceived;
-        if (cap && seen > cap) {
-          await hub.call("download_cancel", { downloadId: start.downloadId }, 10_000).catch(() => {});
-          throw new Error(`Download exceeded maxBytes (${cap}); cancelled after ~${status.bytesReceived} bytes.`);
+        const v = downloadVerdict(status, progress, { now: Date.now(), cap, stallMs: stallTimeoutMs, downloadId: start.downloadId });
+        if (v.kind === "complete") break;
+        if (v.kind === "fail") {
+          if (v.cancel) await hub.call("download_cancel", { downloadId: start.downloadId }, 10_000).catch(() => {});
+          throw new Error(v.message);
         }
         if (Date.now() > deadline) {
           throw new Error(
