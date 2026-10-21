@@ -402,3 +402,109 @@ scenario("contenteditable-refill", async (c) => {
   const text = String(await c.evalJs(tabId, "document.getElementById('ed').innerText")).trim();
   c.expect(text === "second draft", `editor text is ${JSON.stringify(text)}`);
 });
+
+// ---- actions v2 ----------------------------------------------------------------------------------
+
+// eval_js's in-page path must await a returned Promise (it used to stringify it to "{}").
+scenario("eval-js-awaits-promise", async (c) => {
+  const tabId = await c.open("basic.html");
+  const r = await c.call("eval_js", { tabId, code: "new Promise(r => setTimeout(() => r({ ok: 42, via: 'promise' }), 300))" });
+  c.note(`eval(Promise) -> ${trim(r.text, 120)} in ${r.ms}ms`);
+  c.expect(!r.isError && r.json?.value === JSON.stringify({ ok: 42, via: "promise" }), `Promise value not returned: ${trim(r.text, 160)}`);
+  c.expect(r.ms >= 250, `returned in ${r.ms}ms - before the 300ms promise could settle?`);
+  const fetched = await c.call("eval_js", { tabId, code: "fetch(location.href).then(r => r.text()).then(t => t.includes('basic-marker-7731'))" });
+  c.expect(fetched.json?.value === "true", `fetch().then chain not awaited: ${trim(fetched.text, 160)}`);
+  const rej = await c.call("eval_js", { tabId, code: "Promise.reject(new Error('nope-123'))" });
+  c.expect(rej.isError && /rejected/i.test(rej.text) && /nope-123/.test(rej.text), `a rejected Promise should be an error naming the reason: ${trim(rej.text, 160)}`);
+  const raw = await c.call("eval_js", { tabId, code: "new Promise(() => {})", awaitPromise: false });
+  c.expect(!raw.isError && raw.ms < 2_000, `awaitPromise:false should not wait: ${trim(raw.text, 120)} in ${raw.ms}ms`);
+  const hang = await c.call("eval_js", { tabId, code: "new Promise(() => {})", timeoutMs: 3_000 }, { timeoutMs: 10_000, allowTimeout: true });
+  c.note(`never-settling promise -> ${trim(hang.text, 120)} in ${hang.ms}ms`);
+  c.expect(!hang.timedOut && hang.isError && /did not settle/.test(hang.text), `a never-settling promise should report within its timeoutMs: ${trim(hang.text, 160)}`);
+});
+
+// A tab behind another tab (or in a covered/minimized window) is visibilityState 'hidden': Chrome
+// renders no frames, so requestAnimationFrame never fires and UIs that commit in rAF (React-Aria,
+// Radix...) do not update; CDP mouse input also waited ~5s per move for a frame. Playwright keeps
+// every page it controls "visible" (it enables focus emulation on them), so this runs on a second,
+// raw Chromium launched without Playwright attached to its pages (Harness rawBrowser mode).
+scenario(
+  "hidden-tab-raf-commit",
+  async (c0) => {
+    const h2 = new Harness({ rawBrowser: true, logName: "server-raw.log" });
+    try {
+      await h2.setup();
+      const c = c0.fork(h2);
+      const tabId = await c.open("raf-commit.html");
+      await c.open("basic.html"); // in front of the fixture tab: the fixture is now a background tab
+      const vis = await c.evalJs(tabId, "document.visibilityState");
+      if (vis !== "hidden") throw new Error(`could not reproduce a hidden tab (visibilityState=${vis})`);
+      const raf0 = await c.evalJs(tabId, "window.__rafWithin(1000)");
+      c.note(`hidden fixture tab: rAF within 1s (no debugger) = ${raf0}`);
+      c.expect(raf0 === false, `rAF fired in the hidden tab (${raf0}) - the scenario no longer reproduces the problem`);
+      const state = () => c.evalJs(tabId, "window.__state");
+
+      // snapshot reports it
+      const snap = await c.snapshot(tabId);
+      c.expect(snap.json?.tabHidden === true && /tab is hidden/.test(snap.json?.warning ?? ""), `snapshot lacks tabHidden/warning: ${trim(snap.r.text, 160)}`);
+
+      // (a) synthetic, no debugger, no keepAlive: the click happens, the rAF commit cannot - say so
+      const a = await c.call("click", { selector: "#panel", tabId });
+      const sa = await state();
+      c.expect(a.json?.clicked === true && a.json?.tabHidden === true && /tab is hidden/.test(a.json?.warning ?? ""), `synthetic click on a hidden tab did not report tabHidden + warning: ${trim(a.text, 200)}`);
+      c.expect(a.ms < 1_000, `synthetic click on a hidden tab took ${a.ms}ms`);
+      c.note(`(a) synthetic: ${a.ms}ms, state=${JSON.stringify(sa)}`);
+
+      // (b) keepAlive:true - attaches the debugger, keeps the tab rendering: every pending commit lands
+      const b = await c.call("click", { selector: "#panel", tabId, keepAlive: true });
+      const sb = await state();
+      c.note(`(b) keepAlive: ${b.ms}ms, state=${JSON.stringify(sb)}`);
+      c.expect(b.json?.keptAlive === true, `keepAlive click not kept alive: ${trim(b.text, 200)}`);
+      c.expect(sb?.pending === 0 && sb?.clicks === 2, `rAF commits did not land with keepAlive (state ${JSON.stringify(sb)})`);
+      c.expect((await c.evalJs(tabId, "document.getElementById('out').textContent")) === "open", "panel did not open");
+      c.expect((await c.evalJs(tabId, "document.visibilityState")) === "hidden", "tab still forced visible after the action");
+
+      // (c) trusted: CDP mouse input on a hidden tab used to wait ~5s per mouseMoved for a frame
+      const t1 = await c.call("click", { selector: "#panel", tabId, trusted: true });
+      const t2 = await c.call("click", { selector: "#panel", tabId, trusted: true });
+      const hv = await c.call("hover", { selector: "#panel", tabId, trusted: true });
+      const sc = await state();
+      c.note(`(c) trusted click ${t1.ms}ms / ${t2.ms}ms, trusted hover ${hv.ms}ms, state=${JSON.stringify(sc)}`);
+      c.expect(t1.json?.via === "trusted" && t1.json?.keptAlive === true, `trusted click: ${trim(t1.text, 200)}`);
+      c.expect(t1.ms < 1_500 && t2.ms < 500, `trusted clicks on a hidden tab too slow: ${t1.ms}ms, ${t2.ms}ms (want <1500 / <500)`);
+      c.expect(hv.ms < 500, `trusted hover on a hidden tab took ${hv.ms}ms (want <500)`);
+      c.expect(sc?.pending === 0 && sc?.clicks === 4, `trusted click commits did not land (state ${JSON.stringify(sc)})`);
+
+      // (d) a debugger session now exists: a plain synthetic click is kept alive automatically
+      const d = await c.call("click", { selector: "#panel", tabId });
+      const sd = await state();
+      c.expect(d.json?.keptAlive === true && sd?.pending === 0, `synthetic click with a debugger attached was not kept alive: ${trim(d.text, 160)} state=${JSON.stringify(sd)}`);
+      // ... unless the caller opts out
+      const e = await c.call("click", { selector: "#panel", tabId, keepAlive: false });
+      c.expect(e.json?.keptAlive !== true && e.json?.tabHidden === true, `keepAlive:false was kept alive: ${trim(e.text, 160)}`);
+
+      // What actually makes a hidden tab render (measured over a separate raw CDP session):
+      const cdp = h2.rawCdp!;
+      const target = ((await cdp("Target.getTargets")).targetInfos as any[]).find((t) => t.type === "page" && t.url.includes("raf-commit.html"));
+      const { sessionId } = await cdp("Target.attachToTarget", { targetId: target.targetId, flatten: true });
+      const raf = () => c.evalJs(tabId, "window.__rafWithin(1000)");
+      const m: Record<string, unknown> = {};
+      await cdp("Page.enable", {}, sessionId);
+      await cdp("Page.setWebLifecycleState", { state: "active" }, sessionId);
+      m.lifecycleActive = await raf();
+      await cdp("Page.startScreencast", { format: "jpeg", quality: 1, maxWidth: 16, maxHeight: 16 }, sessionId);
+      m.screencast = await raf();
+      await cdp("Page.stopScreencast", {}, sessionId);
+      await cdp("Emulation.setFocusEmulationEnabled", { enabled: true }, sessionId);
+      m.focusEmulation = await raf();
+      await cdp("Emulation.setFocusEmulationEnabled", { enabled: false }, sessionId);
+      m.afterFocusEmulationOff = await raf();
+      await cdp("Target.detachFromTarget", { sessionId });
+      c.note(`rAF within 1s in the hidden tab: ${JSON.stringify(m)}`);
+      c.expect(m.focusEmulation === true, `focus emulation no longer makes a hidden tab render: ${JSON.stringify(m)}`);
+    } finally {
+      await h2.teardown();
+    }
+  },
+  { timeout: 120_000 }
+);
