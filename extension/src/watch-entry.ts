@@ -425,15 +425,39 @@
   window.addEventListener("hashchange", () => reportNav("hash"), true);
   // The MAIN-world script sends a JSON STRING, not an object: a structured-clone `detail` created in
   // the main world is not reliably readable from an isolated world, and silently reads as undefined.
-  window.addEventListener("bb-watch-main", ((e: CustomEvent) => {
+  //
+  // The channel is authenticated: this (isolated, page-invisible) script picks a random per-document
+  // secret, hands it to the service worker in the hello handshake (runtime messages are invisible to
+  // the page) and the SW injects the MAIN-world shim with it. The shim dispatches on an event name
+  // derived from the secret and repeats it in the detail; anything else - a page forging
+  // "bb-watch-main" events to plant fake console/nav lines in the agent's timeline - is ignored.
+  const MAIN_NONCE = (() => {
+    try {
+      const a = new Uint8Array(16);
+      crypto.getRandomValues(a);
+      return Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
+    } catch {
+      return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+    }
+  })();
+  window.addEventListener("bb-watch-main:" + MAIN_NONCE, ((e: CustomEvent) => {
     let d: any;
     try {
       d = JSON.parse(String(e.detail));
     } catch {
       return;
     }
+    if (!d || typeof d !== "object" || d.n !== MAIN_NONCE) return;
     if (d.kind === "nav") reportNav("spa", !!d.replace);
-    else if (d.kind === "console") push({ t: now(), k: "console", level: d.level, text: String(d.text ?? "").slice(0, 500), src: d.src, line: d.line });
+    else if (d.kind === "console")
+      push({
+        t: now(),
+        k: "console",
+        level: d.level === "warn" ? "warn" : "error",
+        text: String(d.text ?? "").slice(0, 500),
+        src: typeof d.src === "string" ? d.src.slice(0, 300) : undefined,
+        line: typeof d.line === "number" ? d.line : undefined,
+      });
   }) as EventListener);
 
   document.addEventListener("visibilitychange", () => {
@@ -447,6 +471,7 @@
 
   w.__bbWatch = {
     v: V,
+    mainNonce: MAIN_NONCE,
     status: () => ({ v: V, armed, dormant, buffered: buf.length, dropped, url: nav() }),
     arm: (on: boolean, mode?: string) => {
       if (on) {
@@ -464,7 +489,7 @@
   };
 
   try {
-    chrome.runtime.sendMessage({ cmd: "bb-watch-hello", v: V, url: nav() }, (res?: any) => {
+    chrome.runtime.sendMessage({ cmd: "bb-watch-hello", v: V, url: nav(), mainNonce: MAIN_NONCE }, (res?: any) => {
       void chrome.runtime.lastError;
       if (res && res.armed) w.__bbWatch.arm(true, res.consoleMode);
       else disarm();

@@ -465,6 +465,27 @@ scenario("hover-revealed-button", async (c) => {
   c.expect((await c.evalJs(tabId, "window.__ran")) === 1, `button did not run after trusted hover: ${trim(ok.text, 160)}`);
 });
 
+// Watch mode: a page can neither pre-disable error capture nor forge timeline lines via the relay event.
+scenario("watch-relay-not-forgeable", async (c) => {
+  if (!c.h.toolSchemas.has("watch_start")) c.skip("watch tools not exposed");
+  const tabId = await c.open("watch-hostile.html");
+  const ws = await c.call("watch_start", { tabId, console: true, retain: "none" });
+  c.expect(!ws.isError, `watch_start failed: ${trim(ws.text, 160)}`);
+  try {
+    await c.evalJs(tabId, "window.__forge(); setTimeout(() => { throw new Error('REAL-BOOM-4242') }, 0); 1");
+    let text = "";
+    for (let i = 0; i < 12 && !/REAL-BOOM-4242/.test(text); i++) {
+      const r = await c.call("watch_read", { waitMs: 1_000 });
+      text = r.text;
+    }
+    c.note(`watch_read -> ${trim(text, 300)}`);
+    c.expect(/REAL-BOOM-4242/.test(text), "a real uncaught error was not captured (page pre-set __bbWatchMain?)");
+    c.expect(!/FORGED-777|Transfer/.test(text), `a forged relay event reached the timeline: ${trim(text, 300)}`);
+  } finally {
+    await c.call("watch_stop", {}).catch(() => undefined);
+  }
+});
+
 // Restarting interception must release (not forget) the requests the first one is holding.
 scenario("intercept-restart-releases-paused", async (c) => {
   if (!c.h.toolSchemas.has("intercept_start")) c.skip("intercept tools not exposed");

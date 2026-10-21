@@ -498,7 +498,7 @@ async function registerWatchScripts(withConsole: boolean): Promise<void> {
     },
   ];
   // The MAIN-world shim is NOT registered here: it is injected per-document as an inline function
-  // (see bbWatchMainShim), which is why watched tabs re-inject it on every commit.
+  // (see bbWatchMainShim), from each document's hello handshake (injectWatchMain).
   void withConsole;
   let existing: chrome.scripting.RegisteredContentScript[] = [];
   try {
@@ -541,11 +541,31 @@ async function unregisterWatchScripts(): Promise<void> {
  * puts this extension in the page's stack traces - observed on a real target whose error reporter
  * shipped our filename. Opt-in by name for that reason.
  */
-function bbWatchMainShim(mode: string) {
+function bbWatchMainShim(mode: string, nonce: string) {
+  if (typeof nonce !== "string" || nonce.length < 16) return false;
   const w = window as any;
+  // Install state lives under a key derived from the per-document secret (hashed, so the visible key
+  // does not reveal it): a page can't pre-set it to switch capture off, as it could the old fixed
+  // window.__bbWatchMain flag. Non-configurable so it can't be deleted to force a double install.
+  let h = 2166136261;
+  for (let i = 0; i < nonce.length; i++) h = Math.imul(h ^ nonce.charCodeAt(i), 16777619);
+  const key = "__bbWM_" + (h >>> 0).toString(36);
+  let st = Object.prototype.hasOwnProperty.call(w, key) ? w[key] : null;
+  if (!st || typeof st !== "object") {
+    st = { main: false, hist: false, wrapped: false };
+    try {
+      Object.defineProperty(w, key, { value: st, enumerable: false, configurable: false, writable: false });
+    } catch {
+      return false; // key squatted: refuse rather than double-install
+    }
+  }
+  const type = "bb-watch-main:" + nonce;
+  const Ev = CustomEvent;
+  const dispatch = EventTarget.prototype.dispatchEvent;
   const relay = (obj: any) => {
     try {
-      window.dispatchEvent(new CustomEvent("bb-watch-main", { detail: JSON.stringify(obj) }));
+      obj.n = nonce;
+      dispatch.call(window, new Ev(type, { detail: JSON.stringify(obj) }));
     } catch {
       /* unserializable - drop rather than throw inside the page */
     }
@@ -564,8 +584,8 @@ function bbWatchMainShim(mode: string) {
       .join(" ")
       .slice(0, 500);
   const wrapConsole = () => {
-    if (w.__bbWatchWrapped) return;
-    w.__bbWatchWrapped = 1;
+    if (st.wrapped) return;
+    st.wrapped = true;
     for (const level of ["error", "warn"]) {
       const orig = (console as any)[level]?.bind(console);
       if (!orig) continue;
@@ -585,8 +605,8 @@ function bbWatchMainShim(mode: string) {
   // the isolated watcher, which emits them as via:"spa" navigations. `replace` is carried through so
   // the fold can leave a search-as-you-type burst intact instead of splitting it per keystroke.
   const patchHistory = () => {
-    if (w.__bbWatchHist) return;
-    w.__bbWatchHist = 1;
+    if (st.hist) return;
+    st.hist = true;
     for (const m of ["pushState", "replaceState"] as const) {
       const orig = (history as any)[m];
       if (typeof orig !== "function") continue;
@@ -601,43 +621,65 @@ function bbWatchMainShim(mode: string) {
       };
     }
   };
-  if (w.__bbWatchMain) {
-    patchHistory();
-    if (mode === "calls") wrapConsole();
-    return true;
+  if (!st.main) {
+    st.main = true;
+    window.addEventListener("error", (e: any) => {
+      relay({ kind: "console", level: "error", text: String(e.message ?? "").slice(0, 500), src: e.filename, line: e.lineno });
+    });
+    window.addEventListener("unhandledrejection", (e: any) => {
+      relay({ kind: "console", level: "error", text: "Unhandled rejection: " + fmt([e?.reason]) });
+    });
   }
-  window.addEventListener("error", (e: any) => {
-    relay({ kind: "console", level: "error", text: String(e.message ?? "").slice(0, 500), src: e.filename, line: e.lineno });
-  });
-  window.addEventListener("unhandledrejection", (e: any) => {
-    relay({ kind: "console", level: "error", text: "Unhandled rejection: " + fmt([e?.reason]) });
-  });
   patchHistory();
   if (mode === "calls") wrapConsole();
-  w.__bbWatchMain = 1;
   return true;
 }
 
+/** Inject the MAIN-world shim into specific frames, each with the secret its isolated watcher chose. */
+async function injectWatchMain(tabId: number, frames: { frameId: number; nonce: string }[], mode: string): Promise<string> {
+  const errs: string[] = [];
+  await Promise.all(
+    frames.map(({ frameId, nonce }) =>
+      chrome.scripting
+        .executeScript({
+          target: { tabId, frameIds: [frameId] },
+          func: bbWatchMainShim,
+          args: [mode, nonce],
+          world: "MAIN",
+          injectImmediately: true,
+        } as chrome.scripting.ScriptInjection<any, any>)
+        .catch((e) => {
+          errs.push(String(e?.message ?? e).slice(0, 200));
+        })
+    )
+  );
+  return errs.length ? errs[0] : "ok";
+}
+
 async function injectWatchNow(tabId: number, consoleMode: "off" | "passive" | "calls"): Promise<void> {
-  const jobs: Promise<unknown>[] = [
-    chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ["vendor/bb-watch.js"] }),
-  ];
-  if (consoleMode !== "off") {
-    jobs.push(
-      chrome.scripting.executeScript({
-        target: { tabId, allFrames: true },
-        func: bbWatchMainShim,
-        args: [consoleMode],
-        world: "MAIN",
-      } as chrome.scripting.ScriptInjection<any, any>)
-    );
-  }
   // Report what failed rather than swallowing it. A silently-failed injection looks exactly like a
   // quiet user, which is the failure mode this whole feature is built to avoid.
-  const [isolated, main] = await Promise.all(
-    jobs.map((p) => p.then(() => "ok").catch((e) => String(e?.message ?? e).slice(0, 200)))
-  );
-  lastInject.set(tabId, { isolated, main: consoleMode === "off" ? "skipped" : main ?? "ok", at: Date.now() });
+  const isolated = await chrome.scripting
+    .executeScript({ target: { tabId, allFrames: true }, files: ["vendor/bb-watch.js"] })
+    .then(() => "ok")
+    .catch((e) => String(e?.message ?? e).slice(0, 200));
+  let main = "skipped";
+  if (consoleMode !== "off") {
+    // The MAIN-world shim needs each frame's own channel secret, which only its isolated watcher has.
+    try {
+      const rs = await chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        func: () => (window as any).__bbWatch?.mainNonce ?? null,
+      } as chrome.scripting.ScriptInjection<any, any>);
+      const frames = ((rs ?? []) as any[])
+        .filter((r: any) => typeof r?.result === "string")
+        .map((r: any) => ({ frameId: r.frameId as number, nonce: r.result as string }));
+      main = frames.length ? await injectWatchMain(tabId, frames, consoleMode) : "no watcher to pair with";
+    } catch (e) {
+      main = String((e as any)?.message ?? e).slice(0, 200);
+    }
+  }
+  lastInject.set(tabId, { isolated, main, at: Date.now() });
   // Arm EXPLICITLY. The content script is registered on <all_urls> and persists, so on any tab that
   // loaded before this watch existed it already ran its hello handshake, was told "not armed", and
   // went dormant. Re-injecting does not revive it - the idempotence guard makes that a no-op - so
@@ -5772,24 +5814,9 @@ chrome.tabs.onActivated.addListener((info) => {
     );
   });
 });
-// SPA route changes seen from the browser side, belt-and-braces with the page's own history patch
-// (which only exists when console:true registered the MAIN-world script).
-chrome.webNavigation.onCommitted.addListener((d) => {
-  if (d.frameId !== 0) return;
-  void ready().then(() => {
-    const g = watchForTab(d.tabId);
-    if (!g || g.consoleMode === "off") return;
-    // A fresh document has no shim: it is injected as an inline function, not a registered script.
-    chrome.scripting
-      .executeScript({
-        target: { tabId: d.tabId, allFrames: true },
-        func: bbWatchMainShim,
-        args: [g.consoleMode],
-        world: "MAIN",
-      } as chrome.scripting.ScriptInjection<any, any>)
-      .catch(() => undefined);
-  });
-});
+// (The MAIN-world shim for a fresh document is injected from the bb-watch-hello handshake, paired
+// with the secret that document's isolated watcher chose - see injectWatchMain.)
+// SPA route changes seen from the browser side, belt-and-braces with the page's own history patch.
 chrome.webNavigation.onHistoryStateUpdated.addListener((d) => {
   if (d.frameId !== 0) return;
   void ready().then(() => {
@@ -5841,6 +5868,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const tabId = sender.tab?.id;
     void ready().then(() => {
       const g = tabId != null ? watchForTab(tabId) : undefined;
+      if (g && g.consoleMode !== "off" && tabId != null && sender.frameId != null && typeof msg.mainNonce === "string") {
+        void injectWatchMain(tabId, [{ frameId: sender.frameId, nonce: msg.mainNonce }], g.consoleMode).then((main) => {
+          if (sender.frameId === 0) lastInject.set(tabId, { isolated: "ok", main, at: Date.now() });
+        });
+      }
       sendResponse({ ok: true, armed: !!g, watchId: g?.watchId, consoleMode: g?.consoleMode });
     });
     return true; // async: hydration may still be in flight right after an SW restart
