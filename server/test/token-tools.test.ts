@@ -143,3 +143,28 @@ test("updateClaudeConfigFile keeps a symlinked config a symlink and edits its ta
   assert.ok(!readFileSync(real, "utf8").includes(OLD) || JSON.stringify(after).includes(`Bearer ${OLD}`), "only bridge entries changed");
   assert.equal(after.projects["/Users/x/proj"].mcpServers.other.headers.Authorization, `Bearer ${OLD}`, "non-bridge entry untouched");
 });
+
+test("updateTextConfigFile rewrites a Codex http_headers Bearer, keeps mode and a 0600 .bak, honours dry-run", () => {
+  const { updateTextConfigFile } = tt as any;
+  const d = tmp();
+  const f = join(d, "config.toml");
+  const before =
+    `model = "x"\n\n[mcp_servers.browser-bridge]\nurl = "http://127.0.0.1:8765/mcp"\n` +
+    `http_headers = { "Authorization" = "Bearer ${OLD}" }\n\n[mcp_servers.other]\nurl = "http://x"\n`;
+  writeFileSync(f, before);
+  chmodSync(f, 0o600);
+  const dry = updateTextConfigFile(f, OLD, NEW, { dryRun: true });
+  assert.equal(dry.replaced, 1);
+  assert.equal(readFileSync(f, "utf8"), before, "dry-run must not write");
+  assert.equal(existsSync(`${f}.bak`), false);
+  const real = updateTextConfigFile(f, OLD, NEW);
+  assert.equal(real.replaced, 1);
+  const after = readFileSync(f, "utf8");
+  assert.ok(after.includes(`Bearer ${NEW}`) && !after.includes(OLD), "old token replaced by the new one");
+  assert.equal(after.replace(NEW, OLD), before, "nothing else in the file changed");
+  assert.equal(mode(f), 0o600);
+  assert.equal(mode(`${f}.bak`), 0o600);
+  assert.equal(readFileSync(`${f}.bak`, "utf8"), before);
+  assert.deepEqual(updateTextConfigFile(join(d, "missing.toml"), OLD, NEW), { path: join(d, "missing.toml"), exists: false, replaced: 0 });
+  assert.equal(updateTextConfigFile(f, OLD, NEW).replaced, 0, "second run finds nothing to replace");
+});

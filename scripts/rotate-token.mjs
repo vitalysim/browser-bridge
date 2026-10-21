@@ -5,7 +5,8 @@
 //
 // - writes a new random token to ~/.browser-bridge/token (0600, atomic), keeping the current one as
 //   ~/.browser-bridge/token.prev (0600) for rollback (`mv token.prev token`);
-// - --update-claude-configs: also rewrites literal `"Authorization": "Bearer <old>"` headers of
+// - --update-claude-configs: also rewrites literal `Bearer <old>` headers in ~/.codex/config.toml, and
+//   the literal `"Authorization": "Bearer <old>"` headers of
 //   browser-bridge MCP entries in ~/.claude.json and ~/.claude-shadow/.claude.json (a .bak copy of
 //   each changed file is written first). Entries that use an env var (e.g. ${BROWSER_BRIDGE_TOKEN})
 //   are reported, not changed;
@@ -14,7 +15,7 @@
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync } from "fs";
-import { newToken, readTokenFile, rotateTokenFile, updateClaudeConfigFile } from "./lib/token-tools.mjs";
+import { newToken, readTokenFile, rotateTokenFile, updateClaudeConfigFile, updateTextConfigFile } from "./lib/token-tools.mjs";
 
 const args = process.argv.slice(2);
 const dryRun = args.includes("--dry-run");
@@ -22,6 +23,8 @@ const updateConfigs = args.includes("--update-claude-configs");
 const dataDir = (args.find((a) => a.startsWith("--data-dir=")) || "").split("=")[1] || join(homedir(), ".browser-bridge");
 const tokenFile = join(dataDir, "token");
 const configFiles = [join(homedir(), ".claude.json"), join(homedir(), ".claude-shadow", ".claude.json")];
+// Literal `Bearer <token>` headers in text configs (Codex re-reads its config on every launch).
+const textConfigFiles = [join(homedir(), ".codex", "config.toml")];
 
 if (process.env.BRIDGE_TOKEN) {
   console.warn("! BRIDGE_TOKEN is set in this environment; a server started with it ignores the token file.");
@@ -54,6 +57,12 @@ if (updateConfigs) {
       for (const c of r.changed) console.log(`    - ${c}`);
     } else console.log(`  ${f}: no literal browser-bridge Bearer header with the current token`);
     for (const e of r.envBased) console.log(`  · ${e} - not changed; open a new shell after updating the variable`);
+  }
+  for (const f of textConfigFiles) {
+    const r = updateTextConfigFile(f, oldToken, token, { dryRun });
+    if (!r.exists) continue;
+    if (r.replaced) console.log(`${dryRun ? "  would update" : "✓ updated"} ${r.replaced} Bearer header(s) in ${f}${r.backup ? ` (backup: ${r.backup})` : ""}`);
+    else console.log(`  ${f}: no literal Bearer header with the current token`);
   }
 }
 

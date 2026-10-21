@@ -130,6 +130,27 @@ export function updateClaudeConfigFile(path, oldToken, newToken, { dryRun = fals
   return { path, exists: true, ...report, backup: !dryRun && report.changed.length ? `${path}.bak` : undefined };
 }
 
+/**
+ * Text configs that hold the token as a literal `Bearer <token>` header (e.g. ~/.codex/config.toml's
+ * `http_headers = { "Authorization" = "Bearer …" }`, which Codex re-reads on every launch, unlike an env
+ * var captured by a long-lived shell). Replaces every `Bearer <old>` with `Bearer <new>`; never prints
+ * either value. Writes a 0600 .bak copy first and keeps the file's mode (and a symlink stays a symlink).
+ */
+export function updateTextConfigFile(path, oldToken, newToken, { dryRun = false } = {}) {
+  if (!existsSync(path)) return { path, exists: false, replaced: 0 };
+  if (!oldToken) return { path, exists: true, replaced: 0 };
+  const text = readFileSync(path, "utf8");
+  const needle = `Bearer ${oldToken}`;
+  const replaced = text.split(needle).length - 1;
+  if (!dryRun && replaced) {
+    const fresh = readFileSync(path, "utf8"); // narrow the race with a running client rewriting it
+    const mode = statSync(path).mode & 0o777;
+    atomicWrite(`${path}.bak`, fresh, 0o600);
+    atomicWrite(path, fresh.split(needle).join(`Bearer ${newToken}`), mode || 0o600);
+  }
+  return { path, exists: true, replaced, backup: !dryRun && replaced ? `${path}.bak` : undefined };
+}
+
 /** server.log, server.log.1 …, launchd.log in `dataDir`. */
 export function logFiles(dataDir) {
   let names = [];
