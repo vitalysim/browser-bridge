@@ -1,0 +1,16 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Core Wait</title></head>
+<body>
+<div id="status">idle</div>
+<div id="spinner">Loading spinner</div>
+<div id="doomed">Doomed node</div>
+<script>
+  // Driven by the test: each schedules one change after `ms`.
+  window.showLater = (ms) => setTimeout(() => {
+    const b = document.createElement("button"); b.id = "late-btn"; b.textContent = "Proceed to checkout";
+    document.body.appendChild(b);
+    const p = document.createElement("p"); p.textContent = "Order #4242 confirmed"; document.body.appendChild(p);
+  }, ms);
+  window.hideLater = (ms) => setTimeout(() => { document.getElementById("spinner").style.display = "none"; }, ms);
+  window.removeLater = (ms) => setTimeout(() => { document.getElementById("doomed").remove(); }, ms);
+</script>
+</body></html>

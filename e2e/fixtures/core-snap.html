@@ -1,0 +1,20 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Core Snapshot</title>
+<style>#modal{position:fixed;inset:20% 20%;background:#fff;border:2px solid #000;padding:20px;z-index:10}</style></head>
+<body>
+<button id="alpha">Alpha action</button>
+<button id="beta">Beta action</button>
+<a href="#gamma" id="gamma">Gamma link</a>
+<input id="search" aria-label="Search box">
+<div id="host"></div>
+<div style="height:3000px"></div>
+<button id="below">Below the fold</button>
+<div id="modal" role="dialog" aria-modal="true" aria-label="Confirm purchase" hidden>
+  <button id="modal-ok">Modal OK</button><button id="modal-cancel">Modal Cancel</button>
+</div>
+<script>
+  const sr = document.getElementById("host").attachShadow({ mode: "closed" });
+  sr.innerHTML = '<button id="closed-btn">Closed shadow button</button>';
+  sr.getElementById("closed-btn").addEventListener("click", () => { window.__closedClicks = (window.__closedClicks || 0) + 1; });
+  window.openModal = () => { document.getElementById("modal").hidden = false; };
+</script>
+</body></html>

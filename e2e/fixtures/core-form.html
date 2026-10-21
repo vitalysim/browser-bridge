@@ -1,0 +1,58 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Core Form</title>
+<style>#sugg li{padding:2px}</style></head>
+<body>
+<form id="f" onsubmit="event.preventDefault(); window.__submitted = (window.__submitted||0)+1; window.__submittedValue = document.getElementById('name').value;">
+  <label>Name <input id="name" name="name"></label>
+  <label>Second <input id="second"></label>
+  <label>Third <input id="third"></label>
+  <button id="submit" type="submit">Submit form</button>
+</form>
+<label>City <input id="ac" autocomplete="off"></label>
+<ul id="sugg"></ul>
+<p><button id="btn-alert" onclick="alert('core alert'); window.__alertDone = true">Show alert</button>
+<button id="btn-confirm" onclick="window.__confirm = confirm('core confirm?')">Show confirm</button>
+<button id="btn-prompt" onclick="window.__prompt = prompt('core prompt?', 'default')">Show prompt</button>
+<button id="btn-plain" onclick="window.__plainClicks = (window.__plainClicks||0)+1; document.getElementById('plain-out').textContent='clicked ' + window.__plainClicks">Plain button</button></p>
+<p id="plain-out"></p>
+<input id="file" type="file" onchange="window.__file = this.files[0] ? {name: this.files[0].name, size: this.files[0].size, type: this.files[0].type} : null; this.files[0] && this.files[0].text().then(t => window.__fileText = t)">
+<div id="editor" contenteditable="true" style="min-height:60px;border:1px solid #888">edit here</div>
+<script>
+  window.__keys = []; window.__ac = { keydowns: [], inputs: 0, trusted: [] };
+  const CITIES = ["Paris", "Parma", "Prague", "Porto", "Lisbon"];
+  const ac = document.getElementById("ac");
+  // Typeahead that only reacts per keystroke: a bare value set (no keydown) yields no suggestions.
+  let typed = "";
+  ac.addEventListener("keydown", (e) => {
+    window.__ac.keydowns.push(e.key); window.__ac.trusted.push(e.isTrusted);
+    if (e.key.length === 1) typed += e.key; else if (e.key === "Backspace") typed = typed.slice(0, -1);
+  });
+  ac.addEventListener("input", () => {
+    window.__ac.inputs++;
+    const q = typed.toLowerCase();
+    const ul = document.getElementById("sugg");
+    ul.innerHTML = "";
+    if (!q) return;
+    for (const c of CITIES.filter((c) => c.toLowerCase().startsWith(q))) {
+      const li = document.createElement("li"); li.textContent = c; ul.appendChild(li);
+    }
+  });
+  document.addEventListener("keydown", (e) => {
+    window.__keys.push({ key: e.key, ctrl: e.ctrlKey, shift: e.shiftKey, alt: e.altKey, meta: e.metaKey, trusted: e.isTrusted, target: e.target && e.target.id });
+    if (e.key === "Escape") window.__escape = (window.__escape || 0) + 1;
+  });
+  const ed = document.getElementById("editor");
+  window.__paste = null;
+  ed.addEventListener("paste", (e) => {
+    const dt = e.clipboardData;
+    const files = dt ? [...dt.files].map((f) => ({ name: f.name, type: f.type, size: f.size })) : [];
+    window.__paste = { types: dt ? [...dt.types] : [], html: dt ? dt.getData("text/html") : "", text: dt ? dt.getData("text/plain") : "", files, trusted: e.isTrusted };
+    if (files.length) {
+      e.preventDefault();
+      const img = document.createElement("img"); img.id = "pasted-img";
+      img.src = URL.createObjectURL(dt.files[0]);
+      img.onload = () => { window.__imgSize = { w: img.naturalWidth, h: img.naturalHeight }; };
+      ed.appendChild(img);
+    }
+  });
+</script>
+</body></html>
