@@ -2180,9 +2180,12 @@ async function cdpScreenshot(tab: chrome.tabs.Tab, params: any): Promise<any> {
     const q: number[] = model.border; // [x1,y1,x2,y2,x3,y3,x4,y4]
     const xs = [q[0], q[2], q[4], q[6]];
     const ys = [q[1], q[3], q[5], q[7]];
+    // DOM.getBoxModel quads are relative to the main frame's VIEWPORT, but Page.captureScreenshot's
+    // clip (with captureBeyondViewport) is in DOCUMENT coordinates - add the scroll offset, exactly
+    // like the viewport branch below (and Puppeteer's ElementHandle.screenshot) does.
     const x = Math.min(...xs);
     const y = Math.min(...ys);
-    clip = { x, y, width: Math.max(...xs) - x, height: Math.max(...ys) - y, scale: clipScale };
+    clip = { x: x + (pd.sx || 0), y: y + (pd.sy || 0), width: Math.max(...xs) - x, height: Math.max(...ys) - y, scale: clipScale };
   } else if (params.fullPage) {
     if (pd.sw * scale > SHOT_MAX_PX || pd.sh * scale > SHOT_MAX_PX) {
       throw new Error(`Page too large for a single capture (${pd.sw}x${pd.sh} @${scale}x, limit ${SHOT_MAX_PX}px). Use a selector, a smaller scale, or capture regions.`);
