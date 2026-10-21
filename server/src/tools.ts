@@ -1078,6 +1078,8 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       "net_get_requests) or an ad-hoc {url,method,headers,body}; optional overrides {url,method,headers,body}. " +
       "A captured request is replayed with ALL its headers fetch() can set (Authorization, CSRF, x-*, Accept...; " +
       "not Cookie/Host/Origin/sec-*/hop-by-hop); an override header set to \"\" removes it. " +
+      "Overriding the url to another host still sends those captured headers (incl. Authorization) there, and the " +
+      "default session identity uses credentials:'include', so the target host's own cookies go too. " +
       "Set identity to send as a captured identity or 'anon' (strips cookies/bearer) - this uses the CDP Fetch " +
       "path to override forbidden headers like Cookie. Returns {status,headers,body}. Shows the banner when identity/forbidden headers are used.",
     {
