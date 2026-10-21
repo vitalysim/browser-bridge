@@ -1,0 +1,27 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Record login</title>
+<style>body{font-family:sans-serif;background:#eef6ff;margin:24px} input,button{display:block;margin:8px 0;font-size:16px;padding:6px}</style></head>
+<body>
+<h1>PAGE-ONE-MARKER</h1>
+<form id="login" action="record-done.html" method="post">
+  <label for="user">Username</label>
+  <input id="user" name="user" type="text" autocomplete="username">
+  <label for="pass">Password</label>
+  <input id="pass" name="pass" type="password" autocomplete="current-password">
+  <label><input id="remember" name="remember" type="checkbox" value="yes"> Remember me</label>
+  <button id="submit" type="submit">Sign in</button>
+</form>
+<button id="load" type="button">Load data</button>
+<p id="out">not loaded</p>
+<button id="boom" type="button" onclick="setTimeout(() => { throw new Error('RECORD-BOOM-5150') }, 0)">Boom</button>
+<button id="ping" type="button" onclick="this.textContent = 'Pinged ' + (++window.__pings)">Ping</button>
+<a id="next" href="record-page2.html">Next page</a>
+<a id="popup" href="record-page2.html?popup=1" target="_blank">Open in new tab</a>
+<script>
+  window.__pings = 0;
+  document.getElementById('load').addEventListener('click', async () => {
+    const r = await fetch('record-data.txt?from=load');
+    document.getElementById('out').textContent = (await r.text()).trim();
+  });
+</script>
+</body></html>
