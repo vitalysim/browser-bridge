@@ -25,7 +25,7 @@ export class CaptureSink {
   // call that created it, rather than surfacing later on an async write mid-stream.
   constructor(path: string) {
     this.path = path;
-    this.fd = openSync(path, "w"); // throws on invalid dir / no permission → caught by the caller
+    this.fd = openSync(path, "w", 0o600); // owner-only (captures hold cookies/auth headers); throws on a bad path → caught by the caller
   }
 
   append(entries: any[]): void {
