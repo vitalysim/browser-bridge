@@ -1,0 +1,14 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>wait for text</title></head>
+<body>
+<h1>Processing</h1>
+<div id="status">Please wait</div>
+<script>
+  setTimeout(() => {
+    const p = document.createElement("p");
+    p.id = "late";
+    p.textContent = "Payment complete";
+    document.body.appendChild(p);
+  }, 1500);
+</script>
+</body></html>

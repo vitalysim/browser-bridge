@@ -1,0 +1,34 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>custom controls</title>
+<style>
+  /* A "styled checkbox": the real input is invisible, the label paints the box. */
+  .cb{position:relative;display:inline-flex;align-items:center;gap:8px;cursor:pointer;padding:6px}
+  .cb input{position:absolute;opacity:0;width:1px;height:1px;margin:0}
+  .cb .box{width:18px;height:18px;border:2px solid #333;display:inline-block}
+  .cb input:checked + .box{background:#333}
+  [role=listbox]{list-style:none;padding:0;border:1px solid #999;width:200px}
+  [role=option]{padding:6px;cursor:pointer}
+  [role=option][aria-selected=true]{background:#def}
+  #clicky{cursor:pointer;padding:8px;border:1px dashed #666;width:200px}
+</style></head>
+<body>
+<h1>Custom controls</h1>
+<label class="cb" id="terms-label"><input type="checkbox" id="terms"><span class="box"></span><span>Accept terms</span></label>
+<ul role="listbox" id="fruit" aria-label="Fruit">
+  <li role="option" id="opt-apple" aria-selected="false">Apple</li>
+  <li role="option" id="opt-banana" aria-selected="false">Banana</li>
+</ul>
+<div id="clicky" onclick="window.__divClicked = true">Clickable div card</div>
+<details id="more"><summary>More info</summary><p>Hidden details text</p></details>
+<script>
+  window.__divClicked = false;
+  window.__fruit = null;
+  for (const o of document.querySelectorAll("[role=option]")) {
+    o.addEventListener("click", () => {
+      for (const x of document.querySelectorAll("[role=option]")) x.setAttribute("aria-selected", "false");
+      o.setAttribute("aria-selected", "true");
+      window.__fruit = o.textContent.trim();
+    });
+  }
+</script>
+</body></html>
