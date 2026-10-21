@@ -403,7 +403,10 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
             return await handler(args, extra);
           } finally {
             const sess = (args?.tabId !== undefined ? watchRegistry.forTab(args.tabId) : undefined) ?? watchRegistry.sole();
-            sess?.noteAgentCall(from, Date.now() + AGENT_ACTION_SLACK_MS);
+            // Trusted (debugger-driven) input produces isTrusted events just like the human's, so the
+            // window may claim those; synthetic input is identified by isTrusted:false alone.
+            const trustedInput = !!args?.trusted || name === "input" || name === "paste_html";
+            sess?.noteAgentCall(from, Date.now() + AGENT_ACTION_SLACK_MS, trustedInput);
           }
         }
       : handler;
@@ -2000,6 +2003,21 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         // window: the extension is about to re-announce and the page is still holding its events.
         // Don't throw "No watch session" - signal reset so the agent re-syncs once it re-adopts.
         const wantId = args.watchId ?? parseCursor(args.since).watchId;
+        const stopped = wantId ? watchRegistry.stoppedInfo(wantId) : undefined;
+        if (wantId && stopped) {
+          const res = {
+            stopped: true,
+            watchId: wantId,
+            actions: [] as unknown[],
+            totalActions: stopped.actions,
+            digestPath: stopped.digestPath ?? undefined,
+            note: stopped.digestPath
+              ? `This watch was stopped. Read its full timeline with watch_read({file: ${JSON.stringify(stopped.digestPath)}}), or call watch_start for a new one.`
+              : "This watch was stopped (it kept no digest file). Call watch_start for a new one.",
+          };
+          if (args.format === "json") return textResult(res);
+          return textResult(`WATCH  stopped  ${wantId}  ${res.note}`);
+        }
         if (wantId) {
           const meta = {
             nextCursor: args.since ?? "",

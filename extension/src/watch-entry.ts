@@ -302,7 +302,7 @@
       const hit = actual(e);
       const el = ref(interactive(hit));
       if (!el) return;
-      push({ t: now(), k: "click", el, button: (e as MouseEvent).button, x: Math.round((e as MouseEvent).clientX), y: Math.round((e as MouseEvent).clientY) });
+      push({ t: now(), k: "click", tr: e.isTrusted, el, button: (e as MouseEvent).button, x: Math.round((e as MouseEvent).clientX), y: Math.round((e as MouseEvent).clientY) });
     },
     true
   );
@@ -315,7 +315,7 @@
       if (!h) return;
       const i = h as HTMLInputElement;
       const value = i.isContentEditable ? clean(h.innerText, 500) : String(i.value ?? "").slice(0, 500);
-      push({ t: now(), k: "input", el: ref(h), value, checked: i.type === "checkbox" || i.type === "radio" ? i.checked : undefined });
+      push({ t: now(), k: "input", tr: e.isTrusted, el: ref(h), value, checked: i.type === "checkbox" || i.type === "radio" ? i.checked : undefined });
     },
     true
   );
@@ -327,7 +327,7 @@
       const h = actual(e);
       if (!h) return;
       const i = h as HTMLInputElement;
-      push({ t: now(), k: "change", el: ref(h), value: String(i.value ?? "").slice(0, 500), checked: i.type === "checkbox" || i.type === "radio" ? i.checked : undefined });
+      push({ t: now(), k: "change", tr: e.isTrusted, el: ref(h), value: String(i.value ?? "").slice(0, 500), checked: i.type === "checkbox" || i.type === "radio" ? i.checked : undefined });
     },
     true
   );
@@ -355,7 +355,7 @@
       } catch {
         /* exotic form */
       }
-      push({ t: now(), k: "submit", el: ref(form), fields });
+      push({ t: now(), k: "submit", tr: e.isTrusted, el: ref(form), fields });
     },
     true
   );
@@ -369,7 +369,7 @@
       // carries the typed text, and a per-character stream is both noisy and the password-leak path.
       const printable = ke.key && ke.key.length === 1 && !ke.ctrlKey && !ke.metaKey && !ke.altKey;
       if (printable) return;
-      push({ t: now(), k: "key", key: ke.key, code: ke.code, ctrl: ke.ctrlKey, meta: ke.metaKey, alt: ke.altKey, shift: ke.shiftKey, el: ref(actual(e)) });
+      push({ t: now(), k: "key", tr: e.isTrusted, key: ke.key, code: ke.code, ctrl: ke.ctrlKey, meta: ke.metaKey, alt: ke.altKey, shift: ke.shiftKey, el: ref(actual(e)) });
     },
     true
   );

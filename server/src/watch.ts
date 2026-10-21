@@ -36,6 +36,9 @@ export interface ElementRef {
 /** One raw event off the wire. `k` is the discriminator; the rest is per-kind. */
 export interface RawEvent {
   t: number; // Date.now() in the page
+  /** Event.isTrusted for click/input/change/submit/key: false = dispatched by script (the agent's
+   *  synthetic actions), true = real input (the human, or the agent's debugger-driven trusted input). */
+  tr?: boolean;
   /** Per-event id, unique within a page document. Lets the server drop a re-delivered event (the
    *  pagehide force-flush and any retry can send an event twice). Absent on SW-originated events. */
   i?: string;
@@ -138,6 +141,8 @@ export interface BaseAction {
   causedBy?: number;
   /** True when this came from an agent tool call rather than the human (see WatchSession.noteAgentCall). */
   agent?: boolean;
+  /** Event.isTrusted of the underlying page event(s), when the page reported it (see RawEvent.tr). */
+  trusted?: boolean;
 }
 
 export interface NavAction extends BaseAction {
@@ -279,6 +284,8 @@ export function defaultFoldOpts(over: Partial<FoldOpts> = {}): FoldOpts {
 }
 
 interface InputBurst {
+  /** false once any event in the run was untrusted (see RawEvent.tr). */
+  trusted?: boolean;
   key: string;
   tabId: number;
   frameId?: number;
@@ -301,6 +308,8 @@ interface ScrollRun {
 }
 
 interface KeyRun {
+  /** false once any event in the run was untrusted (see RawEvent.tr). */
+  trusted?: boolean;
   tabId: number;
   frameId?: number;
   text: string;
@@ -395,6 +404,7 @@ function finalizeInput(state: FoldState, out: Staged[]): void {
   };
   if (secret) action.redacted = true;
   if (b.checked !== undefined) action.checked = b.checked;
+  if (b.trusted !== undefined) action.trusted = b.trusted;
   out.push(action);
 }
 
@@ -421,6 +431,7 @@ function finalizeKeyRun(state: FoldState, out: Staged[]): void {
     target: k.el,
   };
   if (k.count > 1) a.repeat = k.count;
+  if (k.trusted !== undefined) a.trusted = k.trusted;
   out.push(a);
 }
 
@@ -463,6 +474,7 @@ export function foldEvent(state: FoldState, env: EventEnvelope, ev: RawEvent): S
         };
       }
       const b = state.input!;
+      if (ev.tr !== undefined) b.trusted = b.trusted === false ? false : ev.tr;
       b.last = ev.t;
       b.value = ev.value ?? "";
       if (ev.checked !== undefined) b.checked = ev.checked;
@@ -480,7 +492,7 @@ export function foldEvent(state: FoldState, env: EventEnvelope, ev: RawEvent): S
       finalizeAll(state, out);
       if (!inc.has("click") || !ev.el) break;
       const button = ev.button === 2 ? "right" : ev.button === 1 ? "middle" : "left";
-      out.push({ ...base, kind: "click", target: ev.el, button, x: ev.x, y: ev.y });
+      out.push({ ...base, kind: "click", target: ev.el, button, x: ev.x, y: ev.y, ...(ev.tr !== undefined ? { trusted: ev.tr } : {}) });
       break;
     }
 
@@ -492,11 +504,12 @@ export function foldEvent(state: FoldState, env: EventEnvelope, ev: RawEvent): S
         .map((f) => ({
           name: f.name,
           value:
-            f.secret || state.opts.redact === "all" || (state.opts.redact === "auto" && SECRET_NAME.test(f.name))
+            state.opts.redact !== "none" &&
+            (f.secret || state.opts.redact === "all" || (state.opts.redact === "auto" && SECRET_NAME.test(f.name)))
               ? redactValue(f.value ?? "")
               : f.value ?? "",
         }));
-      out.push({ ...base, kind: "submit", target: ev.el, fields: fields.length ? fields : undefined });
+      out.push({ ...base, kind: "submit", target: ev.el, fields: fields.length ? fields : undefined, ...(ev.tr !== undefined ? { trusted: ev.tr } : {}) });
       break;
     }
 
@@ -510,6 +523,7 @@ export function foldEvent(state: FoldState, env: EventEnvelope, ev: RawEvent): S
       if (run && run.text === text && run.tabId === env.tabId) {
         run.last = ev.t;
         run.count++;
+        if (ev.tr !== undefined) run.trusted = run.trusted === false ? false : ev.tr;
       } else {
         finalizeKeyRun(state, out);
         state.keyRun = {
@@ -521,6 +535,7 @@ export function foldEvent(state: FoldState, env: EventEnvelope, ev: RawEvent): S
           last: ev.t,
           count: 1,
           el: ev.el,
+          trusted: ev.tr,
         };
       }
       break;
@@ -867,7 +882,7 @@ export class WatchSession {
   private history = new Map<number, Action[]>();
   private static readonly HISTORY_MAX = 40;
   /** Windows during which incoming actions are attributed to the agent rather than the human. */
-  private agentCalls: { from: number; to: number }[] = [];
+  private agentCalls: { from: number; to: number; trustedInput: boolean }[] = [];
   /** Recently-seen per-event ids, for dropping a re-delivered page event (pagehide force-flush /
    *  retry can send one twice). A bounded FIFO - order of magnitude larger than any single batch. */
   private seenIds = new Set<string>();
@@ -1017,8 +1032,8 @@ export class WatchSession {
   }
 
   /** Mark a window as agent-driven so the timeline can distinguish the agent's clicks from the human's. */
-  noteAgentCall(from: number, to: number): void {
-    this.agentCalls.push({ from, to });
+  noteAgentCall(from: number, to: number, trustedInput = false): void {
+    this.agentCalls.push({ from, to, trustedInput });
     if (this.agentCalls.length > 200) this.agentCalls.splice(0, this.agentCalls.length - 200);
   }
 
@@ -1046,7 +1061,7 @@ export class WatchSession {
       const ts = Math.max(s.ts, this.lastCommittedTs);
       this.lastCommittedTs = ts;
       const action = { ...s, seq: ++this.seq } as Action;
-      if (this.isAgentWindow(action.ts)) action.agent = true;
+      if (this.isAgentAction(action)) action.agent = true;
       this.linkCause(action);
       this.rememberCause(action);
       this.ring.push(action);
@@ -1059,8 +1074,19 @@ export class WatchSession {
     return committed;
   }
 
-  private isAgentWindow(ts: number): boolean {
-    for (const w of this.agentCalls) if (ts >= w.from && ts <= w.to) return true;
+  /**
+   * Who did it. When the page reported Event.isTrusted, that decides: an untrusted event can only come
+   * from script (the agent's synthetic input), and a trusted one is the human's unless it falls inside an
+   * agent call that itself used real (debugger-driven) input. Without the flag (navigations, network,
+   * older extensions) fall back to the time window. The window alone used to label a human click made
+   * within ~1.5s of any agent call as [agent].
+   */
+  private isAgentAction(a: { ts: number; trusted?: boolean }): boolean {
+    if (a.trusted === false) return true;
+    for (const w of this.agentCalls) {
+      if (a.ts < w.from || a.ts > w.to) continue;
+      if (a.trusted === undefined || w.trustedInput) return true;
+    }
     return false;
   }
 
@@ -1389,9 +1415,20 @@ export class WatchRegistry {
     return [...this.sessions.values()];
   }
 
+  /** Watches stopped in this server's lifetime (bounded), so a later read can say "stopped", not "restart". */
+  private stoppedWatches = new Map<string, { stoppedAt: number; digestPath: string | null; actions: number }>();
+
+  stoppedInfo(watchId: string): { stoppedAt: number; digestPath: string | null; actions: number } | undefined {
+    return this.stoppedWatches.get(watchId);
+  }
+
   remove(watchId: string): void {
     const s = this.sessions.get(watchId);
     if (!s) return;
+    if (s.isStopped) {
+      this.stoppedWatches.set(watchId, { stoppedAt: Date.now(), digestPath: s.digestPath ?? null, actions: s.lastSeq });
+      if (this.stoppedWatches.size > 50) this.stoppedWatches.delete(this.stoppedWatches.keys().next().value!);
+    }
     for (const [tab, id] of [...this.byTab]) if (id === watchId) this.byTab.delete(tab);
     this.sessions.delete(watchId);
   }
