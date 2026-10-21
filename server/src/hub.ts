@@ -6,6 +6,16 @@ import { versionSkewWarning } from "./version.js";
 
 export const CALL_TIMEOUT_MS = 30_000;
 
+// How long hub.call waits for the extension to (re)connect before failing with NO_EXTENSION. The MV3
+// service worker restarts often (dozens of times in one server run) and almost always reconnects within
+// ~1s, so failing instantly turned a routine respawn into a spurious tool error.
+export const RECONNECT_GRACE_MS = 3_000;
+
+export interface HubOptions {
+  /** Override RECONNECT_GRACE_MS (tests). */
+  reconnectGraceMs?: number;
+}
+
 // The `ws` default maxPayload is 100 MiB; a single reply over that closes the socket with 1009 and
 // fails every in-flight call. Raise it generously so a big-but-legitimate frame (MHTML snapshot, HAR
 // export, full-page screenshot) is delivered instead of dropping the whole connection.
@@ -68,7 +78,10 @@ export class ExtensionHub {
   private sessionDoneWaiters = new Map<number, () => void>();
   private closedSessionSinks = new Map<number, CaptureSink>();
 
-  constructor(httpServer: HttpServer, token: string, private version = "0.0.0") {
+  private reconnectGraceMs: number;
+
+  constructor(httpServer: HttpServer, token: string, private version = "0.0.0", opts: HubOptions = {}) {
+    this.reconnectGraceMs = opts.reconnectGraceMs ?? RECONNECT_GRACE_MS;
     const wss = new WebSocketServer({ noServer: true, maxPayload: WS_MAX_PAYLOAD });
 
     httpServer.on("upgrade", (req, socket, head) => {
@@ -147,6 +160,7 @@ export class ExtensionHub {
         return;
       }
       const p = this.pending.get(msg.id);
+      // A late reply for a call that already timed out (or was never ours) is dropped quietly.
       if (!p) return;
       this.pending.delete(msg.id);
       clearTimeout(p.timer);
@@ -388,7 +402,7 @@ export class ExtensionHub {
   // async so pre-send failures (not-connected guard, socket.send throw) reject the returned Promise
   // instead of throwing synchronously - honoring the Promise<any> contract for every .then/.catch caller.
   async call(method: string, params: Record<string, unknown> = {}, timeoutMs = CALL_TIMEOUT_MS): Promise<any> {
-    if (!this.connected) {
+    if (!(await this.waitConnected(this.reconnectGraceMs))) {
       throw new Error(
         "Browser extension is not connected. Make sure Chrome is running, the Browser Bridge " +
           "extension is loaded, and the token in the extension options matches the server token."
@@ -401,9 +415,36 @@ export class ExtensionHub {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        // Tell the extension to stop working on it: its retry/poll loops check for cancellation, and
+        // a reply it still produces is dropped instead of being sent or queued.
+        if (socket.readyState === WebSocket.OPEN) {
+          try {
+            socket.send(JSON.stringify({ type: "cancel", id }));
+          } catch {
+            /* socket going away - nothing to cancel on */
+          }
+        }
         reject(new Error(`Extension call '${method}' timed out after ${timeoutMs}ms`));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer, socket });
+    });
+  }
+
+  /** Resolve true once the extension socket is OPEN, waiting up to `ms` for a reconnect. */
+  private waitConnected(ms: number): Promise<boolean> {
+    if (this.connected) return Promise.resolve(true);
+    if (ms <= 0) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      const off = this.onConnectionChange((c) => {
+        if (!c || !this.connected) return;
+        clearTimeout(timer);
+        off();
+        resolve(true);
+      });
+      const timer = setTimeout(() => {
+        off();
+        resolve(this.connected);
+      }, ms);
     });
   }
 }
