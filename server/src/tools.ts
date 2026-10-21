@@ -494,6 +494,8 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       "cursor:pointer clickables, and visually-hidden checkboxes/radios via their label - including iframes and " +
       "open shadow DOM. RECOMMENDED DEFAULT for finding something to act on. Each element: {ref, tag, role, name, " +
       "type, value, checked/selected/expanded/disabled, inViewport, frameId (child frames)}; empty fields omitted. " +
+      "A NAMELESS element (icon-only button, sidebar item) gets `hint` instead: its tooltip/title, data-testid=..., " +
+      "data-key=..., id=..., or icon:<name> (e.g. icon:play) - use it to pick or build a selector. " +
       "Ordered by priority: open dialogs/popovers first, then in-viewport, then the rest. Result has count/total/" +
       "truncated (+hint) - when truncated, pass a higher limit, filter, or viewportOnly. When a modal is open, " +
       "elements behind it are marked behindModal:true (modalOnly:true drops them). Refs work with click/fill/hover/" +
@@ -503,7 +505,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       tabId: tabIdParam,
       deep: z.boolean().optional().describe("Pierce closed shadow roots via chrome.debugger (shows banner)"),
       limit: z.number().int().min(1).max(2000).optional().describe("Max elements/refs across all frames (default 400, max 2000)"),
-      filter: z.string().optional().describe("Only elements whose tag/role/type/name/value/href contains this text (case-insensitive)"),
+      filter: z.string().optional().describe("Only elements whose tag/role/type/name/hint/value/href contains this text (case-insensitive)"),
       viewportOnly: z.boolean().optional().describe("Only elements currently in the viewport"),
       modalOnly: z.boolean().optional().describe("When a modal dialog is open, list only elements inside it"),
     },

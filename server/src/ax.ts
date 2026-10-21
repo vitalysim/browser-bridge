@@ -16,6 +16,7 @@ export interface AxNode {
   required?: boolean;
   focused?: boolean;
   value?: string; // current value of a textbox/combobox/slider
+  hint?: string; // discovery hint for a nameless interactive node (test id, icon, title, ...)
   children?: AxNode[];
 }
 
@@ -61,7 +62,7 @@ function renderable(n: AxNode, interactiveOnly: boolean): boolean {
 }
 
 function escapeName(s: string): string {
-  return s.replace(/\s+/g, " ").replace(/"/g, '\\"').trim().slice(0, 120);
+  return s.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\s]+/g, " ").replace(/"/g, '\\"').trim().slice(0, 120);
 }
 
 // The bracketed state tokens after the name. Order is fixed so output is stable/diffable.
@@ -102,6 +103,7 @@ function renderNodes(nodes: AxNode[], opts: Required<RenderAxOpts>, depth: numbe
     let line = `${pad}- ${n.role || "generic"}`;
     if (n.name) line += ` "${escapeName(n.name)}"`;
     line += stateTokens(n);
+    if (n.hint && !n.name) line += ` [hint="${escapeName(n.hint)}"]`;
     if (n.ref !== undefined) line += ` [ref=${n.ref}]`;
     if (hasKids) line += ":";
     out.push(line);

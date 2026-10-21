@@ -1126,6 +1126,60 @@ function bbSnapshot(epoch: number, o: { limit: number; viewportOnly: boolean; mo
       } catch {}
       return "";
     };
+    // [name hint] A discovery hint for NAMELESS elements (icon-only buttons, sidebar items): the first
+    // of aria-describedby text, title (self / first descendant), test id (self / nearest descendant),
+    // data-key/-value/-action, name attr, a non-generated id, or the icon's name (lucide-*, fa-*, bi-*,
+    // data-icon, material ligature). NOT part of the ref fingerprint. Keep in sync with hintOf in ax.ts.
+    const AUTO_ID = /^(radix-|react-aria|headlessui-|mui-|rc[-_]|ember\d|:r|«r|_r_|aria-)|[:«»]|\d{3,}|^[0-9a-f-]{16,}$/i;
+    const ICON_SKIP = /^(fa-(solid|regular|light|thin|duotone|brands|sharp|fw|lg|xs|sm|xl|\dx|spin|pulse|border|inverse|stack.*|rotate.*|flip.*)|lucide-icon|bi-icon)$/;
+    const hintOf = (el: Element): string => {
+      const clean = (s: string | null | undefined) => (s || "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\s]+/g, " ").trim().slice(0, 60);
+      const attr = (e: Element | null, a: string) => clean(e ? e.getAttribute(a) : "");
+      const desc = el.getAttribute("aria-describedby");
+      if (desc) {
+        const t = clean(byIds(el, desc));
+        if (t) return t;
+      }
+      const sub = (sel: string): Element | null => {
+        if (safeMatches(el, sel)) return el;
+        try {
+          return el.querySelector(sel);
+        } catch {
+          return null;
+        }
+      };
+      const tt = attr(sub("[title]"), "title");
+      if (tt) return tt;
+      for (const a of ["data-testid", "data-test-id", "data-test", "data-cy", "data-qa"]) {
+        const v = attr(sub(`[${a}]`), a);
+        if (v) return `${a}=${v}`;
+      }
+      for (const a of ["data-key", "data-value", "data-action", "name"]) {
+        const v = attr(el, a);
+        if (v) return `${a}=${v}`;
+      }
+      const id = clean(el.id);
+      if (id && !AUTO_ID.test(id)) return `id=${id}`;
+      const di = attr(sub("[data-icon]"), "data-icon");
+      if (di) return `icon:${di}`;
+      let icons: Element[] = [];
+      try {
+        icons = Array.from(el.querySelectorAll("svg, i, span[class*='icon'], span[class*='material']")).slice(0, 8);
+        if (/^(svg|i)$/i.test(el.tagName)) icons.unshift(el);
+      } catch {}
+      for (const ic of icons) {
+        const cls = (ic.getAttribute("class") || "").split(/\s+/);
+        for (const c of cls) {
+          const m = /^(?:lucide|fa|bi|tabler|ph|ri|mdi|icon)-([a-z0-9-]+)$/i.exec(c);
+          if (m && !ICON_SKIP.test(c)) return `icon:${clean(m[1])}`;
+        }
+        if (cls.some((c) => /^material-(icons|symbols)/.test(c))) {
+          const t = clean(ic.textContent);
+          if (t) return `icon:${t}`;
+        }
+      }
+      return "";
+    };
     const NO_VALUE = /^(checkbox|radio|file|button|submit|reset|image|password|hidden)$/;
     // target = element the ref points at; ctl = the control whose state is reported (a hidden checkbox
     // behind a label: target is the label, ctl the checkbox).
@@ -1137,6 +1191,13 @@ function bbSnapshot(epoch: number, o: { limit: number; viewportOnly: boolean; mo
       const e: any = { tag };
       if (role && role !== tag) e.role = role;
       if (name) e.name = name;
+      else {
+        let h = "";
+        try {
+          h = hintOf(target);
+        } catch {}
+        if (h) e.hint = h;
+      }
       if (ctag === "input") e.type = ((ctl as HTMLInputElement).type || "text").toLowerCase();
       if (tag === "a" && (target as HTMLAnchorElement).href) e.href = (target as HTMLAnchorElement).href.slice(0, 120);
       // value
@@ -1314,7 +1375,7 @@ function bbSnapshot(epoch: number, o: { limit: number; viewportOnly: boolean; mo
       }
       const { e, meta } = entryFor(c.el, c.ctl, c.via);
       if (filter) {
-        const hay = `${e.tag} ${e.role || ""} ${e.type || ""} ${e.name || ""} ${e.value || ""} ${e.href || ""}`.toLowerCase();
+        const hay = `${e.tag} ${e.role || ""} ${e.type || ""} ${e.name || ""} ${e.hint || ""} ${e.value || ""} ${e.href || ""}`.toLowerCase();
         if (!hay.includes(filter)) continue;
       }
       total++;
@@ -4168,6 +4229,8 @@ async function pressKeyTrusted(tab: chrome.tabs.Tab, combo: string): Promise<any
   return { pressed: combo, trusted: true };
 }
 
+const HOVER_REVEAL_WAIT_MS = 1000;
+
 // Run a synthetic interaction with auto-wait actionability retry + trusted escalation.
 // Retries while the element is missing or transiently not-actionable (hidden/disabled) up to
 // params.timeoutMs (default 5000). For click, if the target is COVERED by an overlay, it escalates
@@ -4227,6 +4290,9 @@ async function interact(tab: chrome.tabs.Tab, action: string, ref: number | null
     }
     const retryable = last && (last.notFound || (last.notActionable && last.reason !== "covered"));
     if (!retryable || Date.now() >= deadline || isCancelled(params)) break; // server gave up: stop acting
+    // A 0x0 target inside a visible container is almost always hover-revealed (only a trusted hover
+    // shows it): waiting the full default 5s won't help, so give up after ~1s with the hover hint.
+    if (last.hoverReveal && params.timeoutMs == null && Date.now() >= deadline - timeoutMs + HOVER_REVEAL_WAIT_MS) break;
     await sleep(150);
   }
   // Selector disambiguation info rides along when the selector matched more than one element.

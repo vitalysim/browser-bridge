@@ -24,6 +24,7 @@ export interface AxWalkNode {
   required?: boolean;
   focused?: boolean;
   value?: string;
+  hint?: string; // discovery hint for an interactive node with no accessible name (see hintOf)
   children?: AxWalkNode[];
 }
 
@@ -172,6 +173,66 @@ export function bbAxSnapshot(epoch: number): { url: string; root: AxWalkNode[]; 
     return "";
   };
 
+  // ---- name hint for NAMELESS interactive nodes (icon-only buttons): same rules as hintOf in
+  // background.ts bbSnapshot (keep in sync): aria-describedby text, title (self / first descendant),
+  // test id, data-key/-value/-action, name attr, non-generated id, icon name. Not part of any ref
+  // fingerprint. ----
+  const AUTO_ID = /^(radix-|react-aria|headlessui-|mui-|rc[-_]|ember\d|:r|«r|_r_|aria-)|[:«»]|\d{3,}|^[0-9a-f-]{16,}$/i;
+  const ICON_SKIP = /^(fa-(solid|regular|light|thin|duotone|brands|sharp|fw|lg|xs|sm|xl|\dx|spin|pulse|border|inverse|stack.*|rotate.*|flip.*)|lucide-icon|bi-icon)$/;
+  const hintOf = (el: Element): string => {
+    const clean = (s: string | null | undefined) => (s || "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\s]+/g, " ").trim().slice(0, 60);
+    const attr = (e: Element | null, a: string) => clean(e ? e.getAttribute(a) : "");
+    const desc = el.getAttribute("aria-describedby");
+    if (desc) {
+      const root = el.getRootNode() as Document | ShadowRoot;
+      let t = "";
+      for (const id of desc.split(/\s+/)) {
+        const r = id ? lookupId(root, id) : null;
+        if (r) t += " " + ((r as HTMLElement).innerText || r.textContent || "");
+      }
+      t = clean(t);
+      if (t) return t;
+    }
+    const sub = (sel: string): Element | null => {
+      try {
+        return el.matches(sel) ? el : el.querySelector(sel);
+      } catch {
+        return null;
+      }
+    };
+    const tt = attr(sub("[title]"), "title");
+    if (tt) return tt;
+    for (const a of ["data-testid", "data-test-id", "data-test", "data-cy", "data-qa"]) {
+      const v = attr(sub(`[${a}]`), a);
+      if (v) return `${a}=${v}`;
+    }
+    for (const a of ["data-key", "data-value", "data-action", "name"]) {
+      const v = attr(el, a);
+      if (v) return `${a}=${v}`;
+    }
+    const id = clean(el.id);
+    if (id && !AUTO_ID.test(id)) return `id=${id}`;
+    const di = attr(sub("[data-icon]"), "data-icon");
+    if (di) return `icon:${di}`;
+    let icons: Element[] = [];
+    try {
+      icons = Array.from(el.querySelectorAll("svg, i, span[class*='icon'], span[class*='material']")).slice(0, 8);
+      if (/^(svg|i)$/i.test(el.tagName)) icons.unshift(el);
+    } catch {}
+    for (const ic of icons) {
+      const cls = (ic.getAttribute("class") || "").split(/\s+/);
+      for (const c of cls) {
+        const m = /^(?:lucide|fa|bi|tabler|ph|ri|mdi|icon)-([a-z0-9-]+)$/i.exec(c);
+        if (m && !ICON_SKIP.test(c)) return `icon:${clean(m[1])}`;
+      }
+      if (cls.some((c) => /^material-(icons|symbols)/.test(c))) {
+        const t = clean(ic.textContent);
+        if (t) return `icon:${t}`;
+      }
+    }
+    return "";
+  };
+
   // ---- interactivity (gets a ref) ----
   const INTERACTIVE_ROLE = new Set([
     "link", "button", "checkbox", "radio", "switch", "tab", "menuitem", "menuitemcheckbox",
@@ -283,6 +344,12 @@ export function bbAxSnapshot(epoch: number): { url: string; root: AxWalkNode[]; 
     const name = nameOf(el, role);
     if (name) node.name = name;
     Object.assign(node, statesOf(el, role, tag));
+    if (interactive && !name) {
+      try {
+        const h = hintOf(el);
+        if (h) node.hint = h;
+      } catch {}
+    }
     if (interactive) {
       const r = el.getBoundingClientRect();
       const inVp = r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw;
