@@ -149,3 +149,25 @@ test("a replaced (stale) socket closing does not hold or finalize the live sinks
     await t.cleanup();
   }
 });
+
+test("a persisted capture the extension no longer lists is finalized and its savePath is reusable", async () => {
+  const t = await setup(5_000);
+  try {
+    const path = join(t.dir, "net.jsonl");
+    t.hub.registerCaptureSink(9, new CaptureSink(path));
+    const a = await t.connect();
+    await t.send(a, { type: "capture", tabId: 9, entries: [{ kind: "net", url: "a" }] });
+    await t.drop(a);
+    assert.equal(t.hub.captureSinkPathInUse(path), true, "held open during the grace");
+    // After a worker respawn the debugger session (and so the capture) is gone: hello lists none.
+    await t.connect({ recordings: [], captures: [] });
+    assert.equal(t.hub.sinksHeld, false);
+    assert.equal(t.hub.captureSinkPathInUse(path), false, "a dead capture must not keep its path locked");
+    assert.equal(t.hub.closeCaptureSink(9), undefined, "the dead capture's sink was finalized");
+    t.hub.registerCaptureSink(10, new CaptureSink(path)); // net_capture_start with the same savePath works again
+    assert.equal(t.hub.captureSinkPathInUse(path), true);
+    t.hub.closeCaptureSink(10);
+  } finally {
+    await t.cleanup();
+  }
+});

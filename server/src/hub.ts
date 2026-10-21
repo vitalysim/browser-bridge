@@ -13,6 +13,9 @@ export const CALL_TIMEOUT_MS = 30_000;
 export const WS_AUTH_TIMEOUT_MS = 10_000;
 /** Close code for a failed handshake; the extension shows it as a token mismatch. */
 export const WS_AUTH_FAILED_CLOSE_CODE = 4001;
+/** Close code when the extension never answered the challenge in time (e.g. its worker was suspended
+ *  mid-handshake) - NOT a token problem, so the extension just retries with its normal backoff. */
+export const WS_AUTH_TIMEOUT_CLOSE_CODE = 4002;
 
 // How long hub.call waits for the extension to (re)connect before failing with NO_EXTENSION. The MV3
 // service worker restarts often (dozens of times in one server run) and almost always reconnects within
@@ -29,6 +32,8 @@ export interface HubOptions {
   reconnectGraceMs?: number;
   /** Override SINK_RECONNECT_GRACE_MS (tests). */
   sinkReconnectGraceMs?: number;
+  /** Override WS_AUTH_TIMEOUT_MS (tests). */
+  authTimeoutMs?: number;
 }
 
 // The `ws` default maxPayload is 100 MiB; a single reply over that closes the socket with 1009 and
@@ -95,12 +100,14 @@ export class ExtensionHub {
 
   private reconnectGraceMs: number;
   private sinkReconnectGraceMs: number;
+  private authTimeoutMs: number;
   // Set while the socket is down and capture/session sinks are being held open for a reconnect.
   private sinkGraceTimer: NodeJS.Timeout | null = null;
 
   constructor(httpServer: HttpServer, token: string, private version = "0.0.0", opts: HubOptions = {}) {
     this.reconnectGraceMs = opts.reconnectGraceMs ?? RECONNECT_GRACE_MS;
     this.sinkReconnectGraceMs = opts.sinkReconnectGraceMs ?? SINK_RECONNECT_GRACE_MS;
+    this.authTimeoutMs = opts.authTimeoutMs ?? WS_AUTH_TIMEOUT_MS;
     const wss = new WebSocketServer({ noServer: true, maxPayload: WS_MAX_PAYLOAD });
 
     httpServer.on("upgrade", (req, socket, head) => {
@@ -146,17 +153,18 @@ export class ExtensionHub {
       clearTimeout(timer);
       ws.removeListener("message", onMessage);
     };
-    const fail = (reason: string) => {
+    const fail = (reason: string, code = WS_AUTH_FAILED_CLOSE_CODE) => {
       if (done) return;
       finish();
-      log(`[hub] rejected WS: authentication failed (${reason})`);
+      const timedOut = code === WS_AUTH_TIMEOUT_CLOSE_CODE;
+      log(`[hub] rejected WS: ${timedOut ? "handshake timed out" : "authentication failed"} (${reason})`);
       try {
-        ws.close(WS_AUTH_FAILED_CLOSE_CODE, "authentication failed");
+        ws.close(code, timedOut ? "handshake timed out" : "authentication failed");
       } catch {
         ws.terminate();
       }
     };
-    const timer = setTimeout(() => fail(`no auth reply within ${WS_AUTH_TIMEOUT_MS}ms`), WS_AUTH_TIMEOUT_MS);
+    const timer = setTimeout(() => fail(`no auth reply within ${this.authTimeoutMs}ms`, WS_AUTH_TIMEOUT_CLOSE_CODE), this.authTimeoutMs);
     const onMessage = (data: any, isBinary?: boolean) => {
       if (done) return;
       // A handshake frame is ~250 bytes; anything big or binary from an unauthenticated peer is not one.

@@ -7,9 +7,10 @@ import { bbAct, type BbActParams } from "./dom-act";
 import { CDP_MODS, keyInfo, parseKeyCombo, pickFocusedFrame, matchCdpFrame, type FocusProbe } from "./act-logic";
 import { bbAxSnapshot } from "./ax";
 import { buildReplayHeaders } from "./replay-headers";
+import { bbWatchMainShim } from "./watch-main-shim";
 import { allocateFrameBudgets, assignAxRefs, clampLimit, frameOffsets, pickSelectorTarget, routeRef, SNAPSHOT_DEFAULT_LIMIT, SNAPSHOT_MAX_LIMIT, type LocateMatch, type RefRoute } from "./snapshot-plan";
 import { emulateDevice, emulateNetwork, emulateCpu, emulateLocale, emulateGeolocation, emulateReset, hasEmulation, emulationState, forgetEmulation } from "./emulate.js";
-import { WsAuthClient, WS_AUTH_FAILED_CLOSE_CODE } from "./ws-auth";
+import { WsAuthClient, WS_AUTH_FAILED_CLOSE_CODE, WS_AUTH_TIMEOUT_CLOSE_CODE } from "./ws-auth";
 
 // Injected at build time by build.mjs (esbuild define) from extension/package.json - single
 // source of truth shared with manifest.json, so the version can't drift.
@@ -244,6 +245,11 @@ async function connectNow() {
             gapMs,
           })),
         },
+        // The sinks the server held open across the drop are re-adopted only for what is still live
+        // here; the rest are finalized. After a worker respawn the debugger sessions (and so every
+        // persisted net capture) are gone, while session recordings are restored from storage.session.
+        recordings: [...sessionRecordings.keys()],
+        captures: [...sessions.entries()].filter(([, s]) => s.netOn && s.persist).map(([tabId]) => tabId),
       })
     );
     pumpOutbox(); // whatever was held while the socket was down
@@ -356,6 +362,9 @@ async function connectNow() {
           `this extension (v${VERSION}), and that no other program holds the port. Retrying in ${AUTH_FAILED_RETRY_MS / 1000}s.`
       );
       holdOff();
+    } else if (ev.code === WS_AUTH_TIMEOUT_CLOSE_CODE) {
+      // Not a token problem: our reply didn't reach the server in time. Normal backoff, no hold-off.
+      setStatus("handshake-timeout", "The server's authentication handshake timed out. Retrying automatically.");
     } else if (ev.code === WS_AUTH_FAILED_CLOSE_CODE) {
       setStatus(
         "token-rejected",
@@ -614,9 +623,21 @@ async function registerWatchScripts(withConsole: boolean): Promise<void> {
       persistAcrossSessions: true,
     },
   ];
-  // The MAIN-world shim is NOT registered here: it is injected per-document as an inline function
-  // (see bbWatchMainShim), from each document's hello handshake (injectWatchMain).
+  // The MAIN-world shim loader runs at document_start, before any page script, so it captures pristine
+  // primitives and pairs with the isolated watcher through a handshake the page never sees (see
+  // watch-main-entry.ts). It stays inert until the watcher arms it, so registering it regardless of the
+  // console mode is harmless; documents already open when the watch starts get the inline fallback
+  // (injectWatchMain), which is best-effort - see docs/WATCH.md.
   void withConsole;
+  want.push({
+    id: WATCH_MAIN_SCRIPT_ID,
+    js: ["vendor/bb-watch-main.js"],
+    matches: ["<all_urls>"],
+    allFrames: true,
+    runAt: "document_start",
+    world: "MAIN",
+    persistAcrossSessions: true,
+  } as chrome.scripting.RegisteredContentScript);
   let existing: chrome.scripting.RegisteredContentScript[] = [];
   try {
     existing = await chrome.scripting.getRegisteredContentScripts();
@@ -640,117 +661,6 @@ async function unregisterWatchScripts(): Promise<void> {
 
 /** Registration only covers FUTURE document loads. Sweep the tabs already open so watch mode starts
  *  working on the page the human is looking at, without asking them to reload it. */
-
-/**
- * MAIN-world page-error shim, injected as an INLINE FUNCTION rather than a file.
- *
- * It has to run in the page's own JS world: an isolated-world listener does not receive page script
- * errors (verified - CDP saw an uncaught throw, a rejection and a console.error while an isolated
- * listener saw none). But injecting a FILE into the MAIN world proved unreliable here even with
- * web_accessible_resources set, so this is passed as `func`, which needs no web-accessible resource,
- * no second bundle and no runtime handshake to carry the mode.
- *
- * Must be fully self-contained: it is serialized and evaluated in the page.
- *
- * PASSIVE (always): error / unhandledrejection listeners observe an error AFTER it has unwound, so
- * they add no frame to the page's own stack traces.
- * WRAPPING (mode === "calls" only): replacing console.error/warn DOES sit in the page's call path and
- * puts this extension in the page's stack traces - observed on a real target whose error reporter
- * shipped our filename. Opt-in by name for that reason.
- */
-function bbWatchMainShim(mode: string, nonce: string) {
-  if (typeof nonce !== "string" || nonce.length < 16) return false;
-  const w = window as any;
-  // Install state lives under a key derived from the per-document secret (hashed, so the visible key
-  // does not reveal it): a page can't pre-set it to switch capture off, as it could the old fixed
-  // window.__bbWatchMain flag. Non-configurable so it can't be deleted to force a double install.
-  let h = 2166136261;
-  for (let i = 0; i < nonce.length; i++) h = Math.imul(h ^ nonce.charCodeAt(i), 16777619);
-  const key = "__bbWM_" + (h >>> 0).toString(36);
-  let st = Object.prototype.hasOwnProperty.call(w, key) ? w[key] : null;
-  if (!st || typeof st !== "object") {
-    st = { main: false, hist: false, wrapped: false };
-    try {
-      Object.defineProperty(w, key, { value: st, enumerable: false, configurable: false, writable: false });
-    } catch {
-      return false; // key squatted: refuse rather than double-install
-    }
-  }
-  const type = "bb-watch-main:" + nonce;
-  const Ev = CustomEvent;
-  const dispatch = EventTarget.prototype.dispatchEvent;
-  const relay = (obj: any) => {
-    try {
-      obj.n = nonce;
-      dispatch.call(window, new Ev(type, { detail: JSON.stringify(obj) }));
-    } catch {
-      /* unserializable - drop rather than throw inside the page */
-    }
-  };
-  const fmt = (args: any[]): string =>
-    args
-      .map((a: any) => {
-        if (typeof a === "string") return a;
-        if (a instanceof Error) return a.stack || a.message;
-        try {
-          return JSON.stringify(a);
-        } catch {
-          return String(a);
-        }
-      })
-      .join(" ")
-      .slice(0, 500);
-  const wrapConsole = () => {
-    if (st.wrapped) return;
-    st.wrapped = true;
-    for (const level of ["error", "warn"]) {
-      const orig = (console as any)[level]?.bind(console);
-      if (!orig) continue;
-      (console as any)[level] = (...args: any[]) => {
-        try {
-          relay({ kind: "console", level, text: fmt(args) });
-        } catch {
-          /* never break the page's own logging */
-        }
-        return orig(...args);
-      };
-    }
-  };
-  // SPA route changes are only observable from the MAIN world: history.pushState/replaceState run in
-  // the page's own JS and fire no event an isolated listener can see (popstate/hashchange are the
-  // only ones that reach the isolated world, and pushState is neither). Patch them here and relay to
-  // the isolated watcher, which emits them as via:"spa" navigations. `replace` is carried through so
-  // the fold can leave a search-as-you-type burst intact instead of splitting it per keystroke.
-  const patchHistory = () => {
-    if (st.hist) return;
-    st.hist = true;
-    for (const m of ["pushState", "replaceState"] as const) {
-      const orig = (history as any)[m];
-      if (typeof orig !== "function") continue;
-      (history as any)[m] = function (this: History, ...args: any[]) {
-        const r = orig.apply(this, args);
-        try {
-          relay({ kind: "nav", replace: m === "replaceState" });
-        } catch {
-          /* never break the page's navigation */
-        }
-        return r;
-      };
-    }
-  };
-  if (!st.main) {
-    st.main = true;
-    window.addEventListener("error", (e: any) => {
-      relay({ kind: "console", level: "error", text: String(e.message ?? "").slice(0, 500), src: e.filename, line: e.lineno });
-    });
-    window.addEventListener("unhandledrejection", (e: any) => {
-      relay({ kind: "console", level: "error", text: "Unhandled rejection: " + fmt([e?.reason]) });
-    });
-  }
-  patchHistory();
-  if (mode === "calls") wrapConsole();
-  return true;
-}
 
 /** Inject the MAIN-world shim into specific frames, each with the secret its isolated watcher chose. */
 async function injectWatchMain(tabId: number, frames: { frameId: number; nonce: string }[], mode: string): Promise<string> {
@@ -786,12 +696,15 @@ async function injectWatchNow(tabId: number, consoleMode: "off" | "passive" | "c
     try {
       const rs = await chrome.scripting.executeScript({
         target: { tabId, allFrames: true },
-        func: () => (window as any).__bbWatch?.mainNonce ?? null,
+        // A frame whose document_start shim already paired is armed through the watcher (arm below).
+        func: () => {
+          const b = (window as any).__bbWatch;
+          return b ? { nonce: b.mainNonce ?? null, paired: !!b.mainPaired } : null;
+        },
       } as chrome.scripting.ScriptInjection<any, any>);
-      const frames = ((rs ?? []) as any[])
-        .filter((r: any) => typeof r?.result === "string")
-        .map((r: any) => ({ frameId: r.frameId as number, nonce: r.result as string }));
-      main = frames.length ? await injectWatchMain(tabId, frames, consoleMode) : "no watcher to pair with";
+      const all = ((rs ?? []) as any[]).filter((r: any) => typeof r?.result?.nonce === "string");
+      const frames = all.filter((r: any) => !r.result.paired).map((r: any) => ({ frameId: r.frameId as number, nonce: r.result.nonce as string }));
+      main = frames.length ? await injectWatchMain(tabId, frames, consoleMode) : all.length ? "ok (document_start shim)" : "no watcher to pair with";
     } catch (e) {
       main = String((e as any)?.message ?? e).slice(0, 200);
     }
@@ -2631,7 +2544,7 @@ const KEPT_ALIVE_NOTE =
   "tab is hidden; it was kept rendering for this action (debugger focus emulation) but stops again now - later async updates may not render until it is visible";
 const STALLED_WARNING = "the page rendered no frame within 250ms (requestAnimationFrame did not fire): it may be throttled or busy, so updates can lag";
 
-const keepAlives = new Map<number, { refs: number; ready: Promise<boolean> }>();
+const keepAlives = new Map<number, KeepAliveEntry>();
 
 // Top-frame visibility, bounded short: a page stuck behind a JS dialog can't answer, and that must not
 // add more than a moment to the action. null = unknown.
@@ -2701,24 +2614,30 @@ async function settleFrames(tabId: number, n: number, capMs: number): Promise<bo
   }
 }
 
-async function acquireKeepAlive(tabId: number): Promise<boolean> {
-  const cur = keepAlives.get(tabId);
-  if (cur) {
-    cur.refs++;
-    return cur.ready;
+type KeepAliveEntry = { refs: number; ready: Promise<boolean> };
+
+// Returns the entry this caller holds a reference on (its token for releaseKeepAlive), or null when
+// focus emulation could not be turned on. A caller only ever releases the entry it acquired, so a
+// stale entry (debugger detached and re-attached in between) can't switch emulation off mid-way
+// through another session's action, and a new session never inherits a dead entry.
+async function acquireKeepAlive(tabId: number): Promise<KeepAliveEntry | null> {
+  let entry = keepAlives.get(tabId);
+  if (entry) entry.refs++;
+  else {
+    entry = { refs: 1, ready: cmd(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true }, 3_000).then(() => true, () => false) };
+    keepAlives.set(tabId, entry);
   }
-  const entry = { refs: 1, ready: cmd(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true }, 3_000).then(() => true, () => false) };
-  keepAlives.set(tabId, entry);
-  return entry.ready;
+  if (await entry.ready) return entry;
+  releaseKeepAlive(tabId, entry);
+  return null;
 }
 
-async function releaseKeepAlive(tabId: number): Promise<void> {
-  const cur = keepAlives.get(tabId);
-  if (!cur || --cur.refs > 0) return;
+function releaseKeepAlive(tabId: number, entry: KeepAliveEntry): void {
+  if (--entry.refs > 0 || keepAlives.get(tabId) !== entry) return;
   keepAlives.delete(tabId);
-  if ((await cur.ready) && sessions.has(tabId)) {
-    await cmd(tabId, "Emulation.setFocusEmulationEnabled", { enabled: false }, 3_000).catch(() => {});
-  }
+  void entry.ready.then((on) => {
+    if (on && sessions.has(tabId) && !keepAlives.has(tabId)) void cmd(tabId, "Emulation.setFocusEmulationEnabled", { enabled: false }, 3_000).catch(() => {});
+  });
 }
 
 /**
@@ -2731,14 +2650,13 @@ async function withLiveTab(tab: chrome.tabs.Tab, params: any, trusted: boolean, 
   const tabId = tab.id!;
   const mode: boolean | undefined = typeof params?.keepAlive === "boolean" ? params.keepAlive : undefined;
   const vis = await tabVisibility(tab);
-  let kept = false;
+  let held: KeepAliveEntry | null = null;
   let keepError: string | undefined;
   let rafProbe: Promise<{ hidden: boolean; raf: boolean | null } | null> | null = null;
   if (vis?.hidden && mode !== false && (mode === true || trusted || sessions.has(tabId)) && !isCancelled(params)) {
     try {
       await ensureAttached(tabId);
-      kept = await acquireKeepAlive(tabId);
-      if (!kept) await releaseKeepAlive(tabId);
+      held = await acquireKeepAlive(tabId);
     } catch (e) {
       keepError = e instanceof Error ? e.message : String(e);
     }
@@ -2746,13 +2664,14 @@ async function withLiveTab(tab: chrome.tabs.Tab, params: any, trusted: boolean, 
     // Visible - but is it actually rendering? Checked alongside the action, so it costs nothing extra.
     rafProbe = tabVisibility(tab, 250);
   }
+  const kept = held !== null;
   let result: any;
   try {
     result = await run();
     // Let rAF-scheduled commits (React-Aria & co) land while frames are still being produced.
     if (kept && !isCancelled(params)) await settleFrames(tabId, 2, 300);
   } finally {
-    if (kept) await releaseKeepAlive(tabId);
+    if (held) releaseKeepAlive(tabId, held);
   }
   if (!result || typeof result !== "object" || Array.isArray(result)) return result;
   const addWarning = (w: string) => {
@@ -2762,8 +2681,9 @@ async function withLiveTab(tab: chrome.tabs.Tab, params: any, trusted: boolean, 
     result = { ...result, tabHidden: true };
     if (kept) {
       result.keptAlive = true;
-      result.note = result.note ? `${result.note}; ${KEPT_ALIVE_NOTE}` : KEPT_ALIVE_NOTE;
-    } else {
+      if (!String(result.note ?? "").includes(KEPT_ALIVE_NOTE)) result.note = result.note ? `${result.note}; ${KEPT_ALIVE_NOTE}` : KEPT_ALIVE_NOTE;
+    } else if (!result.keptAlive) {
+      // A nested withLiveTab (e.g. a covered click escalated to trusted) may already have kept it alive.
       addWarning(HIDDEN_TAB_WARNING + (keepError ? ` (keepAlive failed: ${keepError})` : ""));
     }
   } else if (rafProbe) {
@@ -6086,6 +6006,7 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   finalizeCapture(source.tabId); // flush + close the sink (user closed banner / DevTools opened / tab gone)
   sessions.delete(source.tabId);
   forgetEmulation(source.tabId);
+  keepAlives.delete(source.tabId); // focus emulation died with the session; holders release a stale entry harmlessly
   pendingDialogs.delete(source.tabId);
 });
 // A committed top-frame navigation means any dialog the old document showed is gone.
@@ -6097,6 +6018,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   finalizeCapture(tabId);
   sessions.delete(tabId);
   forgetEmulation(tabId);
+  keepAlives.delete(tabId);
   const rec = sessionRecordings.get(tabId);
   if (rec) {
     sessionRecordings.delete(tabId);
@@ -6240,7 +6162,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const tabId = sender.tab?.id;
     void ready().then(() => {
       const g = tabId != null ? watchForTab(tabId) : undefined;
-      if (g && g.consoleMode !== "off" && tabId != null && sender.frameId != null && typeof msg.mainNonce === "string") {
+      if (g && g.consoleMode !== "off" && tabId != null && sender.frameId != null && typeof msg.mainNonce === "string" && !msg.mainPaired) {
         void injectWatchMain(tabId, [{ frameId: sender.frameId, nonce: msg.mainNonce }], g.consoleMode).then((main) => {
           if (sender.frameId === 0) lastInject.set(tabId, { isolated: "ok", main, at: Date.now() });
         });
