@@ -24,10 +24,14 @@ export interface AxFrame {
   url: string;
   root: AxNode[] | null;
   truncated?: boolean; // the in-page walk hit its per-frame node cap
+  refsTotal?: number; // interactive nodes in the frame (present only when some got no ref)
+  refsAssigned?: number; // how many of them got a ref within the snapshot's ref limit
+  modal?: string; // name of an open modal dialog in this frame
 }
 
 export interface AxSnapshot {
   url: string;
+  limit?: number; // the ref limit the snapshot was taken with
   frames: AxFrame[];
 }
 
@@ -122,13 +126,26 @@ export function renderAxTree(nodes: AxNode[] | null, opts: RenderAxOpts = {}): s
  * appended under an `iframe` header (positional nesting inside the parent is not attempted - the
  * child frames are cross-origin islands, listed after the main tree).
  */
+/** The note shown when some interactive nodes of a frame got no ref (ref limit reached). */
+export function refLimitNote(f: AxFrame, limit?: number): string | null {
+  if (f.refsTotal === undefined || f.refsAssigned === undefined || f.refsAssigned >= f.refsTotal) return null;
+  const missing = f.refsTotal - f.refsAssigned;
+  return (
+    `- … (${missing} of ${f.refsTotal} interactive nodes have no ref: ref limit${limit ? ` ${limit}` : ""} reached; ` +
+    `refs went to dialogs, then in-viewport nodes first - pass a higher limit (max 2000), or scroll and re-snapshot)`
+  );
+}
+
 export function renderAxSnapshot(snap: AxSnapshot, opts: RenderAxOpts = {}): string {
   const parts: string[] = [];
   const main = snap.frames.find((f) => f.frameId === 0) ?? snap.frames[0];
   if (main) {
+    if (main.modal) parts.push(`- note: modal dialog "${escapeName(main.modal)}" is open; content behind it is not operable`);
     const body = renderAxTree(main.root, opts);
     if (body) parts.push(body);
     if (main.truncated) parts.push("- … (frame node cap reached; tree truncated)");
+    const note = refLimitNote(main, snap.limit);
+    if (note) parts.push(note);
   }
   for (const f of snap.frames) {
     if (!main || f.frameId === main.frameId) continue;
@@ -137,6 +154,8 @@ export function renderAxSnapshot(snap: AxSnapshot, opts: RenderAxOpts = {}): str
     parts.push(`- iframe "${escapeName(f.url)}":`);
     parts.push(body.replace(/^/gm, "  "));
     if (f.truncated) parts.push("  - … (frame node cap reached; tree truncated)");
+    const note = refLimitNote(f, snap.limit);
+    if (note) parts.push("  " + note);
   }
   const text = parts.join("\n");
   return text || "(no accessible content)";

@@ -369,13 +369,26 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
 
   tool(
     "snapshot",
-    "List the interactive elements on the page (links, buttons, inputs), including inside iframes " +
-      "and open shadow DOM. Each element gets a numeric ref usable with click/fill/hover/type " +
-      "(pass ref as a number, or use a CSS selector instead). Set deep:true to also reach CLOSED " +
-      "shadow roots via the debugger (shows the debugging banner; refs from a deep snapshot must be " +
-      "used with trusted:true actions).",
-    { tabId: tabIdParam, deep: z.boolean().optional().describe("Pierce closed shadow roots via chrome.debugger (shows banner)") },
-    async ({ tabId, deep }) => textResult(await hub.call("snapshot", { tabId, deep }))
+    "List the interactive elements on the page - links, buttons, inputs, selects, ARIA widgets (tab, option, " +
+      "checkbox, switch, combobox, slider, treeitem...), summary, contenteditable, focusable/onclick elements, " +
+      "cursor:pointer clickables, and visually-hidden checkboxes/radios via their label - including iframes and " +
+      "open shadow DOM. RECOMMENDED DEFAULT for finding something to act on. Each element: {ref, tag, role, name, " +
+      "type, value, checked/selected/expanded/disabled, inViewport, frameId (child frames)}; empty fields omitted. " +
+      "Ordered by priority: open dialogs/popovers first, then in-viewport, then the rest. Result has count/total/" +
+      "truncated (+hint) - when truncated, pass a higher limit, filter, or viewportOnly. When a modal is open, " +
+      "elements behind it are marked behindModal:true (modalOnly:true drops them). Refs work with click/fill/hover/" +
+      "type/scroll. Taking ANY snapshot (snapshot or ax_snapshot) invalidates refs from earlier snapshots. " +
+      "deep:true also reaches CLOSED shadow roots via the debugger (banner; deep refs need trusted:true actions).",
+    {
+      tabId: tabIdParam,
+      deep: z.boolean().optional().describe("Pierce closed shadow roots via chrome.debugger (shows banner)"),
+      limit: z.number().int().min(1).max(2000).optional().describe("Max elements/refs across all frames (default 400, max 2000)"),
+      filter: z.string().optional().describe("Only elements whose tag/role/type/name/value/href contains this text (case-insensitive)"),
+      viewportOnly: z.boolean().optional().describe("Only elements currently in the viewport"),
+      modalOnly: z.boolean().optional().describe("When a modal dialog is open, list only elements inside it"),
+    },
+    async ({ tabId, deep, limit, filter, viewportOnly, modalOnly }) =>
+      textResult(await hub.call("snapshot", { tabId, deep, limit, filter, viewportOnly, modalOnly }))
   );
 
   tool(
@@ -590,14 +603,24 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
 
   tool(
     "scroll",
-    "Scroll the page by a pixel delta, or scroll an element into view via selector.",
+    "Scroll the page or a scroll container. With ref/selector and no dy/dx/direction: scroll that element into " +
+      "view. With ref/selector AND dy/dx/direction: scroll the element's nearest scrollable container (inner " +
+      "panes, virtualized lists, Gmail/Slack message lists). With neither: scroll the window - or, if the document " +
+      "itself doesn't scroll (app shells), the scroll container under the viewport center. Returns {scrolled, " +
+      "container:'window'|'tag#id', scrollTop, atStart, atEnd} - atEnd:true means no more content is reachable " +
+      "by scrolling further (yet; infinite lists may load more after a moment).",
     {
-      dy: z.number().optional().describe("Vertical pixels to scroll (positive = down). Default 600."),
-      selector: z.string().optional().describe("If set, scroll this element into view instead"),
+      ref: z.number().optional().describe("Element ref from the latest snapshot"),
+      selector: z.string().optional().describe("CSS selector (searched in all frames; the visible/top-frame match wins)"),
+      dy: z.number().optional().describe("Vertical pixels (positive = down). Default 600 when nothing else is given."),
+      dx: z.number().optional().describe("Horizontal pixels (positive = right)"),
+      direction: z.enum(["up", "down", "left", "right", "top", "bottom"]).optional().describe("Scroll by `amount` (default 80% of the container) or jump to top/bottom"),
+      amount: z.number().optional().describe("Pixels per direction step (default 80% of the container's visible size)"),
       withSnapshot: withSnapshotParam,
       tabId: tabIdParam,
     },
-    async ({ dy, selector, withSnapshot, tabId }) => textResult(await hub.call("scroll", { dy, selector, withSnapshot, tabId }))
+    async ({ ref, selector, dy, dx, direction, amount, withSnapshot, tabId }) =>
+      textResult(await hub.call("scroll", { ref, selector, dy, dx, direction, amount, withSnapshot, tabId }))
   );
 
   tool(
@@ -732,14 +755,28 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
 
   tool(
     "wait_for",
-    "Wait until a CSS selector appears on the page, or just sleep for a duration.",
+    "Wait for an element to reach a state, in any frame and open shadow DOM. Target by selector, text, and/or " +
+      "role(+name) - all given criteria must hold for the same element. state: visible (default), attached, " +
+      "hidden, detached (hidden/detached must hold in every frame). Returns {found, state, elapsedMs, matchCount, " +
+      "tag, name, ref (when the element is in the latest snapshot), frameId}. An invalid selector errors " +
+      "immediately. With no selector/text/role it just sleeps timeoutMs (default 1000ms).",
     {
-      selector: z.string().optional().describe("CSS selector to wait for"),
-      timeoutMs: z.number().optional().describe("Max wait in ms (default 10000)"),
+      selector: z.string().optional().describe("CSS selector"),
+      text: z.string().optional().describe("Visible text the element contains (case-insensitive, whitespace-normalized)"),
+      role: z.string().optional().describe("ARIA role (explicit or implicit), e.g. 'button', 'dialog', 'link'"),
+      name: z.string().optional().describe("With role: accessible-name substring (case-insensitive)"),
+      state: z.enum(["attached", "visible", "hidden", "detached"]).optional().describe("Condition to wait for (default visible)"),
+      timeoutMs: z.number().optional().describe("Max wait in ms (default 10000 with a target; sleep length without one, default 1000)"),
       tabId: tabIdParam,
     },
-    async ({ selector, timeoutMs, tabId }) =>
-      textResult(await hub.call("wait_for", { selector, timeoutMs, tabId }, (timeoutMs ?? 10_000) + 5_000))
+    async ({ selector, text, role, name, state, timeoutMs, tabId }) =>
+      textResult(
+        await hub.call(
+          "wait_for",
+          { selector, text, role, name, state, timeoutMs, tabId },
+          (timeoutMs ?? (selector || text || role ? 10_000 : 1_000)) + 5_000
+        )
+      )
   );
 
   // ---- chrome.debugger (CDP) mode: network capture. Attaching shows Chrome's
@@ -1927,14 +1964,18 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     "ax_snapshot",
     "Compact accessibility tree of the page (role + name + states like checked/expanded/level, " +
       "indented YAML-like, incl. iframes and open shadow DOM). Interactive nodes carry a [ref=N] " +
-      "usable with click/fill/hover/type. Prefer over snapshot for understanding page STRUCTURE and " +
-      "forms; interactiveOnly:true trims to actionable nodes only. See docs/AX-SNAPSHOT.md.",
+      "usable with click/fill/hover/type. Use it to understand page STRUCTURE and forms; for simply finding " +
+      "something to act on, snapshot is the recommended default. interactiveOnly:true trims to actionable nodes. " +
+      "Refs go to open dialogs first, then in-viewport, then the rest; past `limit` nodes are listed without a " +
+      "ref and a note says so. Taking ANY snapshot (snapshot or ax_snapshot) invalidates refs from earlier " +
+      "snapshots. See docs/AX-SNAPSHOT.md.",
     {
       tabId: tabIdParam,
       interactiveOnly: z.boolean().optional().describe("Keep only interactive nodes and the containers leading to them"),
+      limit: z.number().int().min(1).max(2000).optional().describe("Max refs across all frames (default 400, max 2000)"),
     },
-    async ({ tabId, interactiveOnly }) => {
-      const snap = (await hub.call("ax_snapshot", { tabId })) as AxSnapshot;
+    async ({ tabId, interactiveOnly, limit }) => {
+      const snap = (await hub.call("ax_snapshot", { tabId, limit })) as AxSnapshot;
       return textResult(renderAxSnapshot(snap, { interactiveOnly }));
     }
   );
