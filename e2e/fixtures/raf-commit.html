@@ -1,0 +1,23 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>raf commit</title></head>
+<body>
+<!-- Like React-Aria / many UI libs: the click handler only SCHEDULES the state change, which is
+     committed inside requestAnimationFrame. In a hidden tab (no frames) the commit never lands. -->
+<button id="panel">Open panel</button>
+<div id="out">closed</div>
+<script>
+  // pending = clicks whose rAF commit has not run yet
+  window.__state = { clicks: 0, committed: 0, pending: 0 };
+  document.getElementById("panel").addEventListener("click", () => {
+    window.__state.clicks++;
+    window.__state.pending++;
+    requestAnimationFrame(() => {
+      window.__state.committed++;
+      window.__state.pending--;
+      document.getElementById("out").textContent = "open";
+    });
+  });
+  // rAF probe helper: resolves true if a frame fires within ms, else false.
+  window.__rafWithin = (ms) => new Promise((res) => { let d = false; requestAnimationFrame(() => { if (!d) { d = true; res(true); } }); setTimeout(() => { if (!d) { d = true; res(false); } }, ms); });
+</script>
+</body></html>

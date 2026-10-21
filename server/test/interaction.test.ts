@@ -158,3 +158,25 @@ test("matchCdpFrame: unique URL match among child frames, fragment-insensitive",
   assert.equal(matchCdpFrame(tree, "https://c.test/x"), null); // ambiguous
   assert.equal(matchCdpFrame(tree, "https://a.test/"), null); // never the main frame
 });
+
+test("pickBest (one-injection selector pick) agrees with pickSelectorTarget for a single frame", async () => {
+  const { pickSelectorTarget } = await import("../../extension/src/snapshot-plan.ts");
+  const flags = [
+    [false, false],
+    [true, false],
+    [true, true],
+  ] as const;
+  // every list of 1-4 matches over the three (visible, inViewport) states
+  const lists: { visible: boolean; inViewport: boolean }[][] = [];
+  const grow = (cur: { visible: boolean; inViewport: boolean }[]) => {
+    if (cur.length) lists.push(cur);
+    if (cur.length === 4) return;
+    for (const [visible, inViewport] of flags) grow([...cur, { visible, inViewport }]);
+  };
+  grow([]);
+  for (const ms of lists) {
+    const chosen = pickSelectorTarget(ms.map((m, index) => ({ frameId: 0, index, ...m }))).chosen!;
+    assert.equal(L.pickBest(ms), chosen.index, JSON.stringify(ms));
+  }
+  assert.equal(L.pickBest([]), -1);
+});

@@ -130,6 +130,17 @@ export class Harness {
   private transport?: StreamableHTTPClientTransport;
   private tornDown = false;
   private exitHook = () => this.killSync();
+  private browserProc?: ChildProcess;
+
+  /**
+   * rawBrowser: launch Chromium WITHOUT Playwright attached to its pages. Playwright enables
+   * Emulation.setFocusEmulationEnabled on every page it controls, which in Chromium counts as a
+   * "capturer" and keeps background tabs visibilityState:'visible' with rAF running - so a
+   * hidden-tab scenario cannot be reproduced under Playwright. Raw mode spawns the same Chromium
+   * build directly, configures the extension over a one-off CDP session to its service worker only,
+   * and detaches. No dialog tracking in this mode.
+   */
+  constructor(readonly opts: { rawBrowser?: boolean; logName?: string } = {}) {}
 
   fixtureUrl(path: string): string {
     return `http://127.0.0.1:${this.fixturePort}/${path.replace(/^\//, "")}`;
@@ -157,7 +168,7 @@ export class Harness {
     if (!existsSync(serverEntry)) throw new Error(`server build missing: ${serverEntry} (run npm run build:deps)`);
     this.bridgePort = await freePort();
     if (this.bridgePort === REAL_BRIDGE_PORT) throw new Error("refusing to use the real bridge port");
-    this.serverLog = createWriteStream(join(ARTIFACTS, "server.log"));
+    this.serverLog = createWriteStream(join(ARTIFACTS, this.opts.logName ?? "server.log"));
     this.serverProc = spawn(process.execPath, [serverEntry], {
       cwd: join(REPO, "server"),
       env: { ...process.env, HOME: fakeHome, USERPROFILE: fakeHome, BRIDGE_PORT: String(this.bridgePort), BRIDGE_TOKEN: this.token },
@@ -176,31 +187,35 @@ export class Harness {
       filter: (src) => !/[/\\](node_modules|src)([/\\]|$)/.test(src.slice(extSrc.length)) && !/\.(ts|mjs)$|package(-lock)?\.json$|tsconfig\.json$/.test(src),
     });
     this.userDataDir = join(this.tmpRoot, "profile");
-    this.context = await chromium.launchPersistentContext(this.userDataDir, {
-      channel: "chromium",
-      headless: this.headless,
-      viewport: null,
-      args: [
-        `--disable-extensions-except=${extDir}`,
-        `--load-extension=${extDir}`,
-        "--window-size=1280,900",
-        "--no-first-run",
-        "--no-default-browser-check",
-      ],
-    });
-    // Real Chrome never auto-dismisses a JS dialog; Playwright does when nobody listens. Listening
-    // (and NOT answering) keeps the real-browser behaviour; scenarios answer them explicitly.
-    this.context.on("dialog", (d) => {
-      this.pendingDialogs.push(d);
-      this.seenDialogs.push({ type: d.type(), message: d.message(), at: Date.now() });
-    });
+    if (this.opts.rawBrowser) {
+      await this.launchRaw(extDir);
+    } else {
+      this.context = await chromium.launchPersistentContext(this.userDataDir, {
+        channel: "chromium",
+        headless: this.headless,
+        viewport: null,
+        args: [
+          `--disable-extensions-except=${extDir}`,
+          `--load-extension=${extDir}`,
+          "--window-size=1280,900",
+          "--no-first-run",
+          "--no-default-browser-check",
+        ],
+      });
+      // Real Chrome never auto-dismisses a JS dialog; Playwright does when nobody listens. Listening
+      // (and NOT answering) keeps the real-browser behaviour; scenarios answer them explicitly.
+      this.context.on("dialog", (d) => {
+        this.pendingDialogs.push(d);
+        this.seenDialogs.push({ type: d.type(), message: d.message(), at: Date.now() });
+      });
 
-    let sw = this.context.serviceWorkers().find((w) => w.url().startsWith("chrome-extension://"));
-    if (!sw) sw = await this.context.waitForEvent("serviceworker", { timeout: 15_000 });
-    await sw.evaluate(
-      ({ token, port }) => (globalThis as any).chrome.storage.local.set({ token, port }),
-      { token: this.token, port: this.bridgePort }
-    );
+      let sw = this.context.serviceWorkers().find((w) => w.url().startsWith("chrome-extension://"));
+      if (!sw) sw = await this.context.waitForEvent("serviceworker", { timeout: 15_000 });
+      await sw.evaluate(
+        ({ token, port }) => (globalThis as any).chrome.storage.local.set({ token, port }),
+        { token: this.token, port: this.bridgePort }
+      );
+    }
     await waitFor("extensionConnected:true", async () => (await this.health()).extensionConnected === true, 20_000);
 
     // 4. MCP client
@@ -212,6 +227,91 @@ export class Harness {
     const { tools } = await this.client.listTools();
     for (const t of tools) this.toolSchemas.set(t.name, t.inputSchema);
   }
+
+  private async launchRaw(extDir: string): Promise<void> {
+    mkdirSync(this.userDataDir, { recursive: true });
+    // CDP over --remote-debugging-pipe (fds 3/4), as Playwright does: extension APIs are hidden from a
+    // --remote-debugging-port client, but a pipe client may evaluate in the extension's worker.
+    const proc = spawn(
+      chromium.executablePath(),
+      [
+        `--user-data-dir=${this.userDataDir}`,
+        "--remote-debugging-pipe",
+        ...(this.headless ? ["--headless=new"] : []),
+        `--disable-extensions-except=${extDir}`,
+        `--load-extension=${extDir}`,
+        "--window-size=1280,900",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-sync",
+        // Chrome 137+ ignores --load-extension unless this feature is off.
+        "--disable-features=DisableLoadExtensionCommandLineSwitch",
+        "--disable-component-update",
+        "--password-store=basic",
+        "--use-mock-keychain",
+        "about:blank",
+      ],
+      { stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"] }
+    );
+    this.browserProc = proc;
+    const out = proc.stdio[3] as NodeJS.WritableStream;
+    const inp = proc.stdio[4] as NodeJS.ReadableStream;
+    let id = 0;
+    let buf = "";
+    const pending = new Map<number, (m: any) => void>();
+    inp.on("data", (d: Buffer) => {
+      buf += d.toString("utf8");
+      let i: number;
+      while ((i = buf.indexOf("\0")) >= 0) {
+        const raw = buf.slice(0, i);
+        buf = buf.slice(i + 1);
+        try {
+          const m = JSON.parse(raw);
+          if (m.id != null) pending.get(m.id)?.(m);
+        } catch {}
+      }
+    });
+    inp.on("error", () => {});
+    out.on("error", () => {});
+    const send = (method: string, params: any = {}, sessionId?: string) =>
+      new Promise<any>((res, rej) => {
+        const i = ++id;
+        const timer = setTimeout(() => (pending.delete(i), rej(new Error(`${method}: no answer in 10s`))), 10_000);
+        pending.set(i, (m) => {
+          clearTimeout(timer);
+          pending.delete(i);
+          if (m.error) rej(new Error(`${method}: ${m.error.message}`));
+          else res(m.result);
+        });
+        out.write(JSON.stringify({ id: i, method, params, ...(sessionId ? { sessionId } : {}) }) + "\0");
+      });
+    // Our SW is a chrome-extension://<id>/background.js worker that has chrome.debugger + storage
+    // (Chrome's own component extensions also run background.js workers). It may need a moment
+    // before chrome.storage is usable, so attach + evaluate until the write succeeds.
+    const expr = `globalThis.chrome?.debugger && chrome.storage ? chrome.storage.local.set(${JSON.stringify({ token: this.token, port: this.bridgePort })}).then(() => true) : false`;
+    await waitFor(
+      "extension service worker configured",
+      async () => {
+        const infos = (await send("Target.getTargets")).targetInfos as any[];
+        for (const sw of infos.filter((t) => t.type === "service_worker" && /^chrome-extension:\/\/[a-p]{32}\/background\.js$/.test(t.url))) {
+          const { sessionId } = await send("Target.attachToTarget", { targetId: sw.targetId, flatten: true });
+          try {
+            const r = await send("Runtime.evaluate", { expression: expr, awaitPromise: true }, sessionId);
+            if (r?.result?.value === true) return true;
+          } finally {
+            await send("Target.detachFromTarget", { sessionId }).catch(() => undefined);
+          }
+        }
+        return false;
+      },
+      20_000
+    );
+    // Kept open (browser-level, attached to no page) so a scenario can attach to a page itself via
+    // rawCdp when it needs to measure something the bridge does not expose.
+    this.rawCdp = send;
+  }
+
+  rawCdp?: (method: string, params?: any, sessionId?: string) => Promise<any>;
 
   async health(): Promise<{ ok?: boolean; extensionConnected?: boolean }> {
     const r = await fetch(`http://127.0.0.1:${this.bridgePort}/health`);
@@ -280,6 +380,11 @@ export class Harness {
     if (this.transport) await withTimeout(this.transport.terminateSession().catch(() => undefined), 3_000, "mcp terminateSession");
     if (this.client) await withTimeout(this.client.close().catch(() => undefined), 3_000, "mcp close");
     if (this.context) await withTimeout(this.context.close().catch(() => undefined), 10_000, "chromium close");
+    if (this.browserProc && this.browserProc.exitCode === null) {
+      const exited = new Promise((r) => this.browserProc!.once("exit", r));
+      this.browserProc.kill("SIGTERM");
+      await withTimeout(exited, 5_000, "raw chromium SIGTERM");
+    }
     this.killChromiumByProfile();
     if (this.serverProc && this.serverProc.exitCode === null) {
       const exited = new Promise((r) => this.serverProc!.once("exit", r));
