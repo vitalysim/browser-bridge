@@ -9,7 +9,9 @@ import { spawn } from "child_process";
 import { CALL_TIMEOUT_MS, type ExtensionHub } from "./hub.js";
 import { CaptureSink } from "./capture-sink.js";
 import { inlineAssets } from "./rrweb-inline.js";
-import { classifyError, truncateForText } from "./result.js";
+import { classifyError, resultObject, stepFailure, truncateForText } from "./result.js";
+import { logCall } from "./log.js";
+import { isToolEnabled, parseToolsets, type ToolsetSelection } from "./toolsets.js";
 import { versionSkewWarning } from "./version.js";
 import { buildHar, parseSessionEventsStream } from "./capture-format.js";
 import { renderAxSnapshot, type AxSnapshot } from "./ax.js";
@@ -35,6 +37,46 @@ const WATCH_SETTLE_MS = 300;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const MAX_BATCH_ACTIONS = 50;
+
+// get_page_text paging. The default slice leaves headroom under MAX_TEXT_CHARS for the JSON envelope
+// (title/url plus escaping of quotes/newlines), so a page never falls into the prefix-preview path,
+// which would have no way to fetch the rest.
+const PAGE_TEXT_DEFAULT_CHARS = 40_000;
+const PAGE_TEXT_MAX_CHARS = 55_000;
+
+/**
+ * Slice the extension's {title, url, text} to one page: {text, totalChars, offset, nextOffset|null}.
+ * If JSON escaping would still push the envelope over budget, the slice shrinks until it fits, so the
+ * agent always gets a valid page and an exact nextOffset. Exported for tests.
+ */
+export function pageTextSlice(
+  r: any,
+  opts: { tabId?: number; offset?: number; maxChars?: number },
+  budget = MAX_TEXT_CHARS - 500
+): Record<string, unknown> {
+  const full: string = typeof r?.text === "string" ? r.text : "";
+  const totalChars = full.length;
+  const offset = Math.min(Math.max(0, Math.floor(opts.offset ?? 0)), totalChars);
+  let take = Math.max(1, Math.min(Math.floor(opts.maxChars ?? PAGE_TEXT_DEFAULT_CHARS), PAGE_TEXT_MAX_CHARS));
+  const build = (n: number) => {
+    const end = Math.min(totalChars, offset + n);
+    return {
+      // The extension does not report which tab it read; echo the caller's tabId when given.
+      ...(opts.tabId !== undefined ? { tabId: opts.tabId } : {}),
+      ...(r && typeof r === "object" ? { ...r, text: undefined } : {}),
+      text: full.slice(offset, end),
+      totalChars,
+      offset,
+      nextOffset: end < totalChars ? end : null,
+    };
+  };
+  let out = build(take);
+  while (take > 1 && JSON.stringify(out).length > budget) {
+    take = Math.floor(take / 2);
+    out = build(take);
+  }
+  return out;
+}
 
 // Tools that drive the page on the agent's behalf. A watch timeline entry whose ts falls in one of
 // these calls' windows is labeled [agent], so the agent's own clicks/fills are told apart from the
@@ -234,10 +276,12 @@ function imageDims(buf: Buffer): { width: number; height: number } | null {
   return null;
 }
 
-function textResult(value: unknown) {
+// `hint` is what a truncated result tells the agent to do instead. Pass one only when the tool really
+// has a narrowing/paging parameter; the default hint is deliberately tool-agnostic.
+function textResult(value: unknown, hint?: string) {
   // Structure-aware so a trimmed result is still valid JSON (see result.ts); a blind slice of a JSON
   // string yields something no agent can parse.
-  const { text } = truncateForText(value, MAX_TEXT_CHARS);
+  const { text } = truncateForText(value, MAX_TEXT_CHARS, hint);
   return { content: [{ type: "text" as const, text }] };
 }
 
@@ -271,7 +315,39 @@ const timeoutMsParam = z
 // `+5_000` slack. Math.max so the budget can only ever GROW: the default stays exactly CALL_TIMEOUT_MS.
 const actionHubTimeout = (t?: number) => Math.max(CALL_TIMEOUT_MS, (t ?? 5_000) + 5_000);
 
-export function registerTools(server: McpServer, hub: ExtensionHub, version = "0.0.0") {
+export interface RegisterOptions {
+  /** Which tool groups to register (see toolsets.ts). Defaults to BRIDGE_TOOLSETS, i.e. all when unset. */
+  toolsets?: ToolsetSelection;
+}
+
+/**
+ * Wrap a tool handler with one structured stderr line per call (see log.ts). Logs the tool name, a
+ * numeric tabId (from the args, else the result), duration and outcome - NEVER parameter values.
+ * Exported for tests.
+ */
+export function withCallLog(name: string, handler: (args: any, extra?: any) => Promise<any>) {
+  return async (args: any, extra?: any) => {
+    const t0 = performance.now();
+    try {
+      const out = await handler(args, extra);
+      try {
+        const obj = resultObject(out);
+        const f = stepFailure(out, obj);
+        logCall({ tool: name, tabId: args?.tabId ?? obj?.tabId, ms: performance.now() - t0, outcome: f?.outcome ?? "ok", detail: f?.reason });
+      } catch {
+        /* logging must never fail a call */
+      }
+      return out;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logCall({ tool: name, tabId: args?.tabId, ms: performance.now() - t0, outcome: "error", detail: `[${classifyError(err)}] ${msg}` });
+      throw err;
+    }
+  };
+}
+
+export function registerTools(server: McpServer, hub: ExtensionHub, version = "0.0.0", opts: RegisterOptions = {}) {
+  const toolsets = opts.toolsets ?? parseToolsets(process.env.BRIDGE_TOOLSETS);
   // Every registered tool, so browser_batch can invoke the SAME handler the MCP layer would - no
   // duplicated dispatch logic to drift. The schema is kept because calling a handler directly
   // bypasses the SDK's own zod validation, so batch must re-validate each item itself.
@@ -285,10 +361,12 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     inputSchema: z.ZodRawShape,
     handler: (args: any, extra?: any) => Promise<any>
   ) => {
+    // BRIDGE_TOOLSETS: a tool outside the chosen groups is simply not registered (nor batchable).
+    if (!isToolEnabled(name, toolsets)) return;
     // Acting tools mark the window they run in as agent-driven, so watch mode labels the clicks/fills
     // they cause as [agent] rather than as the human's. Done here (not in each handler) so it also
     // covers the batched path, which invokes `handler` directly and would otherwise bypass it.
-    const wrapped = AGENT_ACTION_TOOLS.has(name)
+    const acting = AGENT_ACTION_TOOLS.has(name)
       ? async (args: any, extra?: any) => {
           const from = Date.now();
           try {
@@ -299,6 +377,8 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
           }
         }
       : handler;
+    // Logged here (not at the MCP layer) so batched steps get their own line too.
+    const wrapped = withCallLog(name, acting);
     registry.set(name, { schema: inputSchema, handler: wrapped });
     server.registerTool(name, { description, inputSchema }, async (args: any, extra: any) => {
       try {
@@ -362,9 +442,24 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       "pages, e.g. summarizing a feed. Reads `innerText` (rendered text) by default, which OMITS `display:none` / " +
       "collapsed content (e.g. un-expanded accordion bodies). Set includeHidden:true to read `textContent` instead, " +
       "capturing hidden-but-present DOM (loses some block line breaks). Truly virtualized/unmounted content still " +
-      "needs a scroll/expand first.",
-    { tabId: tabIdParam, includeHidden: z.boolean().optional().describe("Include display:none/collapsed text via textContent (default false = rendered innerText only)") },
-    async ({ tabId, includeHidden }) => textResult(await hub.call("get_page_text", { tabId, includeHidden }))
+      "needs a scroll/expand first. Long pages are PAGED: the result carries totalChars and nextOffset - call again " +
+      "with offset:nextOffset to read the rest (nextOffset is null on the last page).",
+    {
+      tabId: tabIdParam,
+      includeHidden: z.boolean().optional().describe("Include display:none/collapsed text via textContent (default false = rendered innerText only)"),
+      offset: z.number().int().min(0).optional().describe("Character offset into the page text to start from (default 0); pass the previous result's nextOffset"),
+      maxChars: z
+        .number()
+        .int()
+        .min(1)
+        .max(PAGE_TEXT_MAX_CHARS)
+        .optional()
+        .describe(`Max characters of text to return (default ${PAGE_TEXT_DEFAULT_CHARS}, max ${PAGE_TEXT_MAX_CHARS})`),
+    },
+    async ({ tabId, includeHidden, offset, maxChars }) => {
+      const r = await hub.call("get_page_text", { tabId, includeHidden });
+      return textResult(pageTextSlice(r, { tabId, offset, maxChars }), "page with offset/maxChars (see nextOffset)");
+    }
   );
 
   tool(
@@ -796,7 +891,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       tabId: tabIdParam,
     },
     async ({ urlFilter, includeBodies, limit, tabId }) =>
-      textResult(await hub.call("net_get_requests", { urlFilter, includeBodies, limit, tabId }, 60_000)),
+      textResult(await hub.call("net_get_requests", { urlFilter, includeBodies, limit, tabId }, 60_000), "narrow with urlFilter/limit, or drop includeBodies"),
   );
 
   tool(
@@ -832,7 +927,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       limit: z.number().optional().describe("Max frames (default 200, newest kept)"),
       tabId: tabIdParam,
     },
-    async ({ urlFilter, limit, tabId }) => textResult(await hub.call("net_get_ws_frames", { urlFilter, limit, tabId })),
+    async ({ urlFilter, limit, tabId }) => textResult(await hub.call("net_get_ws_frames", { urlFilter, limit, tabId }), "narrow with urlFilter/limit"),
   );
 
   tool(
@@ -1123,7 +1218,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       limit: z.number().optional().describe("Max entries to return (default 200)"),
       tabId: tabIdParam,
     },
-    async (args) => textResult(await hub.call("console_get", args)),
+    async (args) => textResult(await hub.call("console_get", args), "narrow with pattern/level/limit"),
   );
 
   tool(
@@ -1434,6 +1529,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         }
       }
       return textResult({
+        tabId,
         saved: savePath,
         htmlBytes,
         eventCount: events.length,
@@ -1946,7 +2042,9 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       "what you'd pass to that tool standalone. Use this whenever you can predict two or more steps " +
       "ahead - e.g. navigate → click → fill → press_key → screenshot - because the round trip per " +
       "tool call, not the browser, is what makes multi-step tasks slow. Actions run SEQUENTIALLY and " +
-      "STOP at the first error; the result reports what completed plus the failing index and message, " +
+      "STOP at the first error - including a step that returns {notActionable} or {filled:false} or an `error` " +
+      "field (set continueOnError:true on a step to tolerate that, or stopOnNotActionable:false for the whole " +
+      "batch); the result reports what completed plus the failing index, tool and reason, " +
       "so a partial run is always legible. Only navigation/interaction/read tools may be batched " +
       `(${[...BATCHABLE_TOOLS].join(", ")}); anything else must be called directly so it keeps its own ` +
       "per-call approval. Cannot be nested.",
@@ -1956,57 +2054,85 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
           z.object({
             name: z.string().describe("Tool name, e.g. 'click'"),
             input: z.record(z.any()).optional().describe("That tool's input - the same shape you'd pass calling it directly"),
+            continueOnError: z
+              .boolean()
+              .optional()
+              .describe("Keep going if THIS step fails (error, notActionable, filled:false); the failure is recorded in its result"),
           })
         )
         .min(1)
         .max(MAX_BATCH_ACTIONS)
-        .describe(`Tools to run in order (max ${MAX_BATCH_ACTIONS}). Executed sequentially; stops at the first error.`),
+        .describe(`Tools to run in order (max ${MAX_BATCH_ACTIONS}). Executed sequentially; stops at the first failure.`),
+      stopOnNotActionable: z
+        .boolean()
+        .optional()
+        .describe("Halt when a step returns {notActionable} or {filled:false} (default true). Errors always halt unless the step sets continueOnError."),
     },
-    async ({ actions }) => {
-      const results: any[] = [];
-      for (let i = 0; i < actions.length; i++) {
-        const { name, input } = actions[i];
-        const fail = (error: string) =>
-          textResult({ executed: results.length, total: actions.length, results, stoppedAt: i, failedTool: name, error });
-
-        if (name === "browser_batch") return fail("browser_batch cannot be nested.");
-        const entry = registry.get(name);
-        if (!entry) return fail(`Unknown tool '${name}'.`);
-        if (!BATCHABLE_TOOLS.has(name)) {
-          return fail(`'${name}' is not batchable - call it directly so it keeps its own per-call approval.`);
-        }
-
-        // The SDK validates args before a normal tool call; invoking the handler directly skips that,
-        // so re-validate here rather than letting a malformed input reach the browser.
-        let args: any;
-        try {
-          args = z.object(entry.schema).parse(input ?? {});
-        } catch (err) {
-          return fail(`Invalid input for '${name}': ${err instanceof Error ? err.message : String(err)}`);
-        }
-
-        // watch_read can block for up to 25s waiting for the human to do something. Inside a batch
-        // that would stall every remaining action behind it, so a batched read always returns now.
-        if (name === "watch_read") args.waitMs = 0;
-
-        let out: any;
-        try {
-          out = await entry.handler(args);
-        } catch (err) {
-          return fail(err instanceof Error ? err.message : String(err));
-        }
-        // Handlers return the MCP content envelope; unwrap to keep the batch result readable. A
-        // handler that returned isError (rather than throwing) still halts the run.
-        const text = out?.content?.[0]?.text ?? "";
-        if (out?.isError) {
-          results.push({ index: i, tool: name, error: text });
-          return fail(text || `'${name}' failed.`);
-        }
-        results.push({ index: i, tool: name, result: text });
-      }
-      return textResult({ executed: results.length, total: actions.length, results });
-    }
+    async ({ actions, stopOnNotActionable }) => runBatch(actions, { stopOnNotActionable })
   );
+
+  async function runBatch(
+    actions: { name: string; input?: Record<string, any>; continueOnError?: boolean }[],
+    { stopOnNotActionable = true }: { stopOnNotActionable?: boolean } = {}
+  ) {
+    const results: any[] = [];
+    for (let i = 0; i < actions.length; i++) {
+      const { name, input, continueOnError } = actions[i];
+      const fail = (error: string, outcome: "error" | "notActionable" = "error") =>
+        textResult({ executed: results.length, total: actions.length, results, stoppedAt: i, failedTool: name, outcome, error });
+
+      if (name === "browser_batch") return fail("browser_batch cannot be nested.");
+      const entry = registry.get(name);
+      if (!entry) return fail(`Unknown tool '${name}'.`);
+      if (!BATCHABLE_TOOLS.has(name)) {
+        return fail(`'${name}' is not batchable - call it directly so it keeps its own per-call approval.`);
+      }
+
+      // The SDK validates args before a normal tool call; invoking the handler directly skips that,
+      // so re-validate here rather than letting a malformed input reach the browser.
+      let args: any;
+      try {
+        args = z.object(entry.schema).parse(input ?? {});
+      } catch (err) {
+        return fail(`Invalid input for '${name}': ${err instanceof Error ? err.message : String(err)}`);
+      }
+
+      // watch_read can block for up to 25s waiting for the human to do something. Inside a batch
+      // that would stall every remaining action behind it, so a batched read always returns now.
+      if (name === "watch_read") args.waitMs = 0;
+
+      let out: any;
+      try {
+        out = await entry.handler(args);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (continueOnError) {
+          results.push({ index: i, tool: name, error: message, outcome: "error" });
+          continue;
+        }
+        return fail(message);
+      }
+      // Handlers return the MCP content envelope; unwrap to keep the batch result readable. A
+      // handler that returned isError (rather than throwing) still halts the run - and so does a
+      // NORMAL result that reports failure ({notActionable}, {filled:false}, an `error` field):
+      // otherwise the next step types into whatever the failed click left focused.
+      const text = out?.content?.[0]?.text ?? "";
+      const failure = stepFailure(out);
+      if (!failure) {
+        results.push({ index: i, tool: name, result: text });
+        continue;
+      }
+      results.push(
+        out?.isError
+          ? { index: i, tool: name, error: text, outcome: failure.outcome }
+          : { index: i, tool: name, result: text, outcome: failure.outcome, reason: failure.reason }
+      );
+      if (continueOnError) continue;
+      if (failure.outcome === "notActionable" && !stopOnNotActionable) continue;
+      return fail(out?.isError ? text || `'${name}' failed.` : `'${name}' ${failure.reason}`, failure.outcome);
+    }
+    return textResult({ executed: results.length, total: actions.length, results });
+  }
 
   // Environment emulation (device / network / locale / geolocation) - self-contained in emulate.ts.
   registerEmulateTools(tool, hub);

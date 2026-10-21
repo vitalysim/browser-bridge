@@ -2,7 +2,14 @@
 // eyeballed in prod is that truncated output is ALWAYS valid JSON (or a plainly-flagged string cut).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { classifyError, truncateForText } from "../src/result.js";
+import {
+  classifyError,
+  truncateForText,
+  DEFAULT_TRUNCATION_HINT,
+  stepFailure,
+  explainTimeout,
+  NOT_CONNECTED_MESSAGE,
+} from "../src/result.js";
 
 test("classifyError honours an explicit code from the extension", () => {
   const e = Object.assign(new Error("whatever"), { code: "RESULT_TOO_LARGE" });
@@ -49,7 +56,7 @@ test("a large top-level array is trimmed to a valid-JSON envelope that fits", ()
   assert.equal(parsed.truncated, true);
   assert.equal(parsed.total, 500);
   assert.ok(parsed.returned < 500 && parsed.returned === parsed.items.length);
-  assert.equal(parsed.hint, "narrow with limit/filter");
+  assert.equal(parsed.hint, DEFAULT_TRUNCATION_HINT);
 });
 
 test("an object holding a large array trims that array in place and stays valid JSON", () => {
@@ -84,4 +91,54 @@ test("truncated output is always parseable even when single items are huge", () 
   assert.equal(r.truncated, true);
   const parsed = JSON.parse(r.text); // the point: no invalid JSON even when nothing fits
   assert.equal(parsed.truncated, true);
+});
+
+// ---- ergonomics: tool-specific hints, tab preservation, soft-failure detection, actionable errors ----
+
+test("a caller-supplied truncation hint replaces the generic one", () => {
+  const arr = Array.from({ length: 500 }, (_, i) => ({ i, pad: "abcdefghij" }));
+  assert.equal(JSON.parse(truncateForText(arr, 2_000, "narrow with urlFilter/limit").text).hint, "narrow with urlFilter/limit");
+});
+
+test("the default hint no longer promises limit/filter parameters", () => {
+  assert.ok(!/limit\/filter/.test(DEFAULT_TRUNCATION_HINT));
+});
+
+test("the prefix-preview fallback keeps the tabId the call ran on", () => {
+  const big = { tabId: 314, blob: "x".repeat(10_000) };
+  const r = truncateForText(big, 2_000);
+  const parsed = JSON.parse(r.text);
+  assert.equal(parsed.tabId, 314);
+  assert.ok(r.text.length <= 2_000);
+});
+
+const env = (v: unknown, isError = false) => ({
+  content: [{ type: "text", text: typeof v === "string" ? v : JSON.stringify(v) }],
+  ...(isError ? { isError } : {}),
+});
+
+test("stepFailure flags notActionable, filled:false, error fields and isError; passes successes", () => {
+  assert.deepEqual(stepFailure(env({ notActionable: true, reason: "covered" })), { outcome: "notActionable", reason: "notActionable: covered" });
+  assert.equal(stepFailure(env({ filled: false }))?.outcome, "notActionable");
+  assert.deepEqual(stepFailure(env({ error: "boom" })), { outcome: "error", reason: "boom" });
+  assert.equal(stepFailure(env("Error [TIMEOUT]: x", true))?.outcome, "error");
+  assert.equal(stepFailure(env({ clicked: true })), null);
+  assert.equal(stepFailure(env({ filled: true, error: null })), null);
+  assert.equal(stepFailure(env("plain text {not json")), null);
+  assert.equal(stepFailure(env([{ notActionable: true }])), null);
+  assert.equal(stepFailure({ content: [{ type: "image", data: "" }] }), null);
+});
+
+test("actionable error messages keep their machine codes", () => {
+  assert.equal(classifyError(new Error(NOT_CONNECTED_MESSAGE)), "NO_EXTENSION");
+  assert.match(NOT_CONNECTED_MESSAGE, /retry in 2-3 seconds/);
+  const t = explainTimeout("click", 30_000);
+  assert.equal(classifyError(new Error(t)), "TIMEOUT");
+  assert.match(t, /^Extension call 'click' timed out after 30000ms/);
+  assert.match(t, /handle_dialog/);
+  assert.match(t, /screenshot or tabs_list/);
+  assert.equal(
+    classifyError(new Error("Browser extension disconnected before responding; it usually reconnects within seconds - retry in 2-3 seconds")),
+    "NO_EXTENSION"
+  );
 });

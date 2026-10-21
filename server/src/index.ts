@@ -12,6 +12,9 @@ import { ExtensionHub } from "./hub.js";
 import { registerTools, startWatchNetCapture } from "./tools.js";
 import { renderActions, watchRegistry } from "./watch.js";
 import { sessionsToReap, type SessionState } from "./session-reaper.js";
+import { log } from "./log.js";
+import { handleListenError } from "./listen.js";
+import { TOOLSETS, parseToolsets } from "./toolsets.js";
 
 const PORT = Number(process.env.BRIDGE_PORT ?? 8765);
 const HOST = "127.0.0.1";
@@ -98,7 +101,7 @@ hub.registerTap((msg, receivedAt) => {
     // target=_blank checkout flow goes.
     if (session.netCapture && !session.netTabs.has(msg.tabId)) {
       void startWatchNetCapture(hub, session, msg.tabId).catch((e) => {
-        console.error(`[watch] could not capture network on tab ${msg.tabId}: ${e?.message ?? e}`);
+        log(`[watch] could not capture network on tab ${msg.tabId}: ${e?.message ?? e}`);
       });
     }
     return;
@@ -135,9 +138,15 @@ hub.onHello((hello) => {
   }
 });
 
+// BRIDGE_TOOLSETS: parsed once, applied to every MCP session (see toolsets.ts). Unset = every tool.
+const toolsets = parseToolsets(process.env.BRIDGE_TOOLSETS);
+if (toolsets.unknown.length) {
+  log(`[browser-bridge] BRIDGE_TOOLSETS: ignoring unknown group(s) ${toolsets.unknown.join(", ")} (known: ${TOOLSETS.join(", ")}, all)`);
+}
+
 function buildMcpServer(): McpServer {
   const server = new McpServer({ name: "browser-bridge", version: VERSION }, { instructions: PLAYBOOK_INSTRUCTIONS });
-  registerTools(server, hub, VERSION);
+  registerTools(server, hub, VERSION, { toolsets });
   return server;
 }
 
@@ -161,7 +170,7 @@ function reapIdleSessions(now = Date.now()): void {
       .then(() => t?.close())
       .then(() => s?.close())
       .catch(() => undefined); // already gone
-    console.error(`[mcp] session reaped (idle): ${sid}`);
+    log(`[mcp] session reaped (idle): ${sid}`);
   }
 }
 // Unref'd so the sweep never holds the process open.
@@ -194,7 +203,7 @@ app.all("/mcp", async (req, res) => {
           transports.set(sid, transport!);
           sessionState.set(sid, { lastSeen: Date.now(), inflight: 0 });
           servers.set(sid, server);
-          console.error(`[mcp] session initialized: ${sid}`);
+          log(`[mcp] session initialized: ${sid}`);
         },
       });
       transport.onclose = () => {
@@ -203,7 +212,7 @@ app.all("/mcp", async (req, res) => {
           transports.delete(sid);
           sessionState.delete(sid);
           servers.delete(sid);
-          console.error(`[mcp] session closed: ${sid}`);
+          log(`[mcp] session closed: ${sid}`);
         }
       };
       const server = buildMcpServer();
@@ -308,11 +317,18 @@ for (const sig of ["SIGINT", "SIGTERM"] as const) {
   });
 }
 
+// Without this the 'error' event is unhandled: a taken port crashes the process with a stack dump and
+// launchd relaunches it instantly, forever. See listen.ts.
+httpServer.on("error", (err: NodeJS.ErrnoException) => {
+  void handleListenError(err, { port: PORT, host: HOST, log, exit: (code) => process.exit(code) });
+});
+
 httpServer.listen(PORT, HOST, () => {
-  console.error(`[browser-bridge] listening on http://${HOST}:${PORT}`);
-  console.error(`[browser-bridge] MCP endpoint:  http://${HOST}:${PORT}/mcp  (Authorization: Bearer <token>)`);
-  console.error(`[browser-bridge] extension WS:  ws://${HOST}:${PORT}/ws?token=<token>`);
+  if (toolsets.enabled) log(`[browser-bridge] toolsets: ${[...toolsets.enabled].join(", ")} (BRIDGE_TOOLSETS)`);
+  log(`[browser-bridge] listening on http://${HOST}:${PORT}`);
+  log(`[browser-bridge] MCP endpoint:  http://${HOST}:${PORT}/mcp  (Authorization: Bearer <token>)`);
+  log(`[browser-bridge] extension WS:  ws://${HOST}:${PORT}/ws?token=<token>`);
   // Log the token FILE PATH, never the token value: launchd persists stderr to
   // ~/.browser-bridge/server.log indefinitely, so a printed secret would linger there forever.
-  console.error(`[browser-bridge] token file: ${join(homedir(), ".browser-bridge", "token")}`);
+  log(`[browser-bridge] token file: ${join(homedir(), ".browser-bridge", "token")}`);
 });
