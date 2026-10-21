@@ -1,0 +1,44 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>watch prepatched</title>
+<script>
+  // A hostile page that patches every primitive a late-injected relay would use, BEFORE anything of
+  // the extension can run in its world, and records anything that looks like the channel secret.
+  (() => {
+    const seen = (window.__leaked = []);
+    const hex = /[0-9a-f]{32}/;
+    const rawStr = JSON.stringify;
+    let busy = false;
+    const note = (v) => {
+      if (busy) return;
+      busy = true;
+      try {
+        let s;
+        if (typeof v === "string") s = v;
+        else if (v && typeof v === "object") { s = ""; for (const k of Object.getOwnPropertyNames(v)) { try { const x = Object.getOwnPropertyDescriptor(v, k); if (x && typeof x.value === "string") s += " " + x.value; } catch {} } }
+        if (s && hex.test(s)) seen.push(s.slice(0, 200));
+      } catch {} finally { busy = false; }
+    };
+    const OrigCE = window.CustomEvent;
+    window.CustomEvent = function (type, init) { note(type); note(init && init.detail); return new OrigCE(type, init); };
+    window.CustomEvent.prototype = OrigCE.prototype;
+    JSON.stringify = function (v, ...r) { note(v); return rawStr.apply(JSON, [v, ...r]); };
+    const origDispatch = EventTarget.prototype.dispatchEvent;
+    EventTarget.prototype.dispatchEvent = function (ev) { note(ev && ev.type); return origDispatch.call(this, ev); };
+    const origCall = Function.prototype.call;
+    Function.prototype.call = function (...a) { for (const x of a) if (x && typeof x === "object" && "type" in x) note(x.type); return origCall.apply(this, a); };
+    for (const k of ["n", "detail", "bubbles"]) Object.defineProperty(Object.prototype, k, { configurable: true, set(v) { note(v); Object.defineProperty(this, k, { value: v, writable: true, enumerable: true, configurable: true }); }, get() { note(this); return undefined; } });
+    Object.defineProperty(Object.prototype, "toJSON", { configurable: true, get() { note(this); return undefined; } });
+    // Also try the pairing events by name, as a page script would after load.
+    document.dispatchEvent(new OrigCE("bb-wm-ask"));
+    window.__forge = () => {
+      for (const s of seen) {
+        const m = s.match(hex);
+        if (!m) continue;
+        const detail = '{"n":"' + m[0] + '","kind":"console","level":"error","text":"FORGED-PREPATCH"}';
+        origDispatch.call(window, new OrigCE("bb-watch-main:" + m[0], { detail }));
+      }
+      return seen.length;
+    };
+  })();
+</script></head>
+<body><h1>Prepatched</h1></body></html>

@@ -46,10 +46,9 @@ console.log("built vendor/rrweb-record.js");
 
 // Watch-mode activity listener — a standalone IIFE registered via chrome.scripting.registerContentScripts
 // by watch_start, so it must not import anything from the service-worker bundle. It runs in the
-// ISOLATED world (it needs chrome.runtime). The MAIN-world error shim is NOT built here: it is
-// injected as an inline function from background.ts (bbWatchMainShim), which avoids needing a
-// web-accessible resource.
-for (const name of ["watch-entry"]) {
+// ISOLATED world (it needs chrome.runtime). watch-main-entry is its MAIN-world partner
+// (vendor/bb-watch-main.js), registered at document_start; see watch-main-entry.ts.
+for (const name of ["watch-entry", "watch-main-entry"]) {
   await build({
     entryPoints: [join(dir, `src/${name}.ts`)],
     bundle: true,

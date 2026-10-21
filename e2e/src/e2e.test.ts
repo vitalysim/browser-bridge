@@ -467,6 +467,20 @@ scenario("hover-revealed-button", async (c) => {
   c.expect((await c.evalJs(tabId, "window.__ran")) === 1, `button did not run after trusted hover: ${trim(ok.text, 160)}`);
 });
 
+// Follow the watch cursor so each watch_read blocks (waitMs) until something NEW arrives, instead of
+// returning the same snapshot instantly; returns everything read once `re` matches or time runs out.
+async function readWatchUntil(c: any, re: RegExp, budgetMs: number): Promise<string> {
+  let text = "";
+  let since: string | undefined;
+  const end = Date.now() + budgetMs;
+  while (Date.now() < end && !re.test(text)) {
+    const r = await c.call("watch_read", since ? { since, waitMs: 1_500 } : { waitMs: 1_500 });
+    text += r.text;
+    since = r.json?.nextCursor ?? since;
+  }
+  return text;
+}
+
 // Watch mode: a page can neither pre-disable error capture nor forge timeline lines via the relay event.
 scenario("watch-relay-not-forgeable", async (c) => {
   if (!c.h.toolSchemas.has("watch_start")) c.skip("watch tools not exposed");
@@ -475,14 +489,36 @@ scenario("watch-relay-not-forgeable", async (c) => {
   c.expect(!ws.isError, `watch_start failed: ${trim(ws.text, 160)}`);
   try {
     await c.evalJs(tabId, "window.__forge(); setTimeout(() => { throw new Error('REAL-BOOM-4242') }, 0); 1");
-    let text = "";
-    for (let i = 0; i < 12 && !/REAL-BOOM-4242/.test(text); i++) {
-      const r = await c.call("watch_read", { waitMs: 1_000 });
-      text = r.text;
-    }
+    const text = await readWatchUntil(c, /REAL-BOOM-4242/, 12_000);
     c.note(`watch_read -> ${trim(text, 300)}`);
     c.expect(/REAL-BOOM-4242/.test(text), "a real uncaught error was not captured (page pre-set __bbWatchMain?)");
     c.expect(!/FORGED-777|Transfer/.test(text), `a forged relay event reached the timeline: ${trim(text, 300)}`);
+  } finally {
+    await c.call("watch_stop", {}).catch(() => undefined);
+  }
+});
+
+// The document_start MAIN-world shim pairs with the watcher before page scripts run: a page that
+// patches CustomEvent / JSON.stringify / dispatchEvent / Function.prototype.call and Object.prototype
+// setters/getters BEFORE load never sees the relay secret and so can't forge lines.
+scenario("watch-relay-secret-not-leaked-to-prepatched-page", async (c) => {
+  if (!c.h.toolSchemas.has("watch_start")) c.skip("watch tools not exposed");
+  const tabId = await c.open("basic.html");
+  const ws = await c.call("watch_start", { tabId, console: true, retain: "none" });
+  c.expect(!ws.isError, `watch_start failed: ${trim(ws.text, 160)}`);
+  try {
+    // A fresh document load in the watched tab: the registered document_start shim applies.
+    const nav = await c.call("navigate", { tabId, url: c.h.fixtureUrl("watch-prepatched.html") });
+    c.expect(!nav.isError, `navigate failed: ${trim(nav.text, 160)}`);
+    await c.call("wait_for", { tabId, timeoutMs: 400 });
+    const tries = await c.evalJs(tabId, "window.__forge()");
+    await c.evalJs(tabId, "setTimeout(() => { throw new Error('REAL-PREPATCH-31337') }, 0); 1");
+    const text = await readWatchUntil(c, /REAL-PREPATCH-31337/, 12_000);
+    const leaked = await c.evalJs(tabId, "JSON.parse(JSON.stringify(window.__leaked))");
+    c.note(`forge attempts=${tries} leaked=${JSON.stringify(leaked)} read=${trim(text, 240)}`);
+    c.expect(/REAL-PREPATCH-31337/.test(text), "a real uncaught error on the prepatched page was not captured");
+    c.expect(!/FORGED-PREPATCH/.test(text), `a forged line reached the timeline: ${trim(text, 300)}`);
+    c.expect(Array.isArray(leaked) && leaked.length === 0, `the page saw the relay secret: ${JSON.stringify(leaked)}`);
   } finally {
     await c.call("watch_stop", {}).catch(() => undefined);
   }
