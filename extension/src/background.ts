@@ -2199,6 +2199,25 @@ interface PausedEntry {
   ts: number;
 }
 
+// Continue every held request unmodified (falling back to failing it, so the page never hangs) and
+// clear the map. Returns how many were held.
+async function releasePaused(tabId: number, s: Session): Promise<number> {
+  const held = [...s.paused.values()];
+  s.paused.clear();
+  for (const e of held) {
+    try {
+      await cmd(tabId, e.stage === "Response" ? "Fetch.continueResponse" : "Fetch.continueRequest", { requestId: e.requestId });
+    } catch {
+      try {
+        await cmd(tabId, "Fetch.failRequest", { requestId: e.requestId, errorReason: "Aborted" });
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+  return held.length;
+}
+
 // ---- console/log capture ----
 interface LogEntry {
   source: string;
@@ -5197,10 +5216,14 @@ async function dispatch(method: string, params: any): Promise<any> {
       const s = await ensureAttached(tab.id!);
       const patterns = params.patterns ?? defaultFetchPatterns(params.stage);
       s.interceptRules = Array.isArray(params.rules) ? params.rules : [];
-      s.paused.clear();
+      // A second intercept_start must not just forget requests the previous one is holding: the page's
+      // fetches would hang forever. Release them unmodified first (as intercept_stop does).
+      const released = await releasePaused(tab.id!, s);
       await cmd(tab.id!, "Fetch.enable", { patterns });
       s.interceptOn = true;
-      return { intercepting: true, tabId: tab.id!, patterns, rules: s.interceptRules.length };
+      const out: any = { intercepting: true, tabId: tab.id!, patterns, rules: s.interceptRules.length };
+      if (released) out.releasedPaused = released;
+      return out;
     }
 
     case "intercept_pending": {
@@ -5261,14 +5284,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       if (s) {
         s.interceptOn = false;
         s.interceptRules = [];
-        for (const e of s.paused.values()) {
-          try {
-            await cmd(tab.id!, e.stage === "Response" ? "Fetch.continueResponse" : "Fetch.continueRequest", { requestId: e.requestId });
-          } catch {
-            /* already gone */
-          }
-        }
-        s.paused.clear();
+        await releasePaused(tab.id!, s);
         try {
           await cmd(tab.id!, "Fetch.disable");
         } catch {

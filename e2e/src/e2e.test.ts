@@ -464,3 +464,32 @@ scenario("hover-revealed-button", async (c) => {
   c.note(`after hover click -> ${trim(ok.text, 160)}`);
   c.expect((await c.evalJs(tabId, "window.__ran")) === 1, `button did not run after trusted hover: ${trim(ok.text, 160)}`);
 });
+
+// Restarting interception must release (not forget) the requests the first one is holding.
+scenario("intercept-restart-releases-paused", async (c) => {
+  if (!c.h.toolSchemas.has("intercept_start")) c.skip("intercept tools not exposed");
+  const tabId = await c.open("basic.html");
+  try {
+    await c.call("intercept_start", { tabId, patterns: [{ urlPattern: "*held=1*" }] });
+    await c.evalJs(tabId, "window.__held = 'pending'; fetch(location.href + '?held=1').then(r => { window.__held = 'done:' + r.status; }, e => { window.__held = 'err:' + e; }); 1");
+    let pending: any = null;
+    for (let i = 0; i < 20; i++) {
+      pending = await c.call("intercept_pending", { tabId });
+      if ((pending.json?.count ?? 0) > 0) break;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    c.expect((pending?.json?.count ?? 0) === 1, `request was not held: ${trim(pending?.text ?? "", 160)}`);
+    const again = await c.call("intercept_start", { tabId, patterns: [{ urlPattern: "*never-matches*" }] });
+    c.note(`restart -> ${trim(again.text, 160)}`);
+    let held = "";
+    for (let i = 0; i < 20; i++) {
+      held = String(await c.evalJs(tabId, "window.__held"));
+      if (held !== "pending") break;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    c.expect(/^done:200$/.test(held), `held request was not released by the restart (page sees ${held})`);
+    c.expect(again.json?.releasedPaused === 1, `restart did not report releasedPaused: ${trim(again.text, 160)}`);
+  } finally {
+    await c.call("intercept_stop", { tabId }).catch(() => undefined);
+  }
+});
