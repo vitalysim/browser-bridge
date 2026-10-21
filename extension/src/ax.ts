@@ -179,7 +179,7 @@ export function bbAxSnapshot(epoch: number): { url: string; root: AxWalkNode[]; 
   // fingerprint. ----
   const AUTO_ID = /^(radix-|react-aria|headlessui-|mui-|rc[-_]|ember\d|:r|«r|_r_|aria-)|[:«»]|\d{3,}|^[0-9a-f-]{16,}$/i;
   const ICON_SKIP = /^(fa-(solid|regular|light|thin|duotone|brands|sharp|fw|lg|xs|sm|xl|\dx|spin|pulse|border|inverse|stack.*|rotate.*|flip.*)|lucide-icon|bi-icon)$/;
-  const hintOf = (el: Element): string => {
+  const hintOf = (el: Element, selfOnly = false): string => {
     const clean = (s: string | null | undefined) => (s || "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\s]+/g, " ").trim().slice(0, 60);
     const attr = (e: Element | null, a: string) => clean(e ? e.getAttribute(a) : "");
     const desc = el.getAttribute("aria-describedby");
@@ -195,7 +195,7 @@ export function bbAxSnapshot(epoch: number): { url: string; root: AxWalkNode[]; 
     }
     const sub = (sel: string): Element | null => {
       try {
-        return el.matches(sel) ? el : el.querySelector(sel);
+        return el.matches(sel) ? el : selfOnly ? null : el.querySelector(sel);
       } catch {
         return null;
       }
@@ -216,7 +216,7 @@ export function bbAxSnapshot(epoch: number): { url: string; root: AxWalkNode[]; 
     if (di) return `icon:${di}`;
     let icons: Element[] = [];
     try {
-      icons = Array.from(el.querySelectorAll("svg, i, span[class*='icon'], span[class*='material']")).slice(0, 8);
+      icons = selfOnly ? [] : Array.from(el.querySelectorAll("svg, i, span[class*='icon'], span[class*='material']")).slice(0, 8);
       if (/^(svg|i)$/i.test(el.tagName)) icons.unshift(el);
     } catch {}
     for (const ic of icons) {
@@ -346,7 +346,8 @@ export function bbAxSnapshot(epoch: number): { url: string; root: AxWalkNode[]; 
     Object.assign(node, statesOf(el, role, tag));
     if (interactive && !name) {
       try {
-        const h = hintOf(el);
+        // a composite widget (listbox, menu, tablist...) must not borrow its first item's icon/testid
+        const h = hintOf(el, /^(listbox|menu|menubar|tablist|tree|grid|treegrid|radiogroup|toolbar|combobox)$/.test(role));
         if (h) node.hint = h;
       } catch {}
     }

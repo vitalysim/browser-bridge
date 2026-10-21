@@ -1175,7 +1175,7 @@ function bbSnapshot(epoch: number, o: { limit: number; viewportOnly: boolean; mo
     // data-icon, material ligature). NOT part of the ref fingerprint. Keep in sync with hintOf in ax.ts.
     const AUTO_ID = /^(radix-|react-aria|headlessui-|mui-|rc[-_]|ember\d|:r|«r|_r_|aria-)|[:«»]|\d{3,}|^[0-9a-f-]{16,}$/i;
     const ICON_SKIP = /^(fa-(solid|regular|light|thin|duotone|brands|sharp|fw|lg|xs|sm|xl|\dx|spin|pulse|border|inverse|stack.*|rotate.*|flip.*)|lucide-icon|bi-icon)$/;
-    const hintOf = (el: Element): string => {
+    const hintOf = (el: Element, selfOnly = false): string => {
       const clean = (s: string | null | undefined) => (s || "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\s]+/g, " ").trim().slice(0, 60);
       const attr = (e: Element | null, a: string) => clean(e ? e.getAttribute(a) : "");
       const desc = el.getAttribute("aria-describedby");
@@ -1185,6 +1185,7 @@ function bbSnapshot(epoch: number, o: { limit: number; viewportOnly: boolean; mo
       }
       const sub = (sel: string): Element | null => {
         if (safeMatches(el, sel)) return el;
+        if (selfOnly) return null;
         try {
           return el.querySelector(sel);
         } catch {
@@ -1207,7 +1208,7 @@ function bbSnapshot(epoch: number, o: { limit: number; viewportOnly: boolean; mo
       if (di) return `icon:${di}`;
       let icons: Element[] = [];
       try {
-        icons = Array.from(el.querySelectorAll("svg, i, span[class*='icon'], span[class*='material']")).slice(0, 8);
+        icons = selfOnly ? [] : Array.from(el.querySelectorAll("svg, i, span[class*='icon'], span[class*='material']")).slice(0, 8);
         if (/^(svg|i)$/i.test(el.tagName)) icons.unshift(el);
       } catch {}
       for (const ic of icons) {
@@ -1237,7 +1238,8 @@ function bbSnapshot(epoch: number, o: { limit: number; viewportOnly: boolean; mo
       else {
         let h = "";
         try {
-          h = hintOf(target);
+          // a composite widget (listbox, menu, tablist...) must not borrow its first item's icon/testid
+          h = hintOf(target, /^(listbox|menu|menubar|tablist|tree|grid|treegrid|radiogroup|toolbar|combobox)$/.test(role));
         } catch {}
         if (h) e.hint = h;
       }

@@ -426,6 +426,8 @@ scenario("icon-only-hints", async (c) => {
   const named = findEl(elements, (e) => e.name === "Named already");
   c.expect(named && named.hint === undefined, `a named element got a hint: ${JSON.stringify(named)}`);
   c.expect(elements.every((e) => !/[\n\r]/.test(String(e.hint ?? ""))), "a hint contains a newline");
+  const lb = findEl(elements, (e) => e.role === "listbox");
+  c.expect(!lb || lb.hint === undefined, `the listbox borrowed its first option's hint: ${JSON.stringify(lb)}`);
   c.expect(!elements.some((e) => /radix-/.test(String(e.hint ?? ""))), "an auto-generated id leaked into a hint");
   // filter matches hint text
   const f = await c.call("snapshot", { tabId, filter: "key=files" });
