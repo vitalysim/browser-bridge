@@ -157,8 +157,13 @@ export function printSummary(): void {
   const skip = records.filter((r) => r.status === "skip").length;
   console.log("\n" + out.join("\n") + `\n\n${pass} passed, ${fail} failed, ${skip} skipped\n`);
   try {
-    writeFileSync(join(ARTIFACTS, "results.json"), JSON.stringify(records, null, 2));
-    console.log(`[e2e] per-call details: ${join(ARTIFACTS, "results.json")}`);
+    // One file per test file (each runs in its own process), so the last file to finish doesn't
+    // overwrite the others: results.json for e2e.test.ts, results-<name>.json for core/devtools/....
+    const testFile = process.argv.map((a) => a.split("/").pop() ?? "").find((a) => a.endsWith(".test.ts"));
+    const tag = testFile && testFile !== "e2e.test.ts" ? `-${testFile.replace(/\.test\.ts$/, "")}` : "";
+    const out = join(ARTIFACTS, `results${tag}.json`);
+    writeFileSync(out, JSON.stringify(records, null, 2));
+    console.log(`[e2e] per-call details: ${out}`);
   } catch {
     /* best-effort */
   }

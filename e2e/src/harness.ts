@@ -536,12 +536,16 @@ export class Harness {
     try {
       // Belt and braces: the SDK's own request timeout (which also sends notifications/cancelled), and
       // a race in case the transport itself wedges.
+      // The race timer is cleared once the call settles (and unref'd), so a long per-call timeout can't
+      // keep the test process alive for minutes after teardown.
+      let wedge: ReturnType<typeof setTimeout> | undefined;
       const res: any = await Promise.race([
         this.client.callTool({ name, arguments: args }, undefined, { timeout: timeoutMs }),
-        sleep(timeoutMs + 2_000).then(() => {
-          throw Object.assign(new Error("transport wedged"), { code: -32001 });
+        new Promise((_, reject) => {
+          wedge = setTimeout(() => reject(Object.assign(new Error("transport wedged"), { code: -32001 })), timeoutMs + 2_000);
+          wedge.unref?.();
         }),
-      ]);
+      ]).finally(() => clearTimeout(wedge));
       const text = (res.content ?? []).find((c: any) => c.type === "text")?.text ?? "";
       let json: any;
       try {
