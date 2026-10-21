@@ -1,0 +1,14 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>confirm dialog</title></head>
+<body>
+<h1>Confirm dialog</h1>
+<button id="del" type="button">Delete account</button>
+<p id="out">idle</p>
+<script>
+  window.__answer = null;
+  document.getElementById("del").addEventListener("click", () => {
+    window.__answer = confirm("Really delete?");
+    document.getElementById("out").textContent = "answered: " + window.__answer;
+  });
+</script>
+</body></html>

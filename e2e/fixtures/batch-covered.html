@@ -1,0 +1,13 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>batch covered</title>
+<style>#overlay{position:fixed;inset:0;background:rgba(0,0,0,.3);z-index:10}</style></head>
+<body>
+<h1>Covered button</h1>
+<button id="covered" type="button" style="margin:40px;padding:20px">Buy now</button>
+<input id="after" placeholder="should stay empty">
+<div id="overlay">cookie wall</div>
+<script>
+  window.__bought = false;
+  document.getElementById("covered").addEventListener("click", () => { window.__bought = true; });
+</script>
+</body></html>

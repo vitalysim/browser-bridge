@@ -1,0 +1,15 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>select and checkbox</title></head>
+<body>
+<h1>Form</h1>
+<label>State <select id="state" name="state">
+  <option value="">-- choose --</option>
+  <option value="CA">California</option>
+  <option value="NY">New York</option>
+</select></label>
+<label><input type="checkbox" id="agree" name="agree"> I agree</label>
+<script>
+  window.__changes = [];
+  document.getElementById("state").addEventListener("change", (e) => window.__changes.push(e.target.value));
+</script>
+</body></html>

@@ -1,0 +1,25 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>slow iframe</title></head>
+<body>
+<h1>Page with a never-finishing iframe</h1>
+<button id="go" type="button">Go</button>
+<p id="out">idle</p>
+<div id="slot"></div>
+<script>
+  window.__go = 0;
+  window.__iframeInserted = false;
+  document.getElementById("go").addEventListener("click", () => {
+    window.__go++;
+    document.getElementById("out").textContent = "went " + window.__go;
+  });
+  // Inserted after load (like a lazy ad/analytics frame): the top document itself is complete, but
+  // the fixture server sends this frame's response headers and part of its body and then never ends.
+  window.addEventListener("load", () => setTimeout(() => {
+    const f = document.createElement("iframe");
+    f.src = "/hang?" + Date.now();
+    f.width = 300; f.height = 60;
+    document.getElementById("slot").appendChild(f);
+    window.__iframeInserted = true;
+  }, 0));
+</script>
+</body></html>
