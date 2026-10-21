@@ -20,8 +20,17 @@ class SkipSignal extends Error {}
 
 export class Ctx {
   tabs: number[] = [];
-  private failures: string[] = [];
-  constructor(readonly h: Harness, readonly rec: ScenarioRecord, private readonly t: TestContext) {}
+  constructor(
+    readonly h: Harness,
+    readonly rec: ScenarioRecord,
+    private readonly t: TestContext,
+    private readonly failures: string[] = []
+  ) {}
+
+  /** The same scenario (record + soft-assertion list) driving a second, separately set-up harness. */
+  fork(h2: Harness): Ctx {
+    return new Ctx(h2, this.rec, this.t, this.failures);
+  }
 
   async call(name: string, args: any = {}, opts: { timeoutMs?: number; allowTimeout?: boolean } = {}): Promise<CallResult> {
     let r: CallResult;

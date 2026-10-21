@@ -63,5 +63,12 @@ failure with its duration, never a stuck run.
 Each asserts the **desired** behaviour; several fail on the current code by design. See
 [BASELINE.md](BASELINE.md) for the results against main and why.
 
+`hidden-tab-raf-commit` needs a tab that is really hidden (`visibilityState:'hidden'`, no rAF). Playwright
+enables `Emulation.setFocusEmulationEnabled` on every page it controls, which keeps background tabs
+visible and rendering, so that scenario starts a second `Harness({ rawBrowser: true })`: the same
+Chromium build spawned directly with `--remote-debugging-pipe`, configured through a one-off CDP session
+to the extension's service worker only (no page is attached), with its own bridge server
+(`server-raw.log`). `harness.rawCdp` stays available for measurements. No dialog tracking in that mode.
+
 `trusted-click-sanity` is a harness self-check: it proves the `chrome.debugger` (CDP) path works in
 this Playwright-launched Chromium, so failures involving trusted escalation are product failures.
