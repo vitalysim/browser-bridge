@@ -2,7 +2,7 @@
 // it can be tested on fixtures (server/test/token-tools.test.ts). No function here ever prints or
 // returns a token value in a report.
 import { randomBytes } from "crypto";
-import { readFileSync, writeFileSync, renameSync, existsSync, statSync, chmodSync, createReadStream, createWriteStream, readdirSync, unlinkSync, openSync, closeSync } from "fs";
+import { readFileSync, writeFileSync, renameSync, existsSync, statSync, chmodSync, createReadStream, createWriteStream, readdirSync, unlinkSync, openSync, closeSync, realpathSync } from "fs";
 import { createInterface } from "readline";
 import { join, dirname, basename } from "path";
 
@@ -19,8 +19,18 @@ export function readTokenFile(path) {
   }
 }
 
-/** Write `content` to `path` atomically (temp file in the same dir + rename), owner-only. */
+/**
+ * Write `content` to `path` atomically (temp file in the same dir + rename), owner-only. If `path` is a
+ * symlink (dotfiles managers), the link's TARGET is replaced, so the symlink itself survives.
+ */
 export function atomicWrite(path, content, mode = 0o600) {
+  let target = path;
+  try {
+    target = realpathSync(path);
+  } catch {
+    /* doesn't exist yet: write it where asked */
+  }
+  path = target;
   const tmp = join(dirname(path), `.${basename(path)}.${process.pid}.${Date.now()}.tmp`);
   const fd = openSync(tmp, "wx", mode);
   try {
@@ -99,9 +109,23 @@ export function updateClaudeConfigFile(path, oldToken, newToken, { dryRun = fals
   }
   const report = rewriteClaudeConfig(json, oldToken, dryRun ? null : newToken);
   if (!dryRun && report.changed.length) {
+    // Running Claude Code processes rewrite this file too. Re-read it right before writing and apply the
+    // same edit to the fresh copy, so a concurrent change made since the first read is not lost.
+    let fresh = text;
+    let freshJson = json;
+    try {
+      fresh = readFileSync(path, "utf8");
+      if (fresh !== text) {
+        freshJson = JSON.parse(fresh);
+        rewriteClaudeConfig(freshJson, oldToken, newToken);
+      }
+    } catch {
+      fresh = text;
+      freshJson = json;
+    }
     const mode = statSync(path).mode & 0o777;
-    atomicWrite(`${path}.bak`, text, 0o600);
-    atomicWrite(path, JSON.stringify(json, null, detectIndent(text)) + (text.endsWith("\n") ? "\n" : ""), mode || 0o600);
+    atomicWrite(`${path}.bak`, fresh, 0o600);
+    atomicWrite(path, JSON.stringify(freshJson, null, detectIndent(fresh)) + (fresh.endsWith("\n") ? "\n" : ""), mode || 0o600);
   }
   return { path, exists: true, ...report, backup: !dryRun && report.changed.length ? `${path}.bak` : undefined };
 }

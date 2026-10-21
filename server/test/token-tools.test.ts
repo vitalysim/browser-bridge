@@ -1,7 +1,7 @@
 // scripts/rotate-token.mjs + scripts/scrub-log.mjs helpers, on fixtures in a temp dir.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, statSync, existsSync, chmodSync, readdirSync } from "fs";
+import { mkdtempSync, writeFileSync, readFileSync, statSync, existsSync, chmodSync, readdirSync, symlinkSync, lstatSync, mkdirSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 // @ts-ignore - plain .mjs module without types
@@ -126,4 +126,20 @@ test("logFiles finds server.log, rotations and launchd.log only", () => {
   const dir = tmp();
   for (const n of ["server.log", "server.log.1", "server.log.3", "launchd.log", "token", "server.log.bak"]) writeFileSync(join(dir, n), "x");
   assert.deepEqual(logFiles(dir).map((p: string) => p.slice(dir.length + 1)), ["launchd.log", "server.log", "server.log.1", "server.log.3"]);
+});
+
+test("updateClaudeConfigFile keeps a symlinked config a symlink and edits its target", () => {
+  const d = tmp();
+  mkdirSync(join(d, "dotfiles"));
+  const real = join(d, "dotfiles", "claude.json");
+  writeFileSync(real, JSON.stringify(fixtureConfig(), null, 2) + "\n", { mode: 0o600 });
+  const link = join(d, ".claude.json");
+  symlinkSync(real, link);
+  const r = updateClaudeConfigFile(link, OLD, NEW);
+  assert.ok(r.changed.length >= 1);
+  assert.ok(lstatSync(link).isSymbolicLink(), "the symlink must survive the atomic rewrite");
+  const after = JSON.parse(readFileSync(real, "utf8"));
+  assert.equal(after.mcpServers["browser-bridge"].headers.Authorization, `Bearer ${NEW}`);
+  assert.ok(!readFileSync(real, "utf8").includes(OLD) || JSON.stringify(after).includes(`Bearer ${OLD}`), "only bridge entries changed");
+  assert.equal(after.projects["/Users/x/proj"].mcpServers.other.headers.Authorization, `Bearer ${OLD}`, "non-bridge entry untouched");
 });
