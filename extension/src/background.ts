@@ -75,7 +75,7 @@ const ATTACH_MS = 10_000; // debugger attach + DOM/Page enable
 const CAPTURE_STEP_MS = 10_000; // one captureVisibleTab grab inside the per-window queue
 
 // JavaScript dialogs currently open, per tab. Only observable while the debugger is attached with
-// Page.enable (ensureAttached does that); recorded from Page.javaScriptDialogOpening/Closed.
+// Page.enable (ensureAttached does that); recorded from Page.javascriptDialogOpening/Closed.
 interface PendingDialog {
   type: string;
   message: string;
@@ -86,7 +86,7 @@ interface PendingDialog {
 const pendingDialogs = new Map<number, PendingDialog>();
 
 function onDialogEvent(tabId: number, method: string, params: any): void {
-  if (method === "Page.javaScriptDialogOpening") {
+  if (method === "Page.javascriptDialogOpening") {
     pendingDialogs.set(tabId, {
       type: String(params?.type ?? "alert"),
       message: String(params?.message ?? ""),
@@ -94,7 +94,7 @@ function onDialogEvent(tabId: number, method: string, params: any): void {
       defaultPrompt: params?.defaultPrompt,
       at: Date.now(),
     });
-  } else if (method === "Page.javaScriptDialogClosed") {
+  } else if (method === "Page.javascriptDialogClosed") {
     pendingDialogs.delete(tabId);
   }
 }
@@ -2755,7 +2755,7 @@ function capExtra(s: Session): void {
 function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, params: any) {
   const tabId = source.tabId;
   if (tabId == null) return;
-  if (method === "Page.javaScriptDialogOpening" || method === "Page.javaScriptDialogClosed") onDialogEvent(tabId, method, params);
+  if (method === "Page.javascriptDialogOpening" || method === "Page.javascriptDialogClosed") onDialogEvent(tabId, method, params);
   const s = sessions.get(tabId);
   if (!s) return;
   // Fetch interception + console/log capture run independently of Network capture (netOn).
