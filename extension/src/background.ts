@@ -8,7 +8,7 @@ import { CDP_MODS, keyInfo, parseKeyCombo, pickFocusedFrame, matchCdpFrame, type
 import { bbAxSnapshot } from "./ax";
 import { buildReplayHeaders } from "./replay-headers";
 import { allocateFrameBudgets, assignAxRefs, clampLimit, frameOffsets, pickSelectorTarget, routeRef, SNAPSHOT_DEFAULT_LIMIT, SNAPSHOT_MAX_LIMIT, type LocateMatch, type RefRoute } from "./snapshot-plan";
-import { emulateDevice, emulateNetwork, emulateCpu, emulateLocale, emulateGeolocation, emulateReset } from "./emulate.js";
+import { emulateDevice, emulateNetwork, emulateCpu, emulateLocale, emulateGeolocation, emulateReset, hasEmulation, emulationState, forgetEmulation } from "./emulate.js";
 
 // Injected at build time by build.mjs (esbuild define) from extension/package.json - single
 // source of truth shared with manifest.json, so the version can't drift.
@@ -2386,6 +2386,7 @@ async function ensureAttached(tabId: number): Promise<Session> {
 async function detachSession(tabId: number): Promise<void> {
   finalizeCapture(tabId); // flush + close the on-disk sink before the session goes away
   sessions.delete(tabId);
+  forgetEmulation(tabId); // CDP drops every override on detach
   pendingDialogs.delete(tabId); // no longer observable once detached - don't report a stale one
   try {
     await new Promise<void>((resolve) => chrome.debugger.detach({ tabId }, () => resolve()));
@@ -2428,7 +2429,9 @@ function idleSweep() {
     // Release paused requests the agent has abandoned FIRST, so a forgotten intercept can't hold the
     // tab (and the banner) open forever via the paused.size check below.
     if (s.paused.size > 0) sweepPaused(tabId, s);
-    if (s.netOn || s.interceptOn || s.logOn || s.paused.size > 0) continue;
+    // Live emulate_* overrides exist only while the debugger is attached: detaching would silently
+    // revert the device/network/locale the agent set, so they count as activity until emulate_reset.
+    if (s.netOn || s.interceptOn || s.logOn || s.paused.size > 0 || hasEmulation(tabId)) continue;
     if (now - s.lastUsedAt > IDLE_DETACH_MS) void detachSession(tabId);
   }
 }
@@ -4844,7 +4847,7 @@ async function dispatch(method: string, params: any): Promise<any> {
         const s = sessions.get(params.tabId);
         const detach = lastDetach.get(params.tabId);
         return s
-          ? { tabId: params.tabId, attached: true, capturing: s.netOn, bufferedRequests: s.net.size, deepRefs: s.refNodes.size, idleMs: Date.now() - s.lastUsedAt }
+          ? { tabId: params.tabId, attached: true, capturing: s.netOn, bufferedRequests: s.net.size, deepRefs: s.refNodes.size, idleMs: Date.now() - s.lastUsedAt, emulating: emulationState(params.tabId) }
           : { tabId: params.tabId, attached: false, lastDetach: detach };
       }
       return {
@@ -4853,6 +4856,7 @@ async function dispatch(method: string, params: any): Promise<any> {
           capturing: s.netOn,
           bufferedRequests: s.net.size,
           idleMs: Date.now() - s.lastUsedAt,
+          emulating: emulationState(tabId),
         })),
         // Why a capture stopped, when it stopped on its own. "canceled_by_user" = the human dismissed
         // the debugging banner; "replaced_with_devtools" = they opened DevTools on that tab.
@@ -5653,6 +5657,7 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   lastDetach.set(source.tabId, { reason: String(reason ?? "unknown"), at: Date.now() });
   finalizeCapture(source.tabId); // flush + close the sink (user closed banner / DevTools opened / tab gone)
   sessions.delete(source.tabId);
+  forgetEmulation(source.tabId);
   pendingDialogs.delete(source.tabId);
 });
 // A committed top-frame navigation means any dialog the old document showed is gone.
@@ -5663,6 +5668,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   pendingDialogs.delete(tabId);
   finalizeCapture(tabId);
   sessions.delete(tabId);
+  forgetEmulation(tabId);
   const rec = sessionRecordings.get(tabId);
   if (rec) {
     sessionRecordings.delete(tabId);

@@ -1009,7 +1009,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
 
   tool(
     "debugger_status",
-    "Report debugger sessions: whether a tab is attached/capturing, buffered request count, idle time. " +
+    "Report debugger sessions: whether a tab is attached/capturing, buffered request count, idle time, live emulate_* overrides (emulating). " +
       "Omit tabId to list all sessions.",
     { tabId: z.number().optional().describe("Tab id; omit to list all sessions") },
     async ({ tabId }) => textResult(await hub.call("debugger_status", { tabId })),

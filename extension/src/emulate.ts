@@ -4,7 +4,9 @@
 // tab, which overrides are live so emulate_reset can report what it undid - but reset clears every
 // override unconditionally regardless, so a lost map (service-worker eviction, which also detaches the
 // debugger and drops the overrides anyway) can never strand one. Overrides also revert when the
-// debugger detaches (idle sweep after ~5 min, DevTools opened, or debugger_detach).
+// debugger detaches (DevTools opened, banner dismissed, or debugger_detach) - the idle sweep skips tabs
+// with live overrides (hasEmulation) - and every detach path calls forgetEmulation so reset/status
+// never report overrides that are already gone.
 
 // cmd(tabId, method, params) - the CDP sendCommand wrapper from background.ts, passed in to avoid a
 // circular import. ensureAttached(tabId) is called by the dispatch case before these run.
@@ -26,6 +28,24 @@ function mark(tabId: number, ...keys: (keyof Applied)[]) {
   const a = applied.get(tabId) ?? {};
   for (const k of keys) a[k] = true;
   applied.set(tabId, a);
+}
+
+/** Whether any override is live on this tab (keeps the debugger session from idle-detaching). */
+export function hasEmulation(tabId: number): boolean {
+  const a = applied.get(tabId);
+  return !!a && Object.values(a).some(Boolean);
+}
+
+/** The overrides tracked for this tab (for status). */
+export function emulationState(tabId: number): string[] {
+  return Object.entries(applied.get(tabId) ?? {})
+    .filter(([, v]) => v)
+    .map(([k]) => k);
+}
+
+/** The debugger detached: CDP dropped every override, so drop the bookkeeping too. */
+export function forgetEmulation(tabId: number): void {
+  applied.delete(tabId);
 }
 
 export interface DeviceParams {
