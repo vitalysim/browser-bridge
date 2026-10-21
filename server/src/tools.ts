@@ -1591,7 +1591,20 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       tabId: tabIdParam,
     },
     async (args) => {
-      const r = await hub.call("session_record_stop", { tabId: args.tabId }, 30_000);
+      // The events file is the server's: if the extension can't stop the recorder (socket still down
+      // after a drop, or its SW lost the recording), still assemble what reached disk rather than
+      // stranding the recording.
+      let r: any;
+      let stopError: string | undefined;
+      try {
+        r = await hub.call("session_record_stop", { tabId: args.tabId }, 30_000);
+      } catch (e) {
+        const known = hub.recordingTabs();
+        const fallback = args.tabId != null ? (hub.getRecordingPath(args.tabId) ? args.tabId : undefined) : known.length === 1 ? known[0] : undefined;
+        if (fallback == null) throw e;
+        stopError = e instanceof Error ? e.message : String(e);
+        r = { tabId: fallback };
+      }
       const tabId = r?.tabId;
       // The recorder's final batch is streamed separately and can arrive AFTER this ack; its sink
       // writes are async. Wait (bounded) for the streamed `done` and drain the sink to disk BEFORE
@@ -1639,6 +1652,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         inlinedBytes: report?.bytesInlined ?? 0,
         skipped: report?.skipped ?? [],
         eventsPath,
+        ...(stopError ? { note: `the extension could not stop the recorder (${stopError}); assembled the events already on disk` } : {}),
       });
     }
   );
