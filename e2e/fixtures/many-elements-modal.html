@@ -1,0 +1,30 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>many elements + modal</title>
+<style>
+  #grid button{width:60px;height:20px;font-size:9px}
+  #backdrop{position:fixed;inset:0;background:rgba(0,0,0,.4)}
+  [role=dialog]{position:fixed;top:30%;left:30%;background:#fff;padding:20px;border:2px solid #000}
+</style></head>
+<body>
+<div id="grid"></div>
+<script>
+  const grid = document.getElementById("grid");
+  for (let i = 0; i < 700; i++) {
+    const b = document.createElement("button");
+    b.textContent = "Item " + i;
+    grid.appendChild(b);
+  }
+  window.__confirmed = false;
+  // A portal-rendered modal appended LAST to <body>, the way React portals / Radix Dialog do.
+  const backdrop = document.createElement("div");
+  backdrop.id = "backdrop";
+  document.body.appendChild(backdrop);
+  const dlg = document.createElement("div");
+  dlg.setAttribute("role", "dialog");
+  dlg.setAttribute("aria-modal", "true");
+  dlg.setAttribute("aria-label", "Confirm purchase");
+  dlg.innerHTML = '<p>Confirm your purchase?</p><button id="confirm" type="button">Confirm</button>';
+  document.body.appendChild(dlg);
+  document.getElementById("confirm").addEventListener("click", () => { window.__confirmed = true; });
+</script>
+</body></html>

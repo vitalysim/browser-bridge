@@ -6,7 +6,7 @@ testing changes.
 
 ## Prerequisites
 
-- **Node.js 18+**
+- **Node.js 20+**
 - **Chrome, Chromium, or Edge** (Chromium-based)
 - A local checkout of this repo
 

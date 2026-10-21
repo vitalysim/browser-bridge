@@ -20,8 +20,9 @@ reports within a few days. Please do **not** open a public issue for a security 
 
 In scope - issues that weaken the bridge's own security boundary, for example:
 
-- The bearer-token / localhost-binding model (`127.0.0.1` only, token on the MCP endpoint **and** the WS handshake,
-  `chrome-extension://` origin check).
+- The bearer-token / localhost-binding model (`127.0.0.1` only, bearer token on the MCP endpoint, a mutual
+  HMAC challenge-response on the extension WebSocket so the token never crosses the wire,
+  `chrome-extension://` origin check), and the owner-only permissions on `~/.browser-bridge`.
 - The extension's permission surface or message handling.
 - Any path that lets an untrusted web page or a non-localhost process reach the server or drive the extension.
 

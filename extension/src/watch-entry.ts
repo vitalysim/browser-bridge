@@ -425,16 +425,68 @@
   window.addEventListener("hashchange", () => reportNav("hash"), true);
   // The MAIN-world script sends a JSON STRING, not an object: a structured-clone `detail` created in
   // the main world is not reliably readable from an isolated world, and silently reads as undefined.
-  window.addEventListener("bb-watch-main", ((e: CustomEvent) => {
-    let d: any;
+  //
+  // The channel is authenticated: this (isolated, page-invisible) script picks a random per-document
+  // secret, hands it to the service worker in the hello handshake (runtime messages are invisible to
+  // the page) and the SW injects the MAIN-world shim with it. The shim dispatches on an event name
+  // derived from the secret and repeats it in the detail; anything else - a page forging
+  // "bb-watch-main" events to plant fake console/nav lines in the agent's timeline - is ignored.
+  const newNonce = (): string => {
     try {
-      d = JSON.parse(String(e.detail));
+      const a = new Uint8Array(16);
+      crypto.getRandomValues(a);
+      return Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
     } catch {
-      return;
+      return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
     }
-    if (d.kind === "nav") reportNav("spa", !!d.replace);
-    else if (d.kind === "console") push({ t: now(), k: "console", level: d.level, text: String(d.text ?? "").slice(0, 500), src: d.src, line: d.line });
-  }) as EventListener);
+  };
+  // Listen for the shim's relay on the event name derived from the secret `n`; returns the remover.
+  const listenRelay = (n: string) => {
+    const h = ((e: CustomEvent) => {
+      let d: any;
+      try {
+        d = JSON.parse(String(e.detail));
+      } catch {
+        return;
+      }
+      if (!d || typeof d !== "object" || d.n !== n) return;
+      if (d.kind === "nav") reportNav("spa", !!d.replace);
+      else if (d.kind === "console")
+        push({
+          t: now(),
+          k: "console",
+          level: d.level === "warn" ? "warn" : "error",
+          text: String(d.text ?? "").slice(0, 500),
+          src: typeof d.src === "string" && d.src ? d.src.slice(0, 300) : undefined,
+          line: typeof d.line === "number" && d.line ? d.line : undefined,
+        });
+    }) as EventListener;
+    window.addEventListener("bb-watch-main:" + n, h);
+    return () => window.removeEventListener("bb-watch-main:" + n, h);
+  };
+  let mainNonce = newNonce();
+  let offRelay = listenRelay(mainNonce);
+
+  // Pair with the MAIN-world shim loader (vendor/bb-watch-main.js, registered at document_start while
+  // a watch is active): both run before any page script, in either order - see watch-main-entry.ts.
+  // Every fixed-name listener is single-use. If pairing did not happen during the document_start pass
+  // (shim not registered, e.g. a page opened before watch_start), the secret is ROTATED before it is
+  // ever used, so anything a page script managed to ask for in the meantime is worthless.
+  let mainPaired = false;
+  const sendHello = () => {
+    const onAck = () => {
+      mainPaired = true;
+    };
+    document.addEventListener("bb-wm-ack", onAck);
+    document.dispatchEvent(new CustomEvent("bb-wm-hello", { detail: mainNonce }));
+    document.removeEventListener("bb-wm-ack", onAck);
+  };
+  const onAsk = () => {
+    document.removeEventListener("bb-wm-ask", onAsk);
+    if (!mainPaired) sendHello();
+  };
+  sendHello(); // the shim ran first: it is listening and acks synchronously
+  if (!mainPaired) document.addEventListener("bb-wm-ask", onAsk); // the shim runs after us: answer its one ask
 
   document.addEventListener("visibilitychange", () => {
     push({ t: now(), k: document.visibilityState === "hidden" ? "hidden" : "visible", url: nav(), title: document.title });
@@ -447,12 +499,20 @@
 
   w.__bbWatch = {
     v: V,
-    status: () => ({ v: V, armed, dormant, buffered: buf.length, dropped, url: nav() }),
+    get mainNonce() {
+      return mainNonce;
+    },
+    get mainPaired() {
+      return mainPaired;
+    },
+    status: () => ({ v: V, armed, dormant, buffered: buf.length, dropped, url: nav(), mainPaired }),
     arm: (on: boolean, mode?: string) => {
       if (on) {
         armed = true;
         dormant = false;
-        void mode; // the MAIN-world shim receives the mode directly as an injection argument
+        // A paired document_start shim is armed here, on a name only it and we know. An unpaired
+        // document gets the shim injected by the service worker instead (with the mode as an argument).
+        if (mainPaired && mode && mode !== "off") document.dispatchEvent(new CustomEvent("bb-wm-arm:" + mainNonce, { detail: mode }));
         // The initial navigation is the timeline's first entry, so the agent knows where we started.
         push({ t: now(), k: "nav", url: nav(), via: "load", title: document.title });
         flush();
@@ -463,13 +523,28 @@
     },
   };
 
-  try {
-    chrome.runtime.sendMessage({ cmd: "bb-watch-hello", v: V, url: nav() }, (res?: any) => {
-      void chrome.runtime.lastError;
-      if (res && res.armed) w.__bbWatch.arm(true, res.consoleMode);
-      else disarm();
-    });
-  } catch {
-    disarm(); // no extension context (rare) — never leak a growing buffer
-  }
+  const helloSW = () => {
+    try {
+      chrome.runtime.sendMessage({ cmd: "bb-watch-hello", v: V, url: nav(), mainNonce, mainPaired }, (res?: any) => {
+        void chrome.runtime.lastError;
+        if (res && res.armed) w.__bbWatch.arm(true, res.consoleMode);
+        else disarm();
+      });
+    } catch {
+      disarm(); // no extension context (rare) — never leak a growing buffer
+    }
+  };
+  if (mainPaired) helloSW();
+  else
+    // Close the pairing window after the document_start pass. Unpaired: rotate the secret (see above)
+    // before it reaches the service worker, which then injects the shim with the fresh one.
+    setTimeout(() => {
+      document.removeEventListener("bb-wm-ask", onAsk);
+      if (!mainPaired) {
+        offRelay();
+        mainNonce = newNonce();
+        offRelay = listenRelay(mainNonce);
+      }
+      helloSW();
+    }, 0);
 })();

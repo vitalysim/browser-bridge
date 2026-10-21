@@ -209,6 +209,25 @@ worker reports the same thing (`via:"hint"`) without any page patching. Same-URL
 The MAIN-world patch rides on the same injected shim as error capture, so it is present whenever
 `console` is on (the default) and absent under `console:false`, where the service-worker hint covers it.
 
+**The relay can't be forged by the page.** The MAIN-world shim talks to the isolated watcher over an
+event whose name and payload carry a per-document random secret, and the watcher drops anything without
+it. The server also escapes control characters in every rendered field, so one action is always one line.
+
+- **Documents loaded while a watch is active:** the shim (`vendor/bb-watch-main.js`) is a MAIN-world
+  content script registered at `document_start`. It runs before any page script, captures pristine
+  copies of `CustomEvent`, `dispatchEvent`, `Reflect.apply` and `JSON.stringify`, and pairs with the
+  watcher through a one-shot handshake that also completes before page scripts run. A page that patches
+  those primitives, `Function.prototype.call`, or `Object.prototype` getters/setters therefore never sees
+  the secret (covered by the `watch-relay-secret-not-leaked-to-prepatched-page` e2e scenario).
+- **Documents already open when `watch_start` runs (best-effort):** their page scripts have already run,
+  so the shim is injected afterwards and uses the primitives as the page left them. The watcher rotates
+  its secret before handing it over, so nothing a page grabbed earlier is useful. But a page that has
+  already patched `CustomEvent` or `dispatchEvent` can still observe the new secret in transit and plant
+  plausible-looking console/navigation lines (never extra lines). Reload the tab after `watch_start` if
+  that matters.
+- **Residual risk:** a same-origin parent frame that scripts a child frame's window before the child's
+  `document_start` scripts run is not covered.
+
 ### Why not rrweb?
 
 Browser Bridge already records with rrweb (see [RECORDING.md](RECORDING.md)), so deriving the timeline

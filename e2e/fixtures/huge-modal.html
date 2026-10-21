@@ -1,0 +1,22 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>huge page + portal modal</title>
+<style>.modal{position:fixed;inset:20% 30%;background:#fff;border:2px solid #000;padding:12px;z-index:10}</style></head>
+<body>
+<h1>7000 buttons, then a portal modal appended last</h1>
+<div id="list"></div>
+<script>
+  const list = document.getElementById("list");
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < 7000; i++) { const b = document.createElement("button"); b.textContent = "Item " + i; frag.appendChild(b); }
+  list.appendChild(frag);
+  window.__confirmed = false;
+  const m = document.createElement("div");
+  m.className = "modal";
+  m.setAttribute("role", "dialog");
+  m.setAttribute("aria-modal", "true");
+  m.setAttribute("aria-label", "Confirm purchase");
+  m.innerHTML = '<p>Buy it?</p><button id="ok">Confirm</button>';
+  document.body.appendChild(m);
+  document.getElementById("ok").addEventListener("click", () => { window.__confirmed = true; });
+</script>
+</body></html>

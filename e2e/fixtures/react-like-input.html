@@ -1,0 +1,34 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>controlled input</title></head>
+<body>
+<h1>Controlled input</h1>
+<input id="name" placeholder="Your name">
+<p id="echo"></p>
+<script>
+  // Minimal emulation of React's controlled <input>: an instance-level value setter (React's
+  // inputValueTracking "_valueTracker") records programmatic writes; the 'input' listener only treats
+  // the event as a change when node.value differs from the tracked value; and every render writes
+  // state back into the DOM, so a write that never reached state is reverted.
+  window.__state = { name: "" };
+  const input = document.getElementById("name");
+  const proto = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+  let tracked = "";
+  Object.defineProperty(input, "value", {
+    configurable: true,
+    get() { return proto.get.call(this); },
+    set(v) { tracked = String(v); proto.set.call(this, v); },
+  });
+  function render() {
+    input.value = window.__state.name; // controlled: DOM always mirrors state
+    document.getElementById("echo").textContent = "Hello " + window.__state.name;
+  }
+  input.addEventListener("input", () => {
+    const actual = proto.get.call(input);
+    if (actual === tracked) return; // React: no change detected -> onChange is not called
+    tracked = actual;
+    window.__state.name = actual; // setState
+    Promise.resolve().then(render);
+  });
+  setInterval(render, 200);
+</script>
+</body></html>

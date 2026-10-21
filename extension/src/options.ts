@@ -9,6 +9,11 @@ const STATUS_TEXT: Record<string, string> = {
   connecting: "Connecting…",
   disconnected: "Disconnected - is the server running?",
   "no-token": "No token set - paste the server token below",
+  "auth-failed": "Server failed authentication",
+  "token-rejected": "Token rejected by the server",
+  "handshake-timeout": "Handshake timed out - retrying",
+  "version-skew": "Server/extension version mismatch",
+  replaced: "Another browser/profile took over the connection",
 };
 
 async function refresh() {

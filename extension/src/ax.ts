@@ -4,14 +4,18 @@
 //
 // It computes role + accessible name + agent-relevant states for each element, descends through open
 // shadow roots, skips aria-hidden / not-rendered subtrees, and flattens non-semantic wrappers so the
-// tree stays about meaning. Each INTERACTIVE node is registered in window.__bbRefs (same registry and
-// per-frame offset scheme bbSnapshot uses) so its ref works with the existing click/fill/hover/type.
-// The structured tree is rendered to text server-side (server/src/ax.ts) - kept pure for testing.
+// tree stays about meaning. Same two-phase ref scheme as bbSnapshot: each INTERACTIVE node is marked
+// with `pi` (its priority rank: open dialog/modal/popover first, then in-viewport, then the rest in
+// DOM order) and parked in window.__bbPending; the service worker budgets refs across frames, turns
+// ranks into refs (snapshot-plan.ts assignAxRefs) and bbCommitRefs registers them in window.__bbRefs
+// so they work with click/fill/hover/type. Inert subtrees (and everything behind a native modal
+// <dialog>) are skipped. The tree is rendered to text server-side (server/src/ax.ts).
 
 export interface AxWalkNode {
   role: string;
   name?: string;
   ref?: number;
+  pi?: number; // priority rank of an interactive node (phase 1 only; becomes `ref` or is dropped)
   level?: number;
   checked?: boolean | "mixed";
   expanded?: boolean;
@@ -20,18 +24,50 @@ export interface AxWalkNode {
   required?: boolean;
   focused?: boolean;
   value?: string;
+  hint?: string; // discovery hint for an interactive node with no accessible name (see hintOf)
   children?: AxWalkNode[];
 }
 
-export function bbAxSnapshot(refOffset: number): { url: string; root: AxWalkNode[]; truncated: boolean } {
-  // Fresh ref registry each snapshot (never merged), matching bbSnapshot's invariant: refs from a
-  // prior snapshot must not leak, and every ref locator injects in this same ISOLATED world.
-  const bbRefs: Map<number, Element> = ((window as any).__bbRefs = new Map());
-  let refCount = 0; // interactive refs assigned; capped below STRIDE so frames' ranges can't collide
+export function bbAxSnapshot(epoch: number): { url: string; root: AxWalkNode[]; truncated: boolean; total: number; modal?: string } | { error: string } {
+  try {
+    return bbAxWalk(epoch);
+  } catch (e) {
+    return { error: `ax_snapshot failed: ${e instanceof Error ? e.message : String(e)}` };
+  }
+
+  function bbAxWalk(epoch: number) {
   let nodeCount = 0; // total emitted nodes (payload cap)
   let truncated = false;
-  const REF_CAP = 400; // < the 500 per-frame ref stride, like bbSnapshot's element cap
   const NODE_CAP = 1500;
+  // Interactive nodes in DOM order; ranked + parked after the walk.
+  const inter: { el: Element; node: AxWalkNode; bucket: number; meta: { tag: string; role: string; name: string } }[] = [];
+  const vw = window.innerWidth || 0, vh = window.innerHeight || 0;
+  let modal: Element | null = null;
+  try {
+    modal = document.querySelector("dialog:modal");
+  } catch {}
+  const modalNative = !!modal;
+  if (!modal) {
+    const ams = document.querySelectorAll('[aria-modal="true"]');
+    for (let i = ams.length - 1; i >= 0; i--) {
+      const r = ams[i].getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) {
+        modal = ams[i];
+        break;
+      }
+    }
+  }
+  const OVERLAY = 'dialog[open], [aria-modal="true"], [role="dialog"], [role="alertdialog"], [popover]';
+  const inOverlay = (el: Element) => {
+    const c = el.closest(OVERLAY);
+    if (!c) return false;
+    if (!c.hasAttribute("popover")) return true;
+    try {
+      return c.matches(":popover-open");
+    } catch {
+      return false;
+    }
+  };
 
   const norm = (s: string) => (s || "").replace(/\s+/g, " ").trim().slice(0, 200);
 
@@ -137,6 +173,66 @@ export function bbAxSnapshot(refOffset: number): { url: string; root: AxWalkNode
     return "";
   };
 
+  // ---- name hint for NAMELESS interactive nodes (icon-only buttons): same rules as hintOf in
+  // background.ts bbSnapshot (keep in sync): aria-describedby text, title (self / first descendant),
+  // test id, data-key/-value/-action, name attr, non-generated id, icon name. Not part of any ref
+  // fingerprint. ----
+  const AUTO_ID = /^(radix-|react-aria|headlessui-|mui-|rc[-_]|ember\d|:r|«r|_r_|aria-)|[:«»]|\d{3,}|^[0-9a-f-]{16,}$/i;
+  const ICON_SKIP = /^(fa-(solid|regular|light|thin|duotone|brands|sharp|fw|lg|xs|sm|xl|\dx|spin|pulse|border|inverse|stack.*|rotate.*|flip.*)|lucide-icon|bi-icon)$/;
+  const hintOf = (el: Element, selfOnly = false): string => {
+    const clean = (s: string | null | undefined) => (s || "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\s]+/g, " ").trim().slice(0, 60);
+    const attr = (e: Element | null, a: string) => clean(e ? e.getAttribute(a) : "");
+    const desc = el.getAttribute("aria-describedby");
+    if (desc) {
+      const root = el.getRootNode() as Document | ShadowRoot;
+      let t = "";
+      for (const id of desc.split(/\s+/)) {
+        const r = id ? lookupId(root, id) : null;
+        if (r) t += " " + ((r as HTMLElement).innerText || r.textContent || "");
+      }
+      t = clean(t);
+      if (t) return t;
+    }
+    const sub = (sel: string): Element | null => {
+      try {
+        return el.matches(sel) ? el : selfOnly ? null : el.querySelector(sel);
+      } catch {
+        return null;
+      }
+    };
+    const tt = attr(sub("[title]"), "title");
+    if (tt) return tt;
+    for (const a of ["data-testid", "data-test-id", "data-test", "data-cy", "data-qa"]) {
+      const v = attr(sub(`[${a}]`), a);
+      if (v) return `${a}=${v}`;
+    }
+    for (const a of ["data-key", "data-value", "data-action", "name"]) {
+      const v = attr(el, a);
+      if (v) return `${a}=${v}`;
+    }
+    const id = clean(el.id);
+    if (id && !AUTO_ID.test(id)) return `id=${id}`;
+    const di = attr(sub("[data-icon]"), "data-icon");
+    if (di) return `icon:${di}`;
+    let icons: Element[] = [];
+    try {
+      icons = selfOnly ? [] : Array.from(el.querySelectorAll("svg, i, span[class*='icon'], span[class*='material']")).slice(0, 8);
+      if (/^(svg|i)$/i.test(el.tagName)) icons.unshift(el);
+    } catch {}
+    for (const ic of icons) {
+      const cls = (ic.getAttribute("class") || "").split(/\s+/);
+      for (const c of cls) {
+        const m = /^(?:lucide|fa|bi|tabler|ph|ri|mdi|icon)-([a-z0-9-]+)$/i.exec(c);
+        if (m && !ICON_SKIP.test(c)) return `icon:${clean(m[1])}`;
+      }
+      if (cls.some((c) => /^material-(icons|symbols)/.test(c))) {
+        const t = clean(ic.textContent);
+        if (t) return `icon:${t}`;
+      }
+    }
+    return "";
+  };
+
   // ---- interactivity (gets a ref) ----
   const INTERACTIVE_ROLE = new Set([
     "link", "button", "checkbox", "radio", "switch", "tab", "menuitem", "menuitemcheckbox",
@@ -209,12 +305,17 @@ export function bbAxSnapshot(refOffset: number): { url: string; root: AxWalkNode
 
   // ---- the walk: returns this element's contribution (itself, or its children when it's a wrapper) ----
   const GENERIC = new Set(["generic", "none", "presentation", ""]);
+  let walkedFirst: Element | null = null; // the open modal, walked before the page (see below)
   const walk = (el: Element): AxWalkNode[] => {
+    if (el === walkedFirst) return []; // already emitted at the top
     if (nodeCount >= NODE_CAP) {
       truncated = true;
       return [];
     }
     if (SKIP_TAG.has(el.tagName)) return [];
+    if (el.hasAttribute("inert")) return [];
+    // Everything outside a native modal <dialog> is inert (not operable, not in the AX tree).
+    if (modalNative && modal && !el.contains(modal) && !modal.contains(el) && el.getRootNode() === document) return [];
     if (isHidden(el)) return [];
     const tag = el.tagName.toLowerCase();
     const role = roleOf(el);
@@ -243,11 +344,18 @@ export function bbAxSnapshot(refOffset: number): { url: string; root: AxWalkNode
     const name = nameOf(el, role);
     if (name) node.name = name;
     Object.assign(node, statesOf(el, role, tag));
-    if (interactive && refCount < REF_CAP) {
-      refCount++;
-      const ref = refOffset + refCount;
-      bbRefs.set(ref, el);
-      node.ref = ref;
+    if (interactive && !name) {
+      try {
+        // a composite widget (listbox, menu, tablist...) must not borrow its first item's icon/testid
+        const h = hintOf(el, /^(listbox|menu|menubar|tablist|tree|grid|treegrid|radiogroup|toolbar|combobox)$/.test(role));
+        if (h) node.hint = h;
+      } catch {}
+    }
+    if (interactive) {
+      const r = el.getBoundingClientRect();
+      const inVp = r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw;
+      const bucket = inOverlay(el) ? 0 : inVp ? 1 : 2;
+      inter.push({ el, node, bucket, meta: { tag, role, name: (name || "").slice(0, 80) } });
     }
     if (childNodes.length) node.children = childNodes;
     return [node];
@@ -255,10 +363,28 @@ export function bbAxSnapshot(refOffset: number): { url: string; root: AxWalkNode
 
   let root: AxWalkNode[] = [];
   try {
+    // An open modal is walked FIRST: a portal modal is usually the last child of <body>, so on a big
+    // page the node cap would otherwise be spent before the walk ever reaches it.
+    let first: AxWalkNode[] = [];
+    if (modal && modal !== document.body) {
+      first = walk(modal);
+      walkedFirst = modal;
+    }
     const body = document.body;
-    root = body ? walk(body) : [];
+    root = first.concat(body ? walk(body) : []);
   } catch {
     /* return whatever was built */
   }
-  return { url: location.href, root, truncated };
+  // Rank interactive nodes (stable: bucket, then DOM order) and park them for bbCommitRefs.
+  const order = inter.map((_, i) => i).sort((a, b) => inter[a].bucket - inter[b].bucket || a - b);
+  const items: { el: Element; meta: any }[] = [];
+  order.forEach((idx, rank) => {
+    inter[idx].node.pi = rank;
+    items.push({ el: inter[idx].el, meta: inter[idx].meta });
+  });
+  (window as any).__bbPending = { epoch, items };
+  const out: { url: string; root: AxWalkNode[]; truncated: boolean; total: number; modal?: string } = { url: location.href, root, truncated, total: items.length };
+  if (modal) out.modal = norm(modal.getAttribute("aria-label") || (modal as HTMLElement).innerText || "").slice(0, 60) || modal.tagName.toLowerCase();
+  return out;
+  }
 }

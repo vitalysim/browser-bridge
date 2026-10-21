@@ -1,0 +1,21 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>shadow button</title></head>
+<body>
+<h1>Shadow DOM button</h1>
+<x-save-button></x-save-button>
+<p id="out">not clicked</p>
+<script>
+  window.__clicks = 0;
+  customElements.define("x-save-button", class extends HTMLElement {
+    constructor() {
+      super();
+      const root = this.attachShadow({ mode: "open" });
+      root.innerHTML = '<style>button{padding:12px 24px;font-size:16px}</style><button id="inner" type="button">Save changes</button>';
+      root.getElementById("inner").addEventListener("click", () => {
+        window.__clicks++;
+        document.getElementById("out").textContent = "clicked " + window.__clicks;
+      });
+    }
+  });
+</script>
+</body></html>

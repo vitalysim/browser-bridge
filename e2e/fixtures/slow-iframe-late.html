@@ -1,0 +1,24 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>slow iframe + late text</title>
+<style>#pane{height:120px;overflow:auto;border:1px solid #888}#pane p{height:40px;margin:0}</style></head>
+<body>
+<h1>Never-finishing iframe, text that appears late, and a scroll pane</h1>
+<div id="pane"></div>
+<div id="slot"></div>
+<script>
+  const pane = document.getElementById("pane");
+  for (let i = 0; i < 30; i++) { const p = document.createElement("p"); p.textContent = "row " + i; pane.appendChild(p); }
+  window.addEventListener("load", () => setTimeout(() => {
+    const f = document.createElement("iframe");
+    f.src = "/hang?" + Date.now();
+    f.width = 300; f.height = 60;
+    document.getElementById("slot").appendChild(f);
+  }, 0));
+  setTimeout(() => {
+    const p = document.createElement("p");
+    p.id = "late";
+    p.textContent = "Report " + "ready";
+    document.body.appendChild(p);
+  }, 2000);
+</script>
+</body></html>

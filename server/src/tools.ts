@@ -9,11 +9,15 @@ import { spawn } from "child_process";
 import { CALL_TIMEOUT_MS, type ExtensionHub } from "./hub.js";
 import { CaptureSink } from "./capture-sink.js";
 import { inlineAssets } from "./rrweb-inline.js";
-import { classifyError, truncateForText } from "./result.js";
+import { classifyError, resultObject, stepFailure, truncateForText } from "./result.js";
+import { logCall } from "./log.js";
+import { isToolEnabled, parseToolsets, type ToolsetSelection } from "./toolsets.js";
 import { versionSkewWarning } from "./version.js";
 import { buildHar, parseSessionEventsStream } from "./capture-format.js";
 import { renderAxSnapshot, type AxSnapshot } from "./ax.js";
 import { registerEmulateTools } from "./emulate.js";
+import { downloadVerdict, DEFAULT_STALL_MS } from "./download-watch.js";
+import { inputHubTimeout, SCREENSHOT_HUB_TIMEOUT_MS } from "./timeouts.js";
 import {
   DEFAULT_INCLUDE,
   defaultWatchOpts,
@@ -35,6 +39,46 @@ const WATCH_SETTLE_MS = 300;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const MAX_BATCH_ACTIONS = 50;
+
+// get_page_text paging. The default slice leaves headroom under MAX_TEXT_CHARS for the JSON envelope
+// (title/url plus escaping of quotes/newlines), so a page never falls into the prefix-preview path,
+// which would have no way to fetch the rest.
+const PAGE_TEXT_DEFAULT_CHARS = 40_000;
+const PAGE_TEXT_MAX_CHARS = 55_000;
+
+/**
+ * Slice the extension's {title, url, text} to one page: {text, totalChars, offset, nextOffset|null}.
+ * If JSON escaping would still push the envelope over budget, the slice shrinks until it fits, so the
+ * agent always gets a valid page and an exact nextOffset. Exported for tests.
+ */
+export function pageTextSlice(
+  r: any,
+  opts: { tabId?: number; offset?: number; maxChars?: number },
+  budget = MAX_TEXT_CHARS - 500
+): Record<string, unknown> {
+  const full: string = typeof r?.text === "string" ? r.text : "";
+  const totalChars = full.length;
+  const offset = Math.min(Math.max(0, Math.floor(opts.offset ?? 0)), totalChars);
+  let take = Math.max(1, Math.min(Math.floor(opts.maxChars ?? PAGE_TEXT_DEFAULT_CHARS), PAGE_TEXT_MAX_CHARS));
+  const build = (n: number) => {
+    const end = Math.min(totalChars, offset + n);
+    return {
+      // The extension does not report which tab it read; echo the caller's tabId when given.
+      ...(opts.tabId !== undefined ? { tabId: opts.tabId } : {}),
+      ...(r && typeof r === "object" ? { ...r, text: undefined } : {}),
+      text: full.slice(offset, end),
+      totalChars,
+      offset,
+      nextOffset: end < totalChars ? end : null,
+    };
+  };
+  let out = build(take);
+  while (take > 1 && JSON.stringify(out).length > budget) {
+    take = Math.floor(take / 2);
+    out = build(take);
+  }
+  return out;
+}
 
 // Tools that drive the page on the agent's behalf. A watch timeline entry whose ts falls in one of
 // these calls' windows is labeled [agent], so the agent's own clicks/fills are told apart from the
@@ -234,10 +278,12 @@ function imageDims(buf: Buffer): { width: number; height: number } | null {
   return null;
 }
 
-function textResult(value: unknown) {
+// `hint` is what a truncated result tells the agent to do instead. Pass one only when the tool really
+// has a narrowing/paging parameter; the default hint is deliberately tool-agnostic.
+function textResult(value: unknown, hint?: string) {
   // Structure-aware so a trimmed result is still valid JSON (see result.ts); a blind slice of a JSON
   // string yields something no agent can parse.
-  const { text } = truncateForText(value, MAX_TEXT_CHARS);
+  const { text } = truncateForText(value, MAX_TEXT_CHARS, hint);
   return { content: [{ type: "text" as const, text }] };
 }
 
@@ -271,7 +317,67 @@ const timeoutMsParam = z
 // `+5_000` slack. Math.max so the budget can only ever GROW: the default stays exactly CALL_TIMEOUT_MS.
 const actionHubTimeout = (t?: number) => Math.max(CALL_TIMEOUT_MS, (t ?? 5_000) + 5_000);
 
-export function registerTools(server: McpServer, hub: ExtensionHub, version = "0.0.0") {
+const onDialogParam = z
+  .enum(["accept", "dismiss"])
+  .optional()
+  .describe(
+    "Answer any alert/confirm/prompt this action opens (within ~3s) instead of leaving it open: 'accept' = OK, " +
+      "'dismiss' = Cancel. What was shown is returned in dialogs[]. Omit to leave dialogs for the user."
+  );
+const promptTextParam = z.string().optional().describe("Text to answer a prompt() with when onDialog is 'accept'");
+
+const keepAliveParam = z
+  .boolean()
+  .optional()
+  .describe(
+    "Hidden tab (window covered/minimized/other desktop, or another tab in front) renders no frames, so rAF-driven UIs " +
+      "(React-Aria, Radix…) may not update. When the target tab is hidden the action keeps it rendering via the debugger " +
+      "for the action's duration - automatically if a debugger session already exists or the action is trusted; " +
+      "true = also attach the debugger for it (banner); false = never. Results report tabHidden/keptAlive/warning."
+  );
+
+const waitUntilParam = z
+  .enum(["load", "domcontentloaded", "none"])
+  .optional()
+  .describe(
+    "When to return: 'load' (default) waits for the full load event, 'domcontentloaded' for the DOM to be parsed, " +
+      "'none' returns as soon as the navigation is issued. Waiting is capped at ~20s; if the cap is hit the result " +
+      "has loadTimedOut:true (the page may still be usable)."
+  );
+
+export interface RegisterOptions {
+  /** Which tool groups to register (see toolsets.ts). Defaults to BRIDGE_TOOLSETS, i.e. all when unset. */
+  toolsets?: ToolsetSelection;
+}
+
+/**
+ * Wrap a tool handler with one structured stderr line per call (see log.ts). Logs the tool name, a
+ * numeric tabId (from the args, else the result), duration and outcome - NEVER parameter values.
+ * Exported for tests.
+ */
+export function withCallLog(name: string, handler: (args: any, extra?: any) => Promise<any>) {
+  return async (args: any, extra?: any) => {
+    const t0 = performance.now();
+    try {
+      const out = await handler(args, extra);
+      try {
+        const obj = resultObject(out);
+        const f = stepFailure(out, obj);
+        logCall({ tool: name, tabId: args?.tabId ?? obj?.tabId, ms: performance.now() - t0, outcome: f?.outcome ?? "ok", detail: f?.reason });
+      } catch {
+        /* logging must never fail a call */
+      }
+      return out;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logCall({ tool: name, tabId: args?.tabId, ms: performance.now() - t0, outcome: "error", detail: `[${classifyError(err)}] ${msg}` });
+      throw err;
+    }
+  };
+}
+
+export function registerTools(server: McpServer, hub: ExtensionHub, version = "0.0.0", opts: RegisterOptions = {}) {
+  const toolsets = opts.toolsets ?? parseToolsets(process.env.BRIDGE_TOOLSETS);
   // Every registered tool, so browser_batch can invoke the SAME handler the MCP layer would - no
   // duplicated dispatch logic to drift. The schema is kept because calling a handler directly
   // bypasses the SDK's own zod validation, so batch must re-validate each item itself.
@@ -285,10 +391,12 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     inputSchema: z.ZodRawShape,
     handler: (args: any, extra?: any) => Promise<any>
   ) => {
+    // BRIDGE_TOOLSETS: a tool outside the chosen groups is simply not registered (nor batchable).
+    if (!isToolEnabled(name, toolsets)) return;
     // Acting tools mark the window they run in as agent-driven, so watch mode labels the clicks/fills
     // they cause as [agent] rather than as the human's. Done here (not in each handler) so it also
     // covers the batched path, which invokes `handler` directly and would otherwise bypass it.
-    const wrapped = AGENT_ACTION_TOOLS.has(name)
+    const acting = AGENT_ACTION_TOOLS.has(name)
       ? async (args: any, extra?: any) => {
           const from = Date.now();
           try {
@@ -299,6 +407,8 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
           }
         }
       : handler;
+    // Logged here (not at the MCP layer) so batched steps get their own line too.
+    const wrapped = withCallLog(name, acting);
     registry.set(name, { schema: inputSchema, handler: wrapped });
     server.registerTool(name, { description, inputSchema }, async (args: any, extra: any) => {
       try {
@@ -323,9 +433,13 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
 
   tool(
     "tab_new",
-    "Open a new browser tab. Returns the new tab's id once the page finishes loading.",
-    { url: z.string().describe("URL to open"), regularWindow: z.boolean().optional().describe("Open in a regular, non-incognito window regardless of which window is active") },
-    async ({ url, regularWindow }) => textResult(await hub.call("tab_new", { url, regularWindow }))
+    "Open a new browser tab. Returns the new tab's id once the page finishes loading (see waitUntil).",
+    {
+      url: z.string().describe("URL to open"),
+      regularWindow: z.boolean().optional().describe("Open in a regular, non-incognito window regardless of which window is active"),
+      waitUntil: waitUntilParam,
+    },
+    async ({ url, regularWindow, waitUntil }) => textResult(await hub.call("tab_new", { url, regularWindow, waitUntil }))
   );
 
   tool(
@@ -351,9 +465,10 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
 
   tool(
     "navigate",
-    "Navigate a tab to a URL and wait for the page to finish loading.",
-    { url: z.string().describe("URL to navigate to"), tabId: tabIdParam },
-    async ({ url, tabId }) => textResult(await hub.call("navigate", { url, tabId }))
+    "Navigate a tab to a URL and wait for the page to finish loading (see waitUntil). If the page's beforeunload " +
+      "dialog blocks the navigation this reports it (navigated:false) instead of success - resolve it with handle_dialog.",
+    { url: z.string().describe("URL to navigate to"), tabId: tabIdParam, waitUntil: waitUntilParam },
+    async ({ url, tabId, waitUntil }) => textResult(await hub.call("navigate", { url, tabId, waitUntil }))
   );
 
   tool(
@@ -362,20 +477,50 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       "pages, e.g. summarizing a feed. Reads `innerText` (rendered text) by default, which OMITS `display:none` / " +
       "collapsed content (e.g. un-expanded accordion bodies). Set includeHidden:true to read `textContent` instead, " +
       "capturing hidden-but-present DOM (loses some block line breaks). Truly virtualized/unmounted content still " +
-      "needs a scroll/expand first.",
-    { tabId: tabIdParam, includeHidden: z.boolean().optional().describe("Include display:none/collapsed text via textContent (default false = rendered innerText only)") },
-    async ({ tabId, includeHidden }) => textResult(await hub.call("get_page_text", { tabId, includeHidden }))
+      "needs a scroll/expand first. Long pages are PAGED: the result carries totalChars and nextOffset - call again " +
+      "with offset:nextOffset to read the rest (nextOffset is null on the last page).",
+    {
+      tabId: tabIdParam,
+      includeHidden: z.boolean().optional().describe("Include display:none/collapsed text via textContent (default false = rendered innerText only)"),
+      offset: z.number().int().min(0).optional().describe("Character offset into the page text to start from (default 0); pass the previous result's nextOffset"),
+      maxChars: z
+        .number()
+        .int()
+        .min(1)
+        .max(PAGE_TEXT_MAX_CHARS)
+        .optional()
+        .describe(`Max characters of text to return (default ${PAGE_TEXT_DEFAULT_CHARS}, max ${PAGE_TEXT_MAX_CHARS})`),
+    },
+    async ({ tabId, includeHidden, offset, maxChars }) => {
+      const r = await hub.call("get_page_text", { tabId, includeHidden });
+      return textResult(pageTextSlice(r, { tabId, offset, maxChars }), "page with offset/maxChars (see nextOffset)");
+    }
   );
 
   tool(
     "snapshot",
-    "List the interactive elements on the page (links, buttons, inputs), including inside iframes " +
-      "and open shadow DOM. Each element gets a numeric ref usable with click/fill/hover/type " +
-      "(pass ref as a number, or use a CSS selector instead). Set deep:true to also reach CLOSED " +
-      "shadow roots via the debugger (shows the debugging banner; refs from a deep snapshot must be " +
-      "used with trusted:true actions).",
-    { tabId: tabIdParam, deep: z.boolean().optional().describe("Pierce closed shadow roots via chrome.debugger (shows banner)") },
-    async ({ tabId, deep }) => textResult(await hub.call("snapshot", { tabId, deep }))
+    "List the interactive elements on the page - links, buttons, inputs, selects, ARIA widgets (tab, option, " +
+      "checkbox, switch, combobox, slider, treeitem...), summary, contenteditable, focusable/onclick elements, " +
+      "cursor:pointer clickables, and visually-hidden checkboxes/radios via their label - including iframes and " +
+      "open shadow DOM. RECOMMENDED DEFAULT for finding something to act on. Each element: {ref, tag, role, name, " +
+      "type, value, checked/selected/expanded/disabled, inViewport, frameId (child frames)}; empty fields omitted. " +
+      "A NAMELESS element (icon-only button, sidebar item) gets `hint` instead: its tooltip/title, data-testid=..., " +
+      "data-key=..., id=..., or icon:<name> (e.g. icon:play) - use it to pick or build a selector. " +
+      "Ordered by priority: open dialogs/popovers first, then in-viewport, then the rest. Result has count/total/" +
+      "truncated (+hint) - when truncated, pass a higher limit, filter, or viewportOnly. When a modal is open, " +
+      "elements behind it are marked behindModal:true (modalOnly:true drops them). Refs work with click/fill/hover/" +
+      "type/scroll. Taking ANY snapshot (snapshot or ax_snapshot) invalidates refs from earlier snapshots. " +
+      "deep:true also reaches CLOSED shadow roots via the debugger (banner; deep refs need trusted:true actions).",
+    {
+      tabId: tabIdParam,
+      deep: z.boolean().optional().describe("Pierce closed shadow roots via chrome.debugger (shows banner)"),
+      limit: z.number().int().min(1).max(2000).optional().describe("Max elements/refs across all frames (default 400, max 2000)"),
+      filter: z.string().optional().describe("Only elements whose tag/role/type/name/hint/value/href contains this text (case-insensitive)"),
+      viewportOnly: z.boolean().optional().describe("Only elements currently in the viewport"),
+      modalOnly: z.boolean().optional().describe("When a modal dialog is open, list only elements inside it"),
+    },
+    async ({ tabId, deep, limit, filter, viewportOnly, modalOnly }) =>
+      textResult(await hub.call("snapshot", { tabId, deep, limit, filter, viewportOnly, modalOnly }))
   );
 
   tool(
@@ -384,21 +529,30 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       "actionable (found + visible + enabled, default 5s). If the element is covered by an overlay it " +
       "auto-escalates to a real trusted CDP click (via:'trusted', shows the banner) unless autoTrusted:false / " +
       "noEscalate:true. Set trusted:true to force the trusted path (also required for deep-snapshot refs). " +
-      "Result reports via:'synthetic'|'trusted', or {notActionable, reason} on failure.",
+      "Result reports via:'synthetic'|'trusted' plus {url, title, urlChanged, newTabId?}, or {notActionable, reason} on failure. " +
+      "If the click may open an alert/confirm/prompt, pass onDialog so the click answers it itself (reported in dialogs[]); " +
+      "otherwise the dialog stays open for the user and later calls on that tab fail until it is closed.",
     {
       ref: z.number().optional().describe("Element ref from a prior snapshot call"),
       selector: z.string().optional().describe("CSS selector (alternative to ref)"),
       trusted: z.boolean().optional().describe("Force a real trusted click via chrome.debugger (shows banner)"),
       autoTrusted: z.boolean().optional().describe("Escalate to a trusted click when the target is covered (default true)"),
       noEscalate: z.boolean().optional().describe("Never auto-escalate to trusted; report {notActionable} instead"),
+      onDialog: onDialogParam,
+      promptText: promptTextParam,
       timeoutMs: timeoutMsParam,
       withSnapshot: withSnapshotParam,
+      keepAlive: keepAliveParam,
       tabId: tabIdParam,
     },
-    async ({ ref, selector, trusted, autoTrusted, noEscalate, timeoutMs, withSnapshot, tabId }) => {
+    async ({ ref, selector, trusted, autoTrusted, noEscalate, onDialog, promptText, timeoutMs, withSnapshot, keepAlive, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
       return textResult(
-        await hub.call("click", { ref, selector, trusted, autoTrusted, noEscalate, timeoutMs, withSnapshot, tabId }, actionHubTimeout(timeoutMs))
+        await hub.call(
+          "click",
+          { ref, selector, trusted, autoTrusted, noEscalate, onDialog, promptText, timeoutMs, withSnapshot, keepAlive, tabId },
+          actionHubTimeout(timeoutMs)
+        )
       );
     }
   );
@@ -415,11 +569,12 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       selector: z.string().optional().describe("CSS selector (alternative to ref)"),
       timeoutMs: timeoutMsParam,
       withSnapshot: withSnapshotParam,
+      keepAlive: keepAliveParam,
       tabId: tabIdParam,
     },
-    async ({ value, ref, selector, timeoutMs, withSnapshot, tabId }) => {
+    async ({ value, ref, selector, timeoutMs, withSnapshot, keepAlive, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
-      return textResult(await hub.call("fill", { value, ref, selector, timeoutMs, withSnapshot, tabId }, actionHubTimeout(timeoutMs)));
+      return textResult(await hub.call("fill", { value, ref, selector, timeoutMs, withSnapshot, keepAlive, tabId }, actionHubTimeout(timeoutMs)));
     }
   );
 
@@ -434,11 +589,12 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       trusted: z.boolean().optional().describe("Use a real trusted mouse move via chrome.debugger (fires CSS :hover; shows banner)"),
       timeoutMs: timeoutMsParam,
       withSnapshot: withSnapshotParam,
+      keepAlive: keepAliveParam,
       tabId: tabIdParam,
     },
-    async ({ ref, selector, trusted, timeoutMs, withSnapshot, tabId }) => {
+    async ({ ref, selector, trusted, timeoutMs, withSnapshot, keepAlive, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
-      return textResult(await hub.call("hover", { ref, selector, trusted, timeoutMs, withSnapshot, tabId }, actionHubTimeout(timeoutMs)));
+      return textResult(await hub.call("hover", { ref, selector, trusted, timeoutMs, withSnapshot, keepAlive, tabId }, actionHubTimeout(timeoutMs)));
     }
   );
 
@@ -455,20 +611,32 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       trusted: z.boolean().optional().describe("Use real trusted keystrokes via chrome.debugger (shows banner)"),
       timeoutMs: timeoutMsParam,
       withSnapshot: withSnapshotParam,
+      keepAlive: keepAliveParam,
       tabId: tabIdParam,
     },
-    async ({ text, ref, selector, trusted, timeoutMs, withSnapshot, tabId }) => {
+    async ({ text, ref, selector, trusted, timeoutMs, withSnapshot, keepAlive, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
-      return textResult(await hub.call("type", { text, ref, selector, trusted, timeoutMs, withSnapshot, tabId }, actionHubTimeout(timeoutMs)));
+      return textResult(await hub.call("type", { text, ref, selector, trusted, timeoutMs, withSnapshot, keepAlive, tabId }, actionHubTimeout(timeoutMs)));
     }
   );
 
   tool(
     "press_key",
-    "Send a keyboard key (e.g. 'Enter', 'Escape', 'Tab', 'ArrowDown') to the focused element. " +
-      "Note: events are synthetic; some sites ignore them.",
-    { key: z.string().describe("Key value, e.g. 'Enter'"), withSnapshot: withSnapshotParam, tabId: tabIdParam },
-    async ({ key, withSnapshot, tabId }) => textResult(await hub.call("press_key", { key, withSnapshot, tabId }))
+    "Send a keyboard key or combo (e.g. 'Enter', 'Escape', 'Tab', 'Shift+Tab', 'ArrowDown', 'Control+a') to the " +
+      "focused element, in whichever frame holds focus. Synthetic by default: Enter submits the field's form only " +
+      "if the page didn't preventDefault() the keydown; Tab/Shift+Tab move focus. Set trusted:true for real " +
+      "(isTrusted) key events via the debugger (shows banner). Returns {pressed, target, url, title, urlChanged, newTabId?}.",
+    {
+      key: z.string().describe("Key value or combo, e.g. 'Enter', 'Shift+Tab'"),
+      trusted: z.boolean().optional().describe("Use a real trusted key press via chrome.debugger (shows banner)"),
+      onDialog: onDialogParam,
+      promptText: promptTextParam,
+      withSnapshot: withSnapshotParam,
+      keepAlive: keepAliveParam,
+      tabId: tabIdParam,
+    },
+    async ({ key, trusted, onDialog, promptText, withSnapshot, keepAlive, tabId }) =>
+      textResult(await hub.call("press_key", { key, trusted, onDialog, promptText, withSnapshot, keepAlive, tabId }))
   );
 
   tool(
@@ -480,8 +648,9 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       "banner. Actions: mouse_move · left_click/right_click/middle_click · double_click · left_mouse_down/left_mouse_up " +
       "(held drags) · left_click_drag (x,y → x2,y2) · scroll (dx/dy at x,y) · type (per-char keystrokes to the FOCUSED " +
       "element - click the field/canvas first) · key (a key or combo like 'Enter', 'Escape', 'ctrl+c', 'ctrl+shift+k'). " +
-      "NOTE: input is delivered even when the tab is backgrounded, but its frame is throttled then so you can't OBSERVE " +
-      "the result - use activate:true (or tab_activate) to foreground it. For ordinary DOM, prefer click/fill/type.",
+      "NOTE: on a hidden/backgrounded tab the tab is kept rendering for the duration of the input (debugger focus " +
+      "emulation; result has tabHidden/keptAlive), but it stops rendering again afterwards - use activate:true (or " +
+      "tab_activate) to watch later updates. For ordinary DOM, prefer click/fill/type.",
     {
       action: z
         .enum(["mouse_move", "left_click", "right_click", "middle_click", "double_click", "left_mouse_down", "left_mouse_up", "left_click_drag", "scroll", "type", "key"])
@@ -505,7 +674,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         throw new Error(`input action '${args.action}' requires x and y (CSS viewport pixels)`);
       if (args.action === "type" && args.text === undefined) throw new Error("input action 'type' requires text");
       if (args.action === "key" && !args.key && !args.code) throw new Error("input action 'key' requires key or code");
-      return textResult(await hub.call("input", args, 120_000));
+      return textResult(await hub.call("input", args, inputHubTimeout(args)));
     }
   );
 
@@ -521,6 +690,19 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     "Navigate the tab forward in its history (like the browser Forward button).",
     { tabId: tabIdParam },
     async ({ tabId }) => textResult(await hub.call("go_forward", { tabId }))
+  );
+
+  tool(
+    "handle_dialog",
+    "Accept or dismiss a JavaScript dialog (alert/confirm/prompt/beforeunload) that is blocking a tab. While a " +
+      "dialog is open the page's JS is frozen, so injected tools time out - their error says to call this. Uses " +
+      "chrome.debugger (shows the banner). Returns {handled:true, type, message} or {handled:false} when no dialog is showing.",
+    {
+      tabId: tabIdParam,
+      accept: z.boolean().optional().describe("true (default) = OK/Leave; false = Cancel/Stay"),
+      promptText: z.string().optional().describe("Text to enter into a prompt() dialog before accepting"),
+    },
+    async ({ tabId, accept, promptText }) => textResult(await hub.call("handle_dialog", { tabId, accept, promptText }))
   );
 
   tool(
@@ -590,14 +772,24 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
 
   tool(
     "scroll",
-    "Scroll the page by a pixel delta, or scroll an element into view via selector.",
+    "Scroll the page or a scroll container. With ref/selector and no dy/dx/direction: scroll that element into " +
+      "view. With ref/selector AND dy/dx/direction: scroll the element's nearest scrollable container (inner " +
+      "panes, virtualized lists, Gmail/Slack message lists). With neither: scroll the window - or, if the document " +
+      "itself doesn't scroll (app shells), the scroll container under the viewport center. Returns {scrolled, " +
+      "container:'window'|'tag#id', scrollTop, atStart, atEnd} - atEnd:true means no more content is reachable " +
+      "by scrolling further (yet; infinite lists may load more after a moment).",
     {
-      dy: z.number().optional().describe("Vertical pixels to scroll (positive = down). Default 600."),
-      selector: z.string().optional().describe("If set, scroll this element into view instead"),
+      ref: z.number().optional().describe("Element ref from the latest snapshot"),
+      selector: z.string().optional().describe("CSS selector (searched in all frames; the visible/top-frame match wins)"),
+      dy: z.number().optional().describe("Vertical pixels (positive = down). Default 600 when nothing else is given."),
+      dx: z.number().optional().describe("Horizontal pixels (positive = right)"),
+      direction: z.enum(["up", "down", "left", "right", "top", "bottom"]).optional().describe("Scroll by `amount` (default 80% of the container) or jump to top/bottom"),
+      amount: z.number().optional().describe("Pixels per direction step (default 80% of the container's visible size)"),
       withSnapshot: withSnapshotParam,
       tabId: tabIdParam,
     },
-    async ({ dy, selector, withSnapshot, tabId }) => textResult(await hub.call("scroll", { dy, selector, withSnapshot, tabId }))
+    async ({ ref, selector, dy, dx, direction, amount, withSnapshot, tabId }) =>
+      textResult(await hub.call("scroll", { ref, selector, dy, dx, direction, amount, withSnapshot, tabId }))
   );
 
   tool(
@@ -616,7 +808,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       savePath: z.string().optional().describe("Absolute path to write the image to (returns metadata, not the image)"),
     },
     async ({ tabId, fullPage, scale, format, quality, selector, savePath }) => {
-      const r = await hub.call("screenshot", { tabId, fullPage, scale, format, quality, selector }, 120_000);
+      const r = await hub.call("screenshot", { tabId, fullPage, scale, format, quality, selector }, SCREENSHOT_HUB_TIMEOUT_MS);
       const buf = Buffer.from(r.base64, "base64");
       const dims = imageDims(buf);
       const mimeType = r.format === "jpeg" ? ("image/jpeg" as const) : ("image/png" as const);
@@ -653,23 +845,27 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       savePath: z.string().optional().describe("Absolute destination path; if omitted, the file stays wherever Chrome's Downloads folder puts it"),
       filename: z.string().optional().describe("Initial relative filename/subpath within Chrome's Downloads directory"),
       headers: z.record(z.string()).optional().describe("Extra request headers, e.g. Authorization"),
-      maxBytes: z.number().optional().describe("Cancel the download if size exceeds this (bytes). Default 100 MB; pass a bigger value or omit for unlimited."),
+      maxBytes: z.number().optional().describe("Cancel the download if size exceeds this (bytes). Omit for unlimited (the default)."),
       timeoutMs: z.number().optional().describe("Max time to wait for completion (default 600000 = 10 min; large/slow downloads may need more)"),
+      stallTimeoutMs: z
+        .number()
+        .optional()
+        .describe(`Fail if no bytes arrive for this long (default ${DEFAULT_STALL_MS}; 0 disables). A dangerous-file prompt or a paused download fails immediately.`),
     },
-    async ({ url, savePath, filename, headers, maxBytes, timeoutMs }) => {
+    async ({ url, savePath, filename, headers, maxBytes, timeoutMs, stallTimeoutMs }) => {
       const start = await hub.call("download_resource", { url, filename, headers }, 20_000);
-      const cap = maxBytes ?? 100 * 1024 * 1024;
+      const cap = maxBytes; // undefined = unlimited, as documented
       const overallTimeout = timeoutMs ?? 600_000;
       const deadline = Date.now() + overallTimeout;
+      const progress = { lastBytes: 0, lastProgressAt: Date.now() };
       let status: any;
       while (true) {
         status = await hub.call("download_status", { downloadId: start.downloadId }, 10_000);
-        if (status.state === "complete") break;
-        if (status.state === "interrupted") throw new Error(`Download interrupted: ${status.error ?? "unknown reason"}`);
-        const seen = status.totalBytes > 0 ? status.totalBytes : status.bytesReceived;
-        if (cap && seen > cap) {
-          await hub.call("download_cancel", { downloadId: start.downloadId }, 10_000).catch(() => {});
-          throw new Error(`Download exceeded maxBytes (${cap}); cancelled after ~${status.bytesReceived} bytes.`);
+        const v = downloadVerdict(status, progress, { now: Date.now(), cap, stallMs: stallTimeoutMs, downloadId: start.downloadId });
+        if (v.kind === "complete") break;
+        if (v.kind === "fail") {
+          if (v.cancel) await hub.call("download_cancel", { downloadId: start.downloadId }, 10_000).catch(() => {});
+          throw new Error(v.message);
         }
         if (Date.now() > deadline) {
           throw new Error(
@@ -732,14 +928,28 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
 
   tool(
     "wait_for",
-    "Wait until a CSS selector appears on the page, or just sleep for a duration.",
+    "Wait for an element to reach a state, in any frame and open shadow DOM. Target by selector, text, and/or " +
+      "role(+name) - all given criteria must hold for the same element. state: visible (default), attached, " +
+      "hidden, detached (hidden/detached must hold in every frame). Returns {found, state, elapsedMs, matchCount, " +
+      "tag, name, ref (when the element is in the latest snapshot), frameId}. An invalid selector errors " +
+      "immediately. With no selector/text/role it just sleeps timeoutMs (default 1000ms).",
     {
-      selector: z.string().optional().describe("CSS selector to wait for"),
-      timeoutMs: z.number().optional().describe("Max wait in ms (default 10000)"),
+      selector: z.string().optional().describe("CSS selector"),
+      text: z.string().optional().describe("Visible text the element contains (case-insensitive, whitespace-normalized)"),
+      role: z.string().optional().describe("ARIA role (explicit or implicit), e.g. 'button', 'dialog', 'link'"),
+      name: z.string().optional().describe("With role: accessible-name substring (case-insensitive)"),
+      state: z.enum(["attached", "visible", "hidden", "detached"]).optional().describe("Condition to wait for (default visible)"),
+      timeoutMs: z.number().optional().describe("Max wait in ms (default 10000 with a target; sleep length without one, default 1000)"),
       tabId: tabIdParam,
     },
-    async ({ selector, timeoutMs, tabId }) =>
-      textResult(await hub.call("wait_for", { selector, timeoutMs, tabId }, (timeoutMs ?? 10_000) + 5_000))
+    async ({ selector, text, role, name, state, timeoutMs, tabId }) =>
+      textResult(
+        await hub.call(
+          "wait_for",
+          { selector, text, role, name, state, timeoutMs, tabId },
+          (timeoutMs ?? (selector || text || role ? 10_000 : 1_000)) + 5_000
+        )
+      )
   );
 
   // ---- chrome.debugger (CDP) mode: network capture. Attaching shows Chrome's
@@ -796,7 +1006,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       tabId: tabIdParam,
     },
     async ({ urlFilter, includeBodies, limit, tabId }) =>
-      textResult(await hub.call("net_get_requests", { urlFilter, includeBodies, limit, tabId }, 60_000)),
+      textResult(await hub.call("net_get_requests", { urlFilter, includeBodies, limit, tabId }, 60_000), "narrow with urlFilter/limit, or drop includeBodies"),
   );
 
   tool(
@@ -815,7 +1025,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
 
   tool(
     "debugger_status",
-    "Report debugger sessions: whether a tab is attached/capturing, buffered request count, idle time. " +
+    "Report debugger sessions: whether a tab is attached/capturing, buffered request count, idle time, live emulate_* overrides (emulating). " +
       "Omit tabId to list all sessions.",
     { tabId: z.number().optional().describe("Tab id; omit to list all sessions") },
     async ({ tabId }) => textResult(await hub.call("debugger_status", { tabId })),
@@ -832,7 +1042,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       limit: z.number().optional().describe("Max frames (default 200, newest kept)"),
       tabId: tabIdParam,
     },
-    async ({ urlFilter, limit, tabId }) => textResult(await hub.call("net_get_ws_frames", { urlFilter, limit, tabId })),
+    async ({ urlFilter, limit, tabId }) => textResult(await hub.call("net_get_ws_frames", { urlFilter, limit, tabId }), "narrow with urlFilter/limit"),
   );
 
   tool(
@@ -866,6 +1076,10 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     "replay_request",
     "Re-issue a request from the tab's live session (an in-session Repeater). Give a requestId (from " +
       "net_get_requests) or an ad-hoc {url,method,headers,body}; optional overrides {url,method,headers,body}. " +
+      "A captured request is replayed with ALL its headers fetch() can set (Authorization, CSRF, x-*, Accept...; " +
+      "not Cookie/Host/Origin/sec-*/hop-by-hop); an override header set to \"\" removes it. " +
+      "Overriding the url to another host still sends those captured headers (incl. Authorization) there, and the " +
+      "default session identity uses credentials:'include', so the target host's own cookies go too. " +
       "Set identity to send as a captured identity or 'anon' (strips cookies/bearer) - this uses the CDP Fetch " +
       "path to override forbidden headers like Cookie. Returns {status,headers,body}. Shows the banner when identity/forbidden headers are used.",
     {
@@ -1123,7 +1337,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       limit: z.number().optional().describe("Max entries to return (default 200)"),
       tabId: tabIdParam,
     },
-    async (args) => textResult(await hub.call("console_get", args)),
+    async (args) => textResult(await hub.call("console_get", args), "narrow with pattern/level/limit"),
   );
 
   tool(
@@ -1395,7 +1609,20 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       tabId: tabIdParam,
     },
     async (args) => {
-      const r = await hub.call("session_record_stop", { tabId: args.tabId }, 30_000);
+      // The events file is the server's: if the extension can't stop the recorder (socket still down
+      // after a drop, or its SW lost the recording), still assemble what reached disk rather than
+      // stranding the recording.
+      let r: any;
+      let stopError: string | undefined;
+      try {
+        r = await hub.call("session_record_stop", { tabId: args.tabId }, 30_000);
+      } catch (e) {
+        const known = hub.recordingTabs();
+        const fallback = args.tabId != null ? (hub.getRecordingPath(args.tabId) ? args.tabId : undefined) : known.length === 1 ? known[0] : undefined;
+        if (fallback == null) throw e;
+        stopError = e instanceof Error ? e.message : String(e);
+        r = { tabId: fallback };
+      }
       const tabId = r?.tabId;
       // The recorder's final batch is streamed separately and can arrive AFTER this ack; its sink
       // writes are async. Wait (bounded) for the streamed `done` and drain the sink to disk BEFORE
@@ -1434,6 +1661,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         }
       }
       return textResult({
+        tabId,
         saved: savePath,
         htmlBytes,
         eventCount: events.length,
@@ -1442,6 +1670,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         inlinedBytes: report?.bytesInlined ?? 0,
         skipped: report?.skipped ?? [],
         eventsPath,
+        ...(stopError ? { note: `the extension could not stop the recorder (${stopError}); assembled the events already on disk` } : {}),
       });
     }
   );
@@ -1624,6 +1853,17 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         ringCount: Math.max(100, Math.min(args.ringSize ?? 5000, 50_000)),
       });
 
+      // Hold first batches for unknown watches until this start has created its session (see
+      // WatchRegistry.beginStart); the finally below replays them into it.
+      watchRegistry.beginStart();
+      let startEnded = false;
+      const endStart = () => {
+        if (!startEnded) {
+          startEnded = true;
+          watchRegistry.endStart();
+        }
+      };
+      try {
       const r = await hub.call("watch_start", { tabId: args.tabId, console: args.console ?? true });
       if (r?.tabId == null || !r?.watchId) throw new Error("extension did not return the watch id/tab");
       // Already watching this tab (e.g. after a server restart): adopt the existing browser-side
@@ -1643,6 +1883,9 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       }
 
       const session = watchRegistry.create(r.watchId, r.tabId, opts, now);
+      // Taken BEFORE the held first batches replay into the session, so watch_read({since: cursor})
+      // still returns them.
+      const startCursor = session.cursorAt;
       const defaultBase = join(
         homedir(),
         ".browser-bridge",
@@ -1657,6 +1900,8 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         sink.append([{ kind: "watch-header", watchId: session.watchId, startedAt: now, rootTabId: r.tabId, version }]);
         session.setSink(sink);
       }
+
+      endStart(); // session + digest sink exist: replay the held first batches into them now
 
       // Network capture serves BOTH consumers off one stream: the hub tap folds each row into the
       // timeline, and the CaptureSink writes the full row (headers + bodies) to disk. The tap runs
@@ -1681,7 +1926,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         watchId: session.watchId,
         tabId: r.tabId,
         url: r.url,
-        cursor: session.cursorAt,
+        cursor: startCursor,
         banner,
         // What actually happened when the listener was injected. Surfaced because a failed injection
         // is otherwise indistinguishable from a quiet user.
@@ -1691,6 +1936,9 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         redact: opts.redact,
         note: "Browse normally, then call watch_read({since: cursor}) - it returns everything new plus the next cursor.",
       });
+      } finally {
+        endStart();
+      }
     }
   );
 
@@ -1927,14 +2175,18 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     "ax_snapshot",
     "Compact accessibility tree of the page (role + name + states like checked/expanded/level, " +
       "indented YAML-like, incl. iframes and open shadow DOM). Interactive nodes carry a [ref=N] " +
-      "usable with click/fill/hover/type. Prefer over snapshot for understanding page STRUCTURE and " +
-      "forms; interactiveOnly:true trims to actionable nodes only. See docs/AX-SNAPSHOT.md.",
+      "usable with click/fill/hover/type. Use it to understand page STRUCTURE and forms; for simply finding " +
+      "something to act on, snapshot is the recommended default. interactiveOnly:true trims to actionable nodes. " +
+      "Refs go to open dialogs first, then in-viewport, then the rest; past `limit` nodes are listed without a " +
+      "ref and a note says so. Taking ANY snapshot (snapshot or ax_snapshot) invalidates refs from earlier " +
+      "snapshots. See docs/AX-SNAPSHOT.md.",
     {
       tabId: tabIdParam,
       interactiveOnly: z.boolean().optional().describe("Keep only interactive nodes and the containers leading to them"),
+      limit: z.number().int().min(1).max(2000).optional().describe("Max refs across all frames (default 400, max 2000)"),
     },
-    async ({ tabId, interactiveOnly }) => {
-      const snap = (await hub.call("ax_snapshot", { tabId })) as AxSnapshot;
+    async ({ tabId, interactiveOnly, limit }) => {
+      const snap = (await hub.call("ax_snapshot", { tabId, limit })) as AxSnapshot;
       return textResult(renderAxSnapshot(snap, { interactiveOnly }));
     }
   );
@@ -1946,7 +2198,9 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       "what you'd pass to that tool standalone. Use this whenever you can predict two or more steps " +
       "ahead - e.g. navigate → click → fill → press_key → screenshot - because the round trip per " +
       "tool call, not the browser, is what makes multi-step tasks slow. Actions run SEQUENTIALLY and " +
-      "STOP at the first error; the result reports what completed plus the failing index and message, " +
+      "STOP at the first error - including a step that returns {notActionable} or {filled:false} or an `error` " +
+      "field (set continueOnError:true on a step to tolerate that, or stopOnNotActionable:false for the whole " +
+      "batch); the result reports what completed plus the failing index, tool and reason, " +
       "so a partial run is always legible. Only navigation/interaction/read tools may be batched " +
       `(${[...BATCHABLE_TOOLS].join(", ")}); anything else must be called directly so it keeps its own ` +
       "per-call approval. Cannot be nested.",
@@ -1956,57 +2210,85 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
           z.object({
             name: z.string().describe("Tool name, e.g. 'click'"),
             input: z.record(z.any()).optional().describe("That tool's input - the same shape you'd pass calling it directly"),
+            continueOnError: z
+              .boolean()
+              .optional()
+              .describe("Keep going if THIS step fails (error, notActionable, filled:false); the failure is recorded in its result"),
           })
         )
         .min(1)
         .max(MAX_BATCH_ACTIONS)
-        .describe(`Tools to run in order (max ${MAX_BATCH_ACTIONS}). Executed sequentially; stops at the first error.`),
+        .describe(`Tools to run in order (max ${MAX_BATCH_ACTIONS}). Executed sequentially; stops at the first failure.`),
+      stopOnNotActionable: z
+        .boolean()
+        .optional()
+        .describe("Halt when a step returns {notActionable} or {filled:false} (default true). Errors always halt unless the step sets continueOnError."),
     },
-    async ({ actions }) => {
-      const results: any[] = [];
-      for (let i = 0; i < actions.length; i++) {
-        const { name, input } = actions[i];
-        const fail = (error: string) =>
-          textResult({ executed: results.length, total: actions.length, results, stoppedAt: i, failedTool: name, error });
-
-        if (name === "browser_batch") return fail("browser_batch cannot be nested.");
-        const entry = registry.get(name);
-        if (!entry) return fail(`Unknown tool '${name}'.`);
-        if (!BATCHABLE_TOOLS.has(name)) {
-          return fail(`'${name}' is not batchable - call it directly so it keeps its own per-call approval.`);
-        }
-
-        // The SDK validates args before a normal tool call; invoking the handler directly skips that,
-        // so re-validate here rather than letting a malformed input reach the browser.
-        let args: any;
-        try {
-          args = z.object(entry.schema).parse(input ?? {});
-        } catch (err) {
-          return fail(`Invalid input for '${name}': ${err instanceof Error ? err.message : String(err)}`);
-        }
-
-        // watch_read can block for up to 25s waiting for the human to do something. Inside a batch
-        // that would stall every remaining action behind it, so a batched read always returns now.
-        if (name === "watch_read") args.waitMs = 0;
-
-        let out: any;
-        try {
-          out = await entry.handler(args);
-        } catch (err) {
-          return fail(err instanceof Error ? err.message : String(err));
-        }
-        // Handlers return the MCP content envelope; unwrap to keep the batch result readable. A
-        // handler that returned isError (rather than throwing) still halts the run.
-        const text = out?.content?.[0]?.text ?? "";
-        if (out?.isError) {
-          results.push({ index: i, tool: name, error: text });
-          return fail(text || `'${name}' failed.`);
-        }
-        results.push({ index: i, tool: name, result: text });
-      }
-      return textResult({ executed: results.length, total: actions.length, results });
-    }
+    async ({ actions, stopOnNotActionable }) => runBatch(actions, { stopOnNotActionable })
   );
+
+  async function runBatch(
+    actions: { name: string; input?: Record<string, any>; continueOnError?: boolean }[],
+    { stopOnNotActionable = true }: { stopOnNotActionable?: boolean } = {}
+  ) {
+    const results: any[] = [];
+    for (let i = 0; i < actions.length; i++) {
+      const { name, input, continueOnError } = actions[i];
+      const fail = (error: string, outcome: "error" | "notActionable" = "error") =>
+        textResult({ executed: results.length, total: actions.length, results, stoppedAt: i, failedTool: name, outcome, error });
+
+      if (name === "browser_batch") return fail("browser_batch cannot be nested.");
+      const entry = registry.get(name);
+      if (!entry) return fail(`Unknown tool '${name}'.`);
+      if (!BATCHABLE_TOOLS.has(name)) {
+        return fail(`'${name}' is not batchable - call it directly so it keeps its own per-call approval.`);
+      }
+
+      // The SDK validates args before a normal tool call; invoking the handler directly skips that,
+      // so re-validate here rather than letting a malformed input reach the browser.
+      let args: any;
+      try {
+        args = z.object(entry.schema).parse(input ?? {});
+      } catch (err) {
+        return fail(`Invalid input for '${name}': ${err instanceof Error ? err.message : String(err)}`);
+      }
+
+      // watch_read can block for up to 25s waiting for the human to do something. Inside a batch
+      // that would stall every remaining action behind it, so a batched read always returns now.
+      if (name === "watch_read") args.waitMs = 0;
+
+      let out: any;
+      try {
+        out = await entry.handler(args);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (continueOnError) {
+          results.push({ index: i, tool: name, error: message, outcome: "error" });
+          continue;
+        }
+        return fail(message);
+      }
+      // Handlers return the MCP content envelope; unwrap to keep the batch result readable. A
+      // handler that returned isError (rather than throwing) still halts the run - and so does a
+      // NORMAL result that reports failure ({notActionable}, {filled:false}, an `error` field):
+      // otherwise the next step types into whatever the failed click left focused.
+      const text = out?.content?.[0]?.text ?? "";
+      const failure = stepFailure(out);
+      if (!failure) {
+        results.push({ index: i, tool: name, result: text });
+        continue;
+      }
+      results.push(
+        out?.isError
+          ? { index: i, tool: name, error: text, outcome: failure.outcome }
+          : { index: i, tool: name, result: text, outcome: failure.outcome, reason: failure.reason }
+      );
+      if (continueOnError) continue;
+      if (failure.outcome === "notActionable" && !stopOnNotActionable) continue;
+      return fail(out?.isError ? text || `'${name}' failed.` : `'${name}' ${failure.reason}`, failure.outcome);
+    }
+    return textResult({ executed: results.length, total: actions.length, results });
+  }
 
   // Environment emulation (device / network / locale / geolocation) - self-contained in emulate.ts.
   registerEmulateTools(tool, hub);

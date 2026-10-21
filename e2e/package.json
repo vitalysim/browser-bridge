@@ -1,0 +1,21 @@
+{
+  "name": "browser-bridge-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Isolated end-to-end harness: real MCP server + real MV3 extension in Playwright's bundled Chromium, driven over MCP.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build:deps": "node scripts/build-deps.mjs",
+    "test": "node scripts/build-deps.mjs && node --import tsx --test --test-concurrency=1 --test-reporter=spec src/e2e.test.ts",
+    "test:nobuild": "node --import tsx --test --test-concurrency=1 --test-reporter=spec src/e2e.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@types/node": "^22.10.0",
+    "playwright-core": "1.64.1",
+    "tsx": "4.23.0",
+    "typescript": "^5.7.0"
+  }
+}

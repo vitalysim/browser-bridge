@@ -1,0 +1,30 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>stale ref</title></head>
+<body>
+<h1>Users</h1>
+<button id="sort" type="button">Sort Z-A</button>
+<ul id="list"></ul>
+<script>
+  // Index-keyed rendering (key={index}): re-sorting REUSES the same <li>/<button> nodes and only
+  // swaps their text, so a ref captured before the sort now points at a different user's row.
+  let data = ["Alice", "Bob", "Carol"];
+  window.__deleted = [];
+  const list = document.getElementById("list");
+  function render() {
+    data.forEach((name, i) => {
+      let li = list.children[i];
+      if (!li) {
+        li = document.createElement("li");
+        const b = document.createElement("button");
+        b.type = "button";
+        b.addEventListener("click", () => window.__deleted.push(data[i]));
+        li.appendChild(b);
+        list.appendChild(li);
+      }
+      li.firstChild.textContent = "Delete " + name;
+    });
+  }
+  render();
+  document.getElementById("sort").addEventListener("click", () => { data = [...data].sort().reverse(); render(); });
+</script>
+</body></html>

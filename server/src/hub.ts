@@ -3,8 +3,38 @@ import type { Server as HttpServer, IncomingMessage } from "http";
 import { randomUUID } from "crypto";
 import { CaptureSink } from "./capture-sink.js";
 import { versionSkewWarning } from "./version.js";
+import { log } from "./log.js";
+import { NOT_CONNECTED_MESSAGE, explainTimeout } from "./result.js";
+import { WS_AUTH_VERSION, newNonce, safeEqual, srvMac, verifyAuthReply } from "./ws-auth.js";
 
 export const CALL_TIMEOUT_MS = 30_000;
+
+/** An unauthenticated socket must finish the challenge-response within this long. */
+export const WS_AUTH_TIMEOUT_MS = 10_000;
+/** Close code for a failed handshake; the extension shows it as a token mismatch. */
+export const WS_AUTH_FAILED_CLOSE_CODE = 4001;
+/** Close code when the extension never answered the challenge in time (e.g. its worker was suspended
+ *  mid-handshake) - NOT a token problem, so the extension just retries with its normal backoff. */
+export const WS_AUTH_TIMEOUT_CLOSE_CODE = 4002;
+
+// How long hub.call waits for the extension to (re)connect before failing with NO_EXTENSION. The MV3
+// service worker restarts often (dozens of times in one server run) and almost always reconnects within
+// ~1s, so failing instantly turned a routine respawn into a spurious tool error.
+export const RECONNECT_GRACE_MS = 3_000;
+
+// How long capture/session sinks stay open after the extension socket drops. The extension keeps
+// recording across SW restarts and replays its outbox on reconnect, so closing the sinks on close
+// (as before) truncated every recording at the first socket blip. Past this, the sinks are finalized.
+export const SINK_RECONNECT_GRACE_MS = 120_000;
+
+export interface HubOptions {
+  /** Override RECONNECT_GRACE_MS (tests). */
+  reconnectGraceMs?: number;
+  /** Override SINK_RECONNECT_GRACE_MS (tests). */
+  sinkReconnectGraceMs?: number;
+  /** Override WS_AUTH_TIMEOUT_MS (tests). */
+  authTimeoutMs?: number;
+}
 
 // The `ws` default maxPayload is 100 MiB; a single reply over that closes the socket with 1009 and
 // fails every in-flight call. Raise it generously so a big-but-legitimate frame (MHTML snapshot, HAR
@@ -68,7 +98,16 @@ export class ExtensionHub {
   private sessionDoneWaiters = new Map<number, () => void>();
   private closedSessionSinks = new Map<number, CaptureSink>();
 
-  constructor(httpServer: HttpServer, token: string, private version = "0.0.0") {
+  private reconnectGraceMs: number;
+  private sinkReconnectGraceMs: number;
+  private authTimeoutMs: number;
+  // Set while the socket is down and capture/session sinks are being held open for a reconnect.
+  private sinkGraceTimer: NodeJS.Timeout | null = null;
+
+  constructor(httpServer: HttpServer, token: string, private version = "0.0.0", opts: HubOptions = {}) {
+    this.reconnectGraceMs = opts.reconnectGraceMs ?? RECONNECT_GRACE_MS;
+    this.sinkReconnectGraceMs = opts.sinkReconnectGraceMs ?? SINK_RECONNECT_GRACE_MS;
+    this.authTimeoutMs = opts.authTimeoutMs ?? WS_AUTH_TIMEOUT_MS;
     const wss = new WebSocketServer({ noServer: true, maxPayload: WS_MAX_PAYLOAD });
 
     httpServer.on("upgrade", (req, socket, head) => {
@@ -79,26 +118,86 @@ export class ExtensionHub {
       }
       const origin = req.headers.origin ?? "";
       if (!origin.startsWith("chrome-extension://")) {
-        console.error(`[hub] rejected WS: bad origin ${origin}`);
+        log(`[hub] rejected WS: bad origin ${origin}`);
         socket.destroy();
         return;
       }
-      if (url.searchParams.get("token") !== token) {
-        console.error("[hub] rejected WS: bad token");
-        socket.destroy();
+      const legacyToken = url.searchParams.get("token");
+      if (legacyToken !== null) {
+        // DEPRECATED (one release): extensions older than the v2 handshake send the token in the URL.
+        // Still accepted so a server upgrade doesn't strand an older extension, but logged - that
+        // extension leaks its token to anything squatting the port while the server is down.
+        if (!safeEqual(legacyToken, token)) {
+          log("[hub] rejected WS: bad token");
+          socket.destroy();
+          return;
+        }
+        log("[hub] extension used the deprecated ?token= handshake - update the extension (it must match the server version)");
+        wss.handleUpgrade(req, socket, head, (ws) => this.attach(ws, req));
         return;
       }
-      wss.handleUpgrade(req, socket, head, (ws) => this.attach(ws, req));
+      wss.handleUpgrade(req, socket, head, (ws) => this.authenticate(ws, req, token));
     });
+  }
+
+  /**
+   * v2 challenge-response (see ws-auth.ts). The socket is NOT attached - it cannot replace the live
+   * connection, receive calls, or feed taps - until the extension proves it holds the token. We then
+   * prove the same to it, so the extension never talks to an impostor on the port.
+   */
+  private authenticate(ws: WebSocket, req: IncomingMessage, token: string) {
+    const sNonce = newNonce();
+    let done = false;
+    const finish = () => {
+      done = true;
+      clearTimeout(timer);
+      ws.removeListener("message", onMessage);
+    };
+    const fail = (reason: string, code = WS_AUTH_FAILED_CLOSE_CODE) => {
+      if (done) return;
+      finish();
+      const timedOut = code === WS_AUTH_TIMEOUT_CLOSE_CODE;
+      log(`[hub] rejected WS: ${timedOut ? "handshake timed out" : "authentication failed"} (${reason})`);
+      try {
+        ws.close(code, timedOut ? "handshake timed out" : "authentication failed");
+      } catch {
+        ws.terminate();
+      }
+    };
+    const timer = setTimeout(() => fail(`no auth reply within ${this.authTimeoutMs}ms`, WS_AUTH_TIMEOUT_CLOSE_CODE), this.authTimeoutMs);
+    const onMessage = (data: any, isBinary?: boolean) => {
+      if (done) return;
+      // A handshake frame is ~250 bytes; anything big or binary from an unauthenticated peer is not one.
+      const raw = isBinary ? "" : data.toString();
+      if (!raw || raw.length > 4096) return fail("oversized or binary handshake frame");
+      let msg: any;
+      try {
+        msg = JSON.parse(raw);
+      } catch {
+        return fail("unparseable handshake frame");
+      }
+      const v = verifyAuthReply(token, sNonce, msg);
+      if (!v.ok) return fail(v.reason);
+      finish();
+      ws.send(JSON.stringify({ type: "auth-ok", v: WS_AUTH_VERSION, mac: srvMac(token, v.cNonce, sNonce) }));
+      this.attach(ws, req);
+    };
+    ws.on("message", onMessage);
+    ws.once("close", () => {
+      done = true;
+      clearTimeout(timer);
+    });
+    ws.on("error", () => undefined);
+    ws.send(JSON.stringify({ type: "challenge", v: WS_AUTH_VERSION, nonce: sNonce }));
   }
 
   private attach(ws: WebSocket, req: IncomingMessage) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      console.error("[hub] replacing existing extension connection");
+      log("[hub] replacing existing extension connection");
       this.ws.close(4000, "replaced by new connection");
     }
     this.ws = ws;
-    console.error(`[hub] extension connected (${req.headers.origin})`);
+    log(`[hub] extension connected (${req.headers.origin})`);
     this.notifyConn(true);
 
     ws.on("message", (data) => {
@@ -114,16 +213,17 @@ export class ExtensionHub {
       }
       if (msg.type === "hello") {
         this.lastHello = { version: msg.version, build: msg.build, at: Date.now() };
-        console.error(`[hub] extension hello: v${msg.version} (build ${msg.build ?? "unknown"})`);
+        log(`[hub] extension hello: v${msg.version} (build ${msg.build ?? "unknown"})`);
         // Surface a version skew loudly, once per distinct mismatch - it silently breaks tools that
         // exist on only one side.
         const skew = versionSkewWarning(this.version, msg.version);
         if (skew && skew !== this.lastSkewWarned) {
           this.lastSkewWarned = skew;
-          console.error(`[hub] version skew: ${skew}`);
+          log(`[hub] version skew: ${skew}`);
         } else if (!skew) {
           this.lastSkewWarned = null;
         }
+        this.readoptSinks(msg);
         // The extension re-announces its live watch state on every connect, so a server restart or a
         // service-worker respawn is recoverable without the agent doing anything.
         for (const w of this.helloWatchers) {
@@ -147,6 +247,7 @@ export class ExtensionHub {
         return;
       }
       const p = this.pending.get(msg.id);
+      // A late reply for a call that already timed out (or was never ours) is dropped quietly.
       if (!p) return;
       this.pending.delete(msg.id);
       clearTimeout(p.timer);
@@ -168,7 +269,7 @@ export class ExtensionHub {
         if (p.socket !== ws) continue;
         this.pending.delete(id);
         clearTimeout(p.timer);
-        p.reject(new Error("Browser extension disconnected before responding"));
+        p.reject(new Error("Browser extension disconnected before responding; it usually reconnects within seconds - retry in 2-3 seconds"));
       }
       // Only tear down capture/session sinks when the CURRENT (live) socket closes. If a stale
       // socket is closing because it was just REPLACED (SW respawn / reconnect), this.ws already
@@ -176,25 +277,14 @@ export class ExtensionHub {
       // every subsequent capture batch would be silently dropped (truncated JSONL / events file).
       if (this.ws === ws) {
         this.ws = null;
-        console.error("[hub] extension disconnected");
+        log("[hub] extension disconnected");
         this.notifyConn(false);
-        for (const sink of this.captureSinks.values()) sink.close();
-        this.captureSinks.clear();
-        // Hand still-open session sinks to closedSessionSinks (as onCapture does on `done`) BEFORE
-        // clearing, so a session_record_stop racing this close still awaits their drain instead of
-        // reading a half-flushed events file. close() only chains the fd-close; drain() awaits it.
-        for (const [tabId, sink] of this.sessionSinks) {
-          sink.close();
-          this.closedSessionSinks.set(tabId, sink);
-        }
-        this.sessionSinks.clear();
-        // Wake any session_record_stop waiting on a streamed `done` that will now never come, so it
-        // falls through to drain whatever was buffered instead of blocking out its full timeout.
-        for (const w of this.sessionDoneWaiters.values()) w();
-        this.sessionDoneWaiters.clear();
+        // Hold capture/session sinks open for a reconnect instead of finalizing them now: the
+        // extension keeps recording across the gap and replays its outbox when it reconnects.
+        this.holdSinksForReconnect();
       }
     });
-    ws.on("error", (err) => console.error(`[hub] ws error: ${err.message}`));
+    ws.on("error", (err) => log(`[hub] ws error: ${err.message}`));
   }
 
   get connected(): boolean {
@@ -283,7 +373,8 @@ export class ExtensionHub {
   }
   // {tabId, path, written} for each active session recording (for session_record_status).
   sessionSinkList(): { tabId: number; path: string; written: number }[] {
-    return [...this.sessionSinks.entries()].map(([tabId, s]) => ({ tabId, path: s.path, written: s.written }));
+    const held = this.sinksHeld;
+    return [...this.sessionSinks.entries()].map(([tabId, s]) => ({ tabId, path: s.path, written: s.written, ...(held ? { awaitingReconnect: true } : {}) }));
   }
   // Events-file path bookkeeping for a recording, on the hub so start/stop work across MCP sessions.
   setRecordingPath(tabId: number, path: string): void {
@@ -291,6 +382,10 @@ export class ExtensionHub {
   }
   getRecordingPath(tabId: number): string | undefined {
     return this.recordingPaths.get(tabId);
+  }
+  /** Tabs with a recording the server knows the events file of (active, or stopped but unassembled). */
+  recordingTabs(): number[] {
+    return [...this.recordingPaths.keys()];
   }
   deleteRecordingPath(tabId: number): boolean {
     return this.recordingPaths.delete(tabId);
@@ -305,6 +400,67 @@ export class ExtensionHub {
       ...(this.recordSink ? [this.recordSink.drain()] : []),
     ];
     await Promise.all(pending);
+  }
+
+  // ---- sink lifecycle across an extension reconnect ----
+
+  /** Socket dropped: keep every open sink for the grace period, then finalize whatever is left. */
+  private holdSinksForReconnect(): void {
+    if (this.sinkGraceTimer || (!this.captureSinks.size && !this.sessionSinks.size)) return;
+    log(`[hub] holding ${this.captureSinks.size} capture / ${this.sessionSinks.size} session sink(s) open for ${Math.round(this.sinkReconnectGraceMs / 1000)}s awaiting reconnect`);
+    this.sinkGraceTimer = setTimeout(() => {
+      this.sinkGraceTimer = null;
+      if (this.connected) return; // reconnected without a hello: keep them
+      log("[hub] extension did not reconnect within the sink grace period; finalizing sinks");
+      for (const tabId of [...this.captureSinks.keys()]) this.finalizeCaptureSink(tabId);
+      for (const tabId of [...this.sessionSinks.keys()]) this.finalizeSessionSink(tabId);
+    }, this.sinkReconnectGraceMs);
+    this.sinkGraceTimer.unref?.();
+  }
+
+  /**
+   * The extension (re)announced itself: re-adopt the held sinks. A hello that lists its live
+   * recordings / captures (`recordings` / `captures`: tab ids) re-adopts exactly those and finalizes
+   * the rest; one that doesn't (older extension) re-adopts them all, as they were before the drop.
+   */
+  private readoptSinks(hello: any): void {
+    if (!this.sinkGraceTimer) return;
+    clearTimeout(this.sinkGraceTimer);
+    this.sinkGraceTimer = null;
+    const ids = (v: unknown) => (Array.isArray(v) ? new Set(v.map(Number)) : null);
+    const rec = ids(hello?.recordings);
+    const cap = ids(hello?.captures);
+    if (rec) for (const tabId of [...this.sessionSinks.keys()]) if (!rec.has(tabId)) this.finalizeSessionSink(tabId);
+    if (cap) for (const tabId of [...this.captureSinks.keys()]) if (!cap.has(tabId)) this.finalizeCaptureSink(tabId);
+    log(`[hub] re-adopted ${this.captureSinks.size} capture / ${this.sessionSinks.size} session sink(s) after reconnect`);
+  }
+
+  private finalizeCaptureSink(tabId: number): void {
+    const sink = this.captureSinks.get(tabId);
+    if (!sink) return;
+    sink.close();
+    this.captureSinks.delete(tabId);
+  }
+
+  // Hand the sink to closedSessionSinks (as onCapture does on `done`) so a session_record_stop still
+  // awaits its drain instead of reading a half-flushed events file, and wake a stop waiting on a
+  // streamed `done` that will now never come.
+  private finalizeSessionSink(tabId: number): void {
+    const sink = this.sessionSinks.get(tabId);
+    if (!sink) return;
+    sink.close();
+    this.sessionSinks.delete(tabId);
+    this.closedSessionSinks.set(tabId, sink);
+    const w = this.sessionDoneWaiters.get(tabId);
+    if (w) {
+      this.sessionDoneWaiters.delete(tabId);
+      w();
+    }
+  }
+
+  /** True while the socket is down and sinks are being held open for a reconnect. */
+  get sinksHeld(): boolean {
+    return this.sinkGraceTimer !== null;
   }
 
   // Route a streamed {type:"capture", stream?, tabId, entries, done} message to the right sink.
@@ -388,11 +544,8 @@ export class ExtensionHub {
   // async so pre-send failures (not-connected guard, socket.send throw) reject the returned Promise
   // instead of throwing synchronously - honoring the Promise<any> contract for every .then/.catch caller.
   async call(method: string, params: Record<string, unknown> = {}, timeoutMs = CALL_TIMEOUT_MS): Promise<any> {
-    if (!this.connected) {
-      throw new Error(
-        "Browser extension is not connected. Make sure Chrome is running, the Browser Bridge " +
-          "extension is loaded, and the token in the extension options matches the server token."
-      );
+    if (!(await this.waitConnected(this.reconnectGraceMs))) {
+      throw new Error(NOT_CONNECTED_MESSAGE);
     }
     const id = randomUUID();
     const socket = this.ws!;
@@ -401,9 +554,36 @@ export class ExtensionHub {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`Extension call '${method}' timed out after ${timeoutMs}ms`));
+        // Tell the extension to stop working on it: its retry/poll loops check for cancellation, and
+        // a reply it still produces is dropped instead of being sent or queued.
+        if (socket.readyState === WebSocket.OPEN) {
+          try {
+            socket.send(JSON.stringify({ type: "cancel", id }));
+          } catch {
+            /* socket going away - nothing to cancel on */
+          }
+        }
+        reject(new Error(explainTimeout(method, timeoutMs)));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer, socket });
+    });
+  }
+
+  /** Resolve true once the extension socket is OPEN, waiting up to `ms` for a reconnect. */
+  private waitConnected(ms: number): Promise<boolean> {
+    if (this.connected) return Promise.resolve(true);
+    if (ms <= 0) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      const off = this.onConnectionChange((c) => {
+        if (!c || !this.connected) return;
+        clearTimeout(timer);
+        off();
+        resolve(true);
+      });
+      const timer = setTimeout(() => {
+        off();
+        resolve(this.connected);
+      }, ms);
     });
   }
 }

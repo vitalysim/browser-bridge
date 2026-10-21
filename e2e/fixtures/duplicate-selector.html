@@ -1,0 +1,9 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>duplicate selector</title>
+<style>nav.mobile{display:none}</style></head>
+<body>
+<!-- Mobile nav rendered first in the DOM but hidden on desktop: a classic responsive-layout duplicate. -->
+<nav class="mobile"><input name="email" id="mobile-email" placeholder="Email (mobile)"></nav>
+<main><h1>Newsletter</h1><input name="email" id="desktop-email" placeholder="Email (desktop)"></main>
+<iframe id="frame" src="dup-frame.html" width="400" height="80"></iframe>
+</body></html>

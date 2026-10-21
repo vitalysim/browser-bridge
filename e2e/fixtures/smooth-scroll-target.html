@@ -1,0 +1,18 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>smooth scroll</title>
+<style>html{scroll-behavior:smooth}#spacer{height:4000px;background:linear-gradient(#fff,#ccd)}
+#hdr{position:sticky;top:0;background:#222;color:#fff;padding:12px;z-index:5}</style></head>
+<body>
+<div id="hdr">Sticky header</div>
+<div id="spacer">scroll down</div>
+<button id="far" type="button">Far away button</button>
+<p id="out">idle</p>
+<div style="height:600px"></div>
+<script>
+  window.__farClicked = 0;
+  document.getElementById("far").addEventListener("click", () => {
+    window.__farClicked++;
+    document.getElementById("out").textContent = "far clicked";
+  });
+</script>
+</body></html>

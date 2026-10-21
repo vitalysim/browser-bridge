@@ -4,8 +4,13 @@ import { NetRing, applyRedirectResponse, capBody, Semaphore, type NetEntry } fro
 // Self-contained injected page helpers, kept in their own files so the two hot files stay small:
 // bbAct is the ONE find-and-act helper the interaction tools share; bbAxSnapshot is the ARIA walker.
 import { bbAct, type BbActParams } from "./dom-act";
+import { CDP_MODS, keyInfo, parseKeyCombo, pickFocusedFrame, matchCdpFrame, type FocusProbe } from "./act-logic";
 import { bbAxSnapshot } from "./ax";
-import { emulateDevice, emulateNetwork, emulateCpu, emulateLocale, emulateGeolocation, emulateReset } from "./emulate.js";
+import { buildReplayHeaders } from "./replay-headers";
+import { bbWatchMainShim } from "./watch-main-shim";
+import { allocateFrameBudgets, assignAxRefs, clampLimit, frameOffsets, pickSelectorTarget, routeRef, SNAPSHOT_DEFAULT_LIMIT, SNAPSHOT_MAX_LIMIT, type LocateMatch, type RefRoute } from "./snapshot-plan";
+import { emulateDevice, emulateNetwork, emulateCpu, emulateLocale, emulateGeolocation, emulateReset, hasEmulation, emulationState, forgetEmulation } from "./emulate.js";
+import { WsAuthClient, WS_AUTH_FAILED_CLOSE_CODE, WS_AUTH_TIMEOUT_CLOSE_CODE } from "./ws-auth";
 
 // Injected at build time by build.mjs (esbuild define) from extension/package.json - single
 // source of truth shared with manifest.json, so the version can't drift.
@@ -14,7 +19,14 @@ declare const __BB_BUILD__: string;
 const VERSION = __BB_VERSION__;
 const BUILD_AT = __BB_BUILD__;
 const PING_INTERVAL_MS = 20_000; // WS traffic resets the MV3 service-worker idle timer (Chrome 116+)
-const RECONNECT_MAX_MS = 30_000;
+// Capped low: the server waits only ~3s for a reconnect before failing a call, and most SW restarts
+// reconnect within ~1s, so a long backoff just turned a server blip into minutes of NO_EXTENSION.
+const RECONNECT_MAX_MS = 5_000;
+// The server closes the OLDER socket with 4000 when another connection with the same token arrives
+// (e.g. two Chrome profiles both configured). Reconnecting immediately would just evict the other one
+// again, forever - so back off for a long while instead.
+const REPLACED_CLOSE_CODE = 4000;
+const RECONNECT_REPLACED_MS = 60_000;
 
 let ws: WebSocket | null = null;
 let pingTimer: ReturnType<typeof setInterval> | null = null;
@@ -35,14 +47,132 @@ function setStatus(status: string, detail = "") {
   chrome.storage.local.set({ bbStatus: status, bbDetail: detail, bbUpdated: Date.now() });
 }
 
+// ---- timeouts ----
+// No chrome.* call is guaranteed to settle: executeScript blocks while the page shows a JS dialog
+// (alert/confirm/prompt/beforeunload) or its renderer is hung, and debugger commands can wedge the same
+// way. Every such call goes through withTimeout so the agent gets an actionable error instead of a hang.
+
+class TimeoutError extends Error {
+  code = "TIMEOUT";
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string | (() => string)): Promise<T> {
+  if (!(ms > 0) || !Number.isFinite(ms)) return p;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const t = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new TimeoutError(typeof label === "function" ? label() : label)), ms);
+  });
+  p.catch(() => undefined); // the loser of the race must not surface as an unhandled rejection
+  return Promise.race([p, t]).finally(() => clearTimeout(timer));
+}
+
+const isTimeout = (e: unknown): boolean => e instanceof TimeoutError;
+
+const INJECT_TOP_MS = 10_000; // top frame of a tab
+const INJECT_CHILD_MS = 3_000; // child frames: best-effort, a wedged ad/embed is skipped and reported
+const CDP_CMD_MS = 15_000; // default per debugger command
+const ATTACH_MS = 10_000; // debugger attach + DOM/Page enable
+const CAPTURE_STEP_MS = 10_000; // one captureVisibleTab grab inside the per-window queue
+
+// JavaScript dialogs currently open, per tab. Only observable while the debugger is attached with
+// Page.enable (ensureAttached does that); recorded from Page.javaScriptDialogOpening/Closed.
+interface PendingDialog {
+  type: string;
+  message: string;
+  url?: string;
+  defaultPrompt?: string;
+  at: number;
+}
+const pendingDialogs = new Map<number, PendingDialog>();
+
+function onDialogEvent(tabId: number, method: string, params: any): void {
+  if (method === "Page.javaScriptDialogOpening") {
+    pendingDialogs.set(tabId, {
+      type: String(params?.type ?? "alert"),
+      message: String(params?.message ?? ""),
+      url: params?.url,
+      defaultPrompt: params?.defaultPrompt,
+      at: Date.now(),
+    });
+  } else if (method === "Page.javaScriptDialogClosed") {
+    pendingDialogs.delete(tabId);
+  }
+}
+
+function dialogHint(tabId: number | undefined): string {
+  const d = tabId != null ? pendingDialogs.get(tabId) : undefined;
+  if (d) {
+    const msg = d.message.length > 120 ? d.message.slice(0, 120) + "…" : d.message;
+    return `the page is showing a JavaScript ${d.type} dialog ("${msg}") - call handle_dialog (accept:true/false) to close it`;
+  }
+  return (
+    "the page may be showing a JavaScript dialog (alert/confirm/prompt/beforeunload) - try handle_dialog, and if it reports " +
+    "none it must be closed by the user in Chrome (pass onDialog to click/press_key to avoid this) - or the tab may be hung or still loading"
+  );
+}
+
+/** The actionable message every bounded tab operation throws on timeout. */
+function tabTimeoutMsg(tabId: number | undefined, ms: number, what = ""): string {
+  const who = tabId != null ? `tab ${tabId}` : "the tab";
+  return `${who} did not respond${what ? ` to ${what}` : ""} within ${Math.round(ms / 100) / 10}s - ${dialogHint(tabId)}`;
+}
+
+// Server-side timeouts send {type:"cancel", id}. Long-running loops check isCancelled(params) and stop;
+// the eventual reply for a cancelled id is dropped rather than sent or queued.
+const cancelledCalls = new Map<string, number>(); // id -> cancelledAt
+const callIds = new WeakMap<object, string>(); // dispatch params object -> call id
+
+function markCancelled(id: string): void {
+  cancelledCalls.set(id, Date.now());
+  // Bounded: an id whose reply never comes (dispatch still wedged) must not leak forever.
+  while (cancelledCalls.size > 500) {
+    const oldest = cancelledCalls.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    cancelledCalls.delete(oldest);
+  }
+}
+
+/** True once the server gave up on the call these params belong to (pass dispatch's `params`). */
+function isCancelled(paramsOrId: object | string | null | undefined): boolean {
+  if (!paramsOrId) return false;
+  const id = typeof paramsOrId === "string" ? paramsOrId : callIds.get(paramsOrId);
+  return !!id && cancelledCalls.has(id);
+}
+
+// While > now, keepalive/alarm-driven connect() calls stand down (we were replaced - see onclose).
+// A token/port change or an explicit reconnect request clears it.
+let replacedUntil = 0;
+
+// A socket that is open (or opening) but has NOT finished the mutual challenge-response yet. Kept out
+// of `ws` on purpose: everything that sends (shipOrQueue, pumpOutbox, replies) goes through `ws`, so
+// nothing - no hello, no capture batch, no reply - can reach an unverified peer.
+let pendingWs: WebSocket | null = null;
+// How long the server has to complete the handshake, and how long to hold off after a failed one.
+const AUTH_TIMEOUT_MS = 10_000;
+const AUTH_FAILED_RETRY_MS = 15_000;
+
 async function connect() {
   if (connecting) return;
+  if (Date.now() < replacedUntil) return;
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  if (pendingWs && (pendingWs.readyState === WebSocket.OPEN || pendingWs.readyState === WebSocket.CONNECTING)) return;
   connecting = true;
   try {
     await connectNow();
   } finally {
     connecting = false;
+  }
+}
+
+/** True when something answers the bridge's /health on the port - used to tell "server down" from
+ *  "a server is up but refused the WebSocket" (an older server that requires ?token=, i.e. version skew). */
+async function healthAnswers(port: number): Promise<boolean> {
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1_500) });
+    const j: any = await r.json();
+    return j?.ok === true;
+  } catch {
+    return false;
   }
 }
 
@@ -53,10 +183,47 @@ async function connectNow() {
     return;
   }
   setStatus("connecting");
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`);
-  ws = socket;
+  // No token in the URL: the server must first prove it knows it (see ws-auth.ts).
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+  pendingWs = socket;
+  const auth = new WsAuthClient(String(token));
+  let authed = false;
+  let opened = false;
+  let authError: string | null = null;
+  // Pre-auth frames are processed strictly in order (HMAC is async): a call the server sends right
+  // after auth-ok must not be judged while auth-ok is still being verified.
+  let preAuth: Promise<void> = Promise.resolve();
+  const authTimer = setTimeout(() => {
+    if (authed) return;
+    authError = "the server did not complete authentication in time";
+    socket.close();
+  }, AUTH_TIMEOUT_MS);
 
-  socket.onopen = async () => {
+  const handshakeStep = async (event: MessageEvent) => {
+    if (authed || authError || pendingWs !== socket) return;
+    try {
+      const out = await auth.step(JSON.parse(String(event.data)));
+      if (out !== "ok") {
+        if (socket.readyState === WebSocket.OPEN) socket.send(out);
+        return;
+      }
+      authed = true;
+      clearTimeout(authTimer);
+      pendingWs = null;
+      ws = socket;
+      await onAuthenticated();
+    } catch (e) {
+      authError = e instanceof Error ? e.message : String(e);
+      console.warn(`[bb] closing connection: ${authError}`);
+      socket.close();
+    }
+  };
+
+  socket.onopen = () => {
+    opened = true; // wait for the server's challenge; send nothing until it has proven itself
+  };
+
+  const onAuthenticated = async () => {
     if (ws !== socket) return; // superseded by a newer connect() before we opened; don't touch globals
     reconnectDelay = 1_000;
     setStatus("connected");
@@ -78,6 +245,11 @@ async function connectNow() {
             gapMs,
           })),
         },
+        // The sinks the server held open across the drop are re-adopted only for what is still live
+        // here; the rest are finalized. After a worker respawn the debugger sessions (and so every
+        // persisted net capture) are gone, while session recordings are restored from storage.session.
+        recordings: [...sessionRecordings.keys()],
+        captures: [...sessions.entries()].filter(([, s]) => s.netOn && s.persist).map(([tabId]) => tabId),
       })
     );
     pumpOutbox(); // whatever was held while the socket was down
@@ -88,7 +260,18 @@ async function connectNow() {
     }, PING_INTERVAL_MS);
   };
 
-  socket.onmessage = async (event) => {
+  socket.onmessage = (event) => {
+    if (!authed) {
+      // Handshake frames - and anything that races in right behind auth-ok - go through one ordered
+      // chain. Nothing reaches dispatch until the server has proven it holds the token.
+      preAuth = preAuth.then(() => (authed ? onCommand(event) : handshakeStep(event)));
+      return;
+    }
+    void onCommand(event);
+  };
+
+  const onCommand = async (event: MessageEvent) => {
+    if (ws !== socket) return; // never act on frames from a socket that isn't the authenticated live one
     let msg: any;
     try {
       msg = JSON.parse(event.data);
@@ -96,10 +279,16 @@ async function connectNow() {
       return;
     }
     if (msg.type === "pong") return;
+    if (msg.type === "cancel") {
+      if (typeof msg.id === "string") markCancelled(msg.id);
+      return;
+    }
     if (!msg.id || !msg.method) return;
     let reply: any;
+    const params = msg.params ?? {};
+    if (params && typeof params === "object") callIds.set(params, msg.id);
     try {
-      const result = await dispatch(msg.method, msg.params ?? {});
+      const result = await dispatch(msg.method, params);
       reply = { id: msg.id, ok: true, result };
     } catch (err) {
       reply = { id: msg.id, ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -117,22 +306,86 @@ async function connectNow() {
       };
       json = JSON.stringify(reply);
     }
-    replyOrQueue(socket, json, reply);
+    // The server already gave up on this call (and failed it to the agent) - don't ship a late reply.
+    if (cancelledCalls.delete(msg.id)) return;
+    replyOrQueue(socket, json);
   };
 
-  socket.onclose = () => {
+  socket.onclose = (ev) => {
+    clearTimeout(authTimer);
+    if (pendingWs === socket) {
+      // Closed before mutual authentication completed. Nothing was sent to this peer but our proof.
+      pendingWs = null;
+      void onPreAuthClose(ev);
+      return;
+    }
     if (ws !== socket) return; // a superseded/replaced socket closing must not disturb the live one
     if (pingTimer) {
       clearInterval(pingTimer);
       pingTimer = null;
     }
     ws = null;
+    if (ev?.code === REPLACED_CLOSE_CODE) {
+      // Another connection with this token took over (a second browser/profile). Don't fight it.
+      console.warn(
+        `[bb] server replaced this connection with another one (close ${ev.code}). Is the token configured in ` +
+          `two browsers/profiles? Backing off ${RECONNECT_REPLACED_MS / 1000}s instead of reconnecting immediately.`
+      );
+      setStatus("replaced", "Another browser/profile with the same token took over the connection. Retrying in 60s.");
+      replacedUntil = Date.now() + RECONNECT_REPLACED_MS - 1_000; // the keepalive alarm must not undercut it
+      reconnectDelay = RECONNECT_REPLACED_MS;
+      scheduleReconnect();
+      return;
+    }
     setStatus("disconnected", "Will retry automatically.");
     scheduleReconnect();
   };
 
   socket.onerror = () => {
     // onclose fires next; nothing to do here (and a superseded socket must never touch globals)
+  };
+
+  const holdOff = () => {
+    // Don't hammer a peer that failed (or failed us) authentication; the keepalive alarm must not
+    // undercut the hold. A token/port change or an explicit reconnect clears it.
+    replacedUntil = Date.now() + AUTH_FAILED_RETRY_MS - 1_000;
+    reconnectDelay = AUTH_FAILED_RETRY_MS;
+  };
+
+  const onPreAuthClose = async (ev: CloseEvent) => {
+    if (ws || pendingWs) return; // a newer connect() already took over
+    if (authError) {
+      setStatus(
+        "auth-failed",
+        `Server failed authentication (${authError}). Whatever answered on 127.0.0.1:${port} could not prove it ` +
+          `knows the token, so nothing was sent to it. Check the bridge server is running, is the same version as ` +
+          `this extension (v${VERSION}), and that no other program holds the port. Retrying in ${AUTH_FAILED_RETRY_MS / 1000}s.`
+      );
+      holdOff();
+    } else if (ev.code === WS_AUTH_TIMEOUT_CLOSE_CODE) {
+      // Not a token problem: our reply didn't reach the server in time. Normal backoff, no hold-off.
+      setStatus("handshake-timeout", "The server's authentication handshake timed out. Retrying automatically.");
+    } else if (ev.code === WS_AUTH_FAILED_CLOSE_CODE) {
+      setStatus(
+        "token-rejected",
+        `The server rejected this extension's token. Paste the current token from ~/.browser-bridge/token into ` +
+          `the options. Retrying in ${AUTH_FAILED_RETRY_MS / 1000}s.`
+      );
+      holdOff();
+    } else if (!opened && (await healthAnswers(Number(port)))) {
+      // /health answers but the WebSocket upgrade was refused without a challenge: a pre-v2 server that
+      // still requires ?token=. We will not send the token in the clear, so the versions must match.
+      setStatus(
+        "version-skew",
+        `A bridge server is running on port ${port} but refused the connection - it is probably older than this ` +
+          `extension (v${VERSION}) and doesn't support the token challenge-response. Update/rebuild the server ` +
+          `(cd server && npm run build) and restart it; extension and server versions must match.`
+      );
+      holdOff();
+    } else {
+      setStatus("disconnected", "Will retry automatically.");
+    }
+    scheduleReconnect();
   };
 }
 
@@ -209,20 +462,17 @@ function pumpOutbox(): void {
   }
 }
 
-// Send a dispatch reply on the socket it arrived on, or - when that socket is no longer OPEN
-// (superseded by a reconnect, or closing) - hand it to the outbox instead of calling send() on a dead
-// socket. A reply the server no longer awaits is ignored by id, so routing a late one is harmless.
-// `json` is the already-serialized reply (sent as-is); `obj` is the same value for the outbox path.
-function replyOrQueue(socket: WebSocket, json: string, obj: any): void {
-  if (socket.readyState === WebSocket.OPEN) {
-    try {
-      socket.send(json);
-      return;
-    } catch {
-      /* fall through to the outbox */
-    }
+// Send a dispatch reply on the socket it arrived on. When that socket is no longer OPEN the reply is
+// DROPPED, not queued: the server rejects every call pending on a socket the moment it closes, so
+// nobody awaits it - and one huge late reply (screenshot, MHTML) in the outbox would evict every
+// queued capture/watch event to fit under the outbox byte cap.
+function replyOrQueue(socket: WebSocket, json: string): void {
+  if (socket.readyState !== WebSocket.OPEN) return;
+  try {
+    socket.send(json);
+  } catch {
+    /* socket going away - the server already failed this call */
   }
-  shipOrQueue(obj);
 }
 
 // ---------- watch mode ----------
@@ -373,9 +623,21 @@ async function registerWatchScripts(withConsole: boolean): Promise<void> {
       persistAcrossSessions: true,
     },
   ];
-  // The MAIN-world shim is NOT registered here: it is injected per-document as an inline function
-  // (see bbWatchMainShim), which is why watched tabs re-inject it on every commit.
+  // The MAIN-world shim loader runs at document_start, before any page script, so it captures pristine
+  // primitives and pairs with the isolated watcher through a handshake the page never sees (see
+  // watch-main-entry.ts). It stays inert until the watcher arms it, so registering it regardless of the
+  // console mode is harmless; documents already open when the watch starts get the inline fallback
+  // (injectWatchMain), which is best-effort - see docs/WATCH.md.
   void withConsole;
+  want.push({
+    id: WATCH_MAIN_SCRIPT_ID,
+    js: ["vendor/bb-watch-main.js"],
+    matches: ["<all_urls>"],
+    allFrames: true,
+    runAt: "document_start",
+    world: "MAIN",
+    persistAcrossSessions: true,
+  } as chrome.scripting.RegisteredContentScript);
   let existing: chrome.scripting.RegisteredContentScript[] = [];
   try {
     existing = await chrome.scripting.getRegisteredContentScripts();
@@ -400,120 +662,54 @@ async function unregisterWatchScripts(): Promise<void> {
 /** Registration only covers FUTURE document loads. Sweep the tabs already open so watch mode starts
  *  working on the page the human is looking at, without asking them to reload it. */
 
-/**
- * MAIN-world page-error shim, injected as an INLINE FUNCTION rather than a file.
- *
- * It has to run in the page's own JS world: an isolated-world listener does not receive page script
- * errors (verified - CDP saw an uncaught throw, a rejection and a console.error while an isolated
- * listener saw none). But injecting a FILE into the MAIN world proved unreliable here even with
- * web_accessible_resources set, so this is passed as `func`, which needs no web-accessible resource,
- * no second bundle and no runtime handshake to carry the mode.
- *
- * Must be fully self-contained: it is serialized and evaluated in the page.
- *
- * PASSIVE (always): error / unhandledrejection listeners observe an error AFTER it has unwound, so
- * they add no frame to the page's own stack traces.
- * WRAPPING (mode === "calls" only): replacing console.error/warn DOES sit in the page's call path and
- * puts this extension in the page's stack traces - observed on a real target whose error reporter
- * shipped our filename. Opt-in by name for that reason.
- */
-function bbWatchMainShim(mode: string) {
-  const w = window as any;
-  const relay = (obj: any) => {
-    try {
-      window.dispatchEvent(new CustomEvent("bb-watch-main", { detail: JSON.stringify(obj) }));
-    } catch {
-      /* unserializable - drop rather than throw inside the page */
-    }
-  };
-  const fmt = (args: any[]): string =>
-    args
-      .map((a: any) => {
-        if (typeof a === "string") return a;
-        if (a instanceof Error) return a.stack || a.message;
-        try {
-          return JSON.stringify(a);
-        } catch {
-          return String(a);
-        }
-      })
-      .join(" ")
-      .slice(0, 500);
-  const wrapConsole = () => {
-    if (w.__bbWatchWrapped) return;
-    w.__bbWatchWrapped = 1;
-    for (const level of ["error", "warn"]) {
-      const orig = (console as any)[level]?.bind(console);
-      if (!orig) continue;
-      (console as any)[level] = (...args: any[]) => {
-        try {
-          relay({ kind: "console", level, text: fmt(args) });
-        } catch {
-          /* never break the page's own logging */
-        }
-        return orig(...args);
-      };
-    }
-  };
-  // SPA route changes are only observable from the MAIN world: history.pushState/replaceState run in
-  // the page's own JS and fire no event an isolated listener can see (popstate/hashchange are the
-  // only ones that reach the isolated world, and pushState is neither). Patch them here and relay to
-  // the isolated watcher, which emits them as via:"spa" navigations. `replace` is carried through so
-  // the fold can leave a search-as-you-type burst intact instead of splitting it per keystroke.
-  const patchHistory = () => {
-    if (w.__bbWatchHist) return;
-    w.__bbWatchHist = 1;
-    for (const m of ["pushState", "replaceState"] as const) {
-      const orig = (history as any)[m];
-      if (typeof orig !== "function") continue;
-      (history as any)[m] = function (this: History, ...args: any[]) {
-        const r = orig.apply(this, args);
-        try {
-          relay({ kind: "nav", replace: m === "replaceState" });
-        } catch {
-          /* never break the page's navigation */
-        }
-        return r;
-      };
-    }
-  };
-  if (w.__bbWatchMain) {
-    patchHistory();
-    if (mode === "calls") wrapConsole();
-    return true;
-  }
-  window.addEventListener("error", (e: any) => {
-    relay({ kind: "console", level: "error", text: String(e.message ?? "").slice(0, 500), src: e.filename, line: e.lineno });
-  });
-  window.addEventListener("unhandledrejection", (e: any) => {
-    relay({ kind: "console", level: "error", text: "Unhandled rejection: " + fmt([e?.reason]) });
-  });
-  patchHistory();
-  if (mode === "calls") wrapConsole();
-  w.__bbWatchMain = 1;
-  return true;
+/** Inject the MAIN-world shim into specific frames, each with the secret its isolated watcher chose. */
+async function injectWatchMain(tabId: number, frames: { frameId: number; nonce: string }[], mode: string): Promise<string> {
+  const errs: string[] = [];
+  await Promise.all(
+    frames.map(({ frameId, nonce }) =>
+      chrome.scripting
+        .executeScript({
+          target: { tabId, frameIds: [frameId] },
+          func: bbWatchMainShim,
+          args: [mode, nonce],
+          world: "MAIN",
+          injectImmediately: true,
+        } as chrome.scripting.ScriptInjection<any, any>)
+        .catch((e) => {
+          errs.push(String(e?.message ?? e).slice(0, 200));
+        })
+    )
+  );
+  return errs.length ? errs[0] : "ok";
 }
 
 async function injectWatchNow(tabId: number, consoleMode: "off" | "passive" | "calls"): Promise<void> {
-  const jobs: Promise<unknown>[] = [
-    chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ["vendor/bb-watch.js"] }),
-  ];
-  if (consoleMode !== "off") {
-    jobs.push(
-      chrome.scripting.executeScript({
-        target: { tabId, allFrames: true },
-        func: bbWatchMainShim,
-        args: [consoleMode],
-        world: "MAIN",
-      } as chrome.scripting.ScriptInjection<any, any>)
-    );
-  }
   // Report what failed rather than swallowing it. A silently-failed injection looks exactly like a
   // quiet user, which is the failure mode this whole feature is built to avoid.
-  const [isolated, main] = await Promise.all(
-    jobs.map((p) => p.then(() => "ok").catch((e) => String(e?.message ?? e).slice(0, 200)))
-  );
-  lastInject.set(tabId, { isolated, main: consoleMode === "off" ? "skipped" : main ?? "ok", at: Date.now() });
+  const isolated = await chrome.scripting
+    .executeScript({ target: { tabId, allFrames: true }, files: ["vendor/bb-watch.js"] })
+    .then(() => "ok")
+    .catch((e) => String(e?.message ?? e).slice(0, 200));
+  let main = "skipped";
+  if (consoleMode !== "off") {
+    // The MAIN-world shim needs each frame's own channel secret, which only its isolated watcher has.
+    try {
+      const rs = await chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        // A frame whose document_start shim already paired is armed through the watcher (arm below).
+        func: () => {
+          const b = (window as any).__bbWatch;
+          return b ? { nonce: b.mainNonce ?? null, paired: !!b.mainPaired } : null;
+        },
+      } as chrome.scripting.ScriptInjection<any, any>);
+      const all = ((rs ?? []) as any[]).filter((r: any) => typeof r?.result?.nonce === "string");
+      const frames = all.filter((r: any) => !r.result.paired).map((r: any) => ({ frameId: r.frameId as number, nonce: r.result.nonce as string }));
+      main = frames.length ? await injectWatchMain(tabId, frames, consoleMode) : all.length ? "ok (document_start shim)" : "no watcher to pair with";
+    } catch (e) {
+      main = String((e as any)?.message ?? e).slice(0, 200);
+    }
+  }
+  lastInject.set(tabId, { isolated, main, at: Date.now() });
   // Arm EXPLICITLY. The content script is registered on <all_urls> and persists, so on any tab that
   // loaded before this watch existed it already ran its hello handshake, was told "not armed", and
   // went dormant. Re-injecting does not revive it - the idempotence guard makes that a no-op - so
@@ -572,14 +768,34 @@ function assertScriptable(tab: chrome.tabs.Tab) {
 // coalesce to null (which the injected funcs treat the same via `!= null` / falsy checks).
 const clean = (args: any[]) => args.map((a) => (a === undefined ? null : a));
 
-async function inject<T>(tab: chrome.tabs.Tab, func: (...args: any[]) => T, args: any[] = [], world: "ISOLATED" | "MAIN" = "ISOLATED"): Promise<T> {
+// opts.timeoutMs bounds the call (default INJECT_TOP_MS); opts.immediate sets injectImmediately for
+// read-only funcs that need not wait for document_idle (the tab may be stuck loading).
+interface InjectOpts {
+  timeoutMs?: number;
+  immediate?: boolean;
+  skipTop?: boolean; // injectAllFrames: child frames only
+}
+
+async function inject<T>(
+  tab: chrome.tabs.Tab,
+  func: (...args: any[]) => T,
+  args: any[] = [],
+  world: "ISOLATED" | "MAIN" = "ISOLATED",
+  opts: InjectOpts = {}
+): Promise<T> {
   assertScriptable(tab);
-  const [result] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id! },
-    world,
-    func: func as any,
-    args: clean(args),
-  });
+  const ms = opts.timeoutMs ?? INJECT_TOP_MS;
+  const [result] = await withTimeout(
+    chrome.scripting.executeScript({
+      target: { tabId: tab.id! },
+      world,
+      func: func as any,
+      args: clean(args),
+      injectImmediately: !!opts.immediate,
+    }),
+    ms,
+    () => tabTimeoutMsg(tab.id, ms)
+  );
   const value = result?.result as any;
   // Injected functions signal failure by RETURNING { error } - never by throwing, because
   // Chrome swallows exceptions thrown inside executeScript and resolves with null instead.
@@ -591,24 +807,97 @@ async function inject<T>(tab: chrome.tabs.Tab, func: (...args: any[]) => T, args
 
 // Inject into every frame of the tab; returns the raw per-frame InjectionResults ({ frameId, result }).
 // <all_urls> host permission lets executeScript reach cross-origin iframes that page JS can't.
+//
+// Injected PER FRAME, each raced against its own timeout (the scheme injectFrame uses for the session
+// recorder): a single allFrames:true executeScript waits on the slowest frame, so one wedged
+// cross-origin ad/embed - or a page showing a JS dialog - hung the whole call. The top frame gets
+// INJECT_TOP_MS and its timeout fails the call with an actionable error; a child frame that times out
+// is SKIPPED and listed on the returned array's `skippedFrames` property instead.
+type FrameResults = chrome.scripting.InjectionResult[] & { skippedFrames?: { frameId: number; url?: string; reason: string }[] };
+
 async function injectAllFrames(
   tab: chrome.tabs.Tab,
   func: (...args: any[]) => any,
   args: any[] = [],
-  world: "ISOLATED" | "MAIN" = "ISOLATED"
-): Promise<chrome.scripting.InjectionResult[]> {
+  world: "ISOLATED" | "MAIN" = "ISOLATED",
+  opts: InjectOpts = {}
+): Promise<FrameResults> {
   assertScriptable(tab);
-  return chrome.scripting.executeScript({
-    target: { tabId: tab.id!, allFrames: true },
-    world,
-    func: func as any,
-    args: clean(args),
-  });
+  const tabId = tab.id!;
+  let frames: { frameId: number; url?: string }[] | null = null;
+  try {
+    frames = (await withTimeout(chrome.webNavigation.getAllFrames({ tabId }), 3_000, "getAllFrames")) ?? null;
+  } catch {
+    frames = null;
+  }
+  if (opts.skipTop) {
+    if (!frames) return [] as FrameResults; // no frame list: no known child frames
+    frames = frames.filter((f) => f.frameId !== 0);
+    if (!frames.length) return [] as FrameResults;
+  }
+  if (!frames || !frames.length) {
+    // No frame list - fall back to one allFrames call, still bounded.
+    const ms = opts.timeoutMs ?? INJECT_TOP_MS;
+    return withTimeout(
+      chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        world,
+        func: func as any,
+        args: clean(args),
+        injectImmediately: !!opts.immediate,
+      }),
+      ms,
+      () => tabTimeoutMsg(tabId, ms)
+    );
+  }
+  const cleaned = clean(args);
+  const skipped: { frameId: number; url?: string; reason: string }[] = [];
+  const settled = await Promise.all(
+    frames.map(async (f) => {
+      const top = f.frameId === 0;
+      const ms = top ? opts.timeoutMs ?? INJECT_TOP_MS : INJECT_CHILD_MS;
+      try {
+        const res = await withTimeout(
+          chrome.scripting.executeScript({
+            target: { tabId, frameIds: [f.frameId] },
+            world,
+            func: func as any,
+            args: cleaned,
+            injectImmediately: !!opts.immediate,
+          }),
+          ms,
+          () => tabTimeoutMsg(tabId, ms, top ? "" : `frame ${f.frameId}`)
+        );
+        return res?.[0] ?? null;
+      } catch (e) {
+        if (top) throw e; // the top frame is the page - its failure is the call's failure
+        // Not injectable (about:blank, sandboxed, gone mid-call) is silently omitted, as allFrames did;
+        // only a frame that HUNG is worth telling the agent about.
+        if (isTimeout(e)) skipped.push({ frameId: f.frameId, url: f.url, reason: "timeout" });
+        return null;
+      }
+    })
+  );
+  const out = settled.filter((r): r is chrome.scripting.InjectionResult => r != null) as FrameResults;
+  if (skipped.length) out.skippedFrames = skipped;
+  return out;
 }
 
 // Run an element-interaction func in every frame; exactly the frame that owns the element acts.
 // Frames without the element return { notFound: true }; a real failure returns { error }.
 async function injectAllAggregate(tab: chrome.tabs.Tab, func: (...args: any[]) => any, args: any[] = []): Promise<any> {
+  // A snapshot ref is only valid in the frame that issued it (see twoPhaseSnapshot).
+  const ref = args[1]?.ref;
+  if (ref != null) {
+    const owner = ownerFrameForRef(tab.id!, ref);
+    if (owner === null) throw new Error(`ref ${ref} is not from the latest snapshot (taking any snapshot invalidates earlier refs) - take a fresh snapshot`);
+    if (owner !== undefined) {
+      const v = await actInFrame(tab, owner, args, func);
+      if (v?.staleRef) throw new Error("Ref matched an element that was since removed/re-rendered - take a fresh snapshot");
+      if (!v || v.notFound) throw new Error("Element not found - take a fresh snapshot");
+      return v;
+    }
+  }
   const results = await injectAllFrames(tab, func, args);
   let acted: any = null;
   let stale = false;
@@ -628,32 +917,116 @@ async function injectAllAggregate(tab: chrome.tabs.Tab, func: (...args: any[]) =
 // re-inject into just that frame instead of walking every frame's DOM again each tick. Unlike
 // injectAllAggregate it does NOT throw on not-found/stale - it returns a structured result the retry
 // loop interprets (a real {error} still throws). frameId is null when no frame located the element.
-async function actAllFrames(tab: chrome.tabs.Tab, args: any[]): Promise<{ result: any; frameId: number | null }> {
+//
+// Refs route straight to the frame that issued them. Selectors are first LOCATED read-only in every
+// frame and ONE match is chosen (visible > top frame > in viewport > document order), then bbAct runs
+// only in that frame on that match (p.nth) - so a selector can't also fill a lookalike field inside an
+// embedded widget iframe, and a hidden duplicate (mobile nav) doesn't shadow the visible one.
+async function actAllFrames(
+  tab: chrome.tabs.Tab,
+  args: any[]
+): Promise<{ result: any; frameId: number | null; nth?: number; matchCount?: number; note?: string; skipped?: number }> {
+  const p: BbActParams = args[1] ?? {};
+  if (p.ref != null) {
+    const owner = ownerFrameForRef(tab.id!, p.ref);
+    if (owner === null) return { result: { notFound: true }, frameId: null };
+    if (owner !== undefined) {
+      let v: any;
+      try {
+        v = await actInFrame(tab, owner, args);
+      } catch (e) {
+        if (e instanceof Error && /Frame with ID|No frame|was removed/i.test(e.message)) v = { notFound: true };
+        else throw e;
+      }
+      return { result: v, frameId: v?.notFound || v?.staleRef ? null : owner };
+    }
+  } else if (p.sel != null && p.nth == null) {
+    // Fast path: locate + pick + act in the TOP frame in one injection, while the child frames are
+    // located in parallel (for matchCount/note, and as the fallback). A visible top-frame match always
+    // wins pickSelectorTarget's ranking, so acting on it before the children answer picks the same
+    // element the two-step locate-then-act did - one executeScript round trip fewer.
+    const [top, kids] = await Promise.all([
+      actInFrame(tab, 0, [args[0], { ...p, pick: true }, ...args.slice(2)]),
+      injectAllFrames(tab, bbLocateAll, [p.sel], "ISOLATED", { skipTop: true }),
+    ]);
+    const pickData = top?._pick as { count: number; matches: { index: number; visible: boolean; inViewport: boolean }[]; index?: number } | undefined;
+    if (top && typeof top === "object") delete top._pick;
+    const matches: LocateMatch[] = (pickData?.matches ?? []).map((m) => ({ frameId: 0, ...m }));
+    for (const r of kids) {
+      const v: any = r?.result;
+      if (!v || typeof v !== "object") continue;
+      if (typeof v.error === "string") throw new Error(v.error);
+      for (const m of v.matches ?? []) matches.push({ frameId: r.frameId, index: m.index, visible: m.visible, inViewport: m.inViewport });
+    }
+    const skipped = kids.skippedFrames?.length ?? 0;
+    const pick = pickSelectorTarget(matches);
+    if (top && !top.notFound && !top.pickHidden && pickData?.index != null) {
+      return { result: top, frameId: 0, nth: pickData.index, matchCount: pick.count, note: pick.note, skipped };
+    }
+    if (!pick.chosen) return { result: { notFound: true }, frameId: null, skipped };
+    const nthArgs = [args[0], { ...p, nth: pick.chosen.index }, ...args.slice(2)];
+    const v = await actInFrame(tab, pick.chosen.frameId, nthArgs);
+    return { result: v, frameId: v?.notFound ? null : pick.chosen.frameId, nth: pick.chosen.index, matchCount: pick.count, note: pick.note, skipped };
+  } else if (p.sel != null) {
+    const pick = await locateOne(tab, p.sel);
+    if (!pick.chosen) return { result: { notFound: true }, frameId: null, skipped: pick.skipped };
+    const nthArgs = [args[0], { ...p, nth: pick.chosen.index }, ...args.slice(2)];
+    const v = await actInFrame(tab, pick.chosen.frameId, nthArgs);
+    return {
+      result: v,
+      frameId: v?.notFound ? null : pick.chosen.frameId,
+      nth: pick.chosen.index,
+      matchCount: pick.count,
+      note: pick.note,
+      skipped: pick.skipped,
+    };
+  }
   const results = await injectAllFrames(tab, bbAct, args);
+  const skipped = results.skippedFrames?.length ?? 0;
   let acted: any = null;
   let ownerFrame: number | null = null;
-  let stale = false;
+  let stale: any = null; // keep bbAct's {staleRef, was, now} detail for the error message
   for (const r of results) {
     const v: any = r?.result;
     if (!v || typeof v !== "object") continue;
     if (typeof v.error === "string") throw new Error(v.error);
-    if (v.staleRef) { stale = true; continue; }
+    if (v.staleRef) { stale = v; continue; }
     if (v.notFound) continue;
     acted = v;
     ownerFrame = r.frameId; // this frame owns the element (result may be notActionable)
   }
-  if (acted) return { result: acted, frameId: ownerFrame };
-  return { result: stale ? { staleRef: true } : { notFound: true }, frameId: null };
+  if (acted) return { result: acted, frameId: ownerFrame, skipped };
+  return { result: stale ?? { notFound: true }, frameId: null, skipped };
+}
+
+// Read-only locate of a selector in every frame, then pick ONE match (snapshot-plan.ts
+// pickSelectorTarget). An invalid selector throws immediately instead of being retried until timeout.
+async function locateOne(tab: chrome.tabs.Tab, sel: string) {
+  const located = await injectAllFrames(tab, bbLocateAll, [sel]);
+  const matches: LocateMatch[] = [];
+  for (const r of located.slice().sort((a, b) => (a.frameId === 0 ? -1 : b.frameId === 0 ? 1 : 0))) {
+    const v: any = r?.result;
+    if (!v || typeof v !== "object") continue;
+    if (typeof v.error === "string") throw new Error(v.error);
+    for (const m of v.matches ?? []) matches.push({ frameId: r.frameId, index: m.index, visible: m.visible, inViewport: m.inViewport });
+  }
+  // Child frames that did not answer within INJECT_CHILD_MS were not searched: callers say so on a miss.
+  return { ...pickSelectorTarget(matches), skipped: located.skippedFrames?.length ?? 0 };
 }
 
 // A retry once the owning frame is known: run bbAct in just that one frame.
-async function actInFrame(tab: chrome.tabs.Tab, frameId: number, args: any[]): Promise<any> {
-  const res = await chrome.scripting.executeScript({
-    target: { tabId: tab.id!, frameIds: [frameId] },
-    world: "ISOLATED",
-    func: bbAct as any,
-    args: clean(args),
-  });
+async function actInFrame(tab: chrome.tabs.Tab, frameId: number, args: any[], func: (...a: any[]) => any = bbAct): Promise<any> {
+  const ms = INJECT_TOP_MS;
+  const res = await withTimeout(
+    chrome.scripting.executeScript({
+      target: { tabId: tab.id!, frameIds: [frameId] },
+      world: "ISOLATED",
+      func: func as any,
+      args: clean(args),
+    }),
+    ms,
+    () => tabTimeoutMsg(tab.id, ms, frameId ? `frame ${frameId}` : "")
+  );
   const v: any = res?.[0]?.result;
   if (v && typeof v === "object" && typeof v.error === "string") throw new Error(v.error);
   return v ?? { notFound: true };
@@ -722,71 +1095,855 @@ function bbPageText(includeHidden: boolean) {
   return { title: document.title, url: location.href, text };
 }
 
-function bbSnapshot(refOffset: number) {
-  const SEL =
-    'a[href], button, input, select, textarea, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [contenteditable="true"]';
-  const items: any[] = [];
-  // Fresh ref registry each snapshot: ref (number) -> Element, kept on the frame's ISOLATED-world
-  // global so a later click/fill/hover/type injection (same world) resolves the ref WITHOUT mutating
-  // the page DOM. Reassign a new Map (never merge) so detached nodes from prior snapshots don't leak.
-  // INVARIANT: every ref locator must inject in the ISOLATED world - a MAIN-world locator sees a
-  // different `window` and would miss this registry.
-  const bbRefs: Map<number, Element> = ((window as any).__bbRefs = new Map());
-  let n = 0;
-  // Single fused pass: match-and-emit during the walk instead of materializing EVERY element in the
-  // document into an array and re-looping it. Emission order is identical - the old walk pushed a
-  // host then immediately recursed into its shadow root, which is exactly this traversal order - and
-  // the 400 cap now stops the walk itself rather than only the second loop, so a huge page no longer
-  // traverses tens of thousands of nodes it will never emit. Same elements, same refs, less work.
+// Phase 1 of a plain snapshot (runs per frame). Collects candidate interactive elements in one pass,
+// orders them by priority (open dialog / modal / popover first, then in-viewport, then the rest in
+// DOM order), and returns up to `limit` entries WITHOUT refs. The elements are parked in
+// window.__bbPending (tagged with the snapshot epoch); phase 2 (bbCommitRefs) registers the ones the
+// service worker's cross-frame budget kept, under refs it numbered. Two phases so every frame's ref
+// range is dense and disjoint whatever its size, and child frames get a fair share of the budget.
+function bbSnapshot(epoch: number, o: { limit: number; viewportOnly: boolean; modalOnly: boolean; filter: string | null }) {
+  try {
+    const LIMIT = Math.max(1, Math.min(2000, o.limit || 400));
+    const SCAN_CAP = 6000; // max candidates considered per frame (bounds work on giant pages)
+    const CURSOR_CAP = 3000; // max getComputedStyle(cursor) checks for handler-only clickables
+    const STRONG =
+      'a[href], button, input:not([type="hidden"]), select, textarea, summary, [contenteditable]:not([contenteditable="false"]), ' +
+      'audio[controls], video[controls], [role="button"], [role="link"], [role="tab"], [role="menuitem"], ' +
+      '[role="menuitemcheckbox"], [role="menuitemradio"], [role="option"], [role="checkbox"], [role="radio"], ' +
+      '[role="switch"], [role="combobox"], [role="textbox"], [role="searchbox"], [role="treeitem"], [role="slider"], ' +
+      '[role="spinbutton"], [role="gridcell"], [role="listbox"]';
+    const WEAK = '[tabindex]:not([tabindex="-1"]), [onclick]';
+    const SKIP = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE", "HEAD", "META", "LINK", "TITLE", "BASE", "HTML", "BODY", "BR", "HR", "OPTION", "OPTGROUP", "LABEL", "SLOT", "IFRAME", "FRAME"]);
+    const SVG_INNER = /^(path|g|use|circle|rect|line|polyline|polygon|ellipse|defs|clippath|mask|lineargradient|radialgradient|stop|symbol|tspan|title|desc)$/i;
+    const vw = window.innerWidth || 0, vh = window.innerHeight || 0;
+    const norm = (s: string | null | undefined, max = 80) => (s || "").replace(/\s+/g, " ").trim().slice(0, max);
+    const safeMatches = (el: Element, sel: string) => {
+      try {
+        return el.matches(sel);
+      } catch {
+        return false;
+      }
+    };
+    const parentOf = (n: Node): Element | null => (n.parentElement as Element | null) || ((n.getRootNode() as ShadowRoot).host ?? null);
+    const containsDeep = (a: Element, b: Element) => {
+      for (let n: Node | null = b; n; n = (n.parentNode as Node | null) || ((n as ShadowRoot).host ?? null)) if (n === a) return true;
+      return false;
+    };
+    // Rendered + not visibility:hidden (+ opacity unless the caller is checking a toggle input).
+    const shown = (el: Element, opacity: boolean) => {
+      const cv = (el as any).checkVisibility;
+      if (typeof cv === "function") {
+        try {
+          if (!cv.call(el, { visibilityProperty: true, checkVisibilityCSS: true, opacityProperty: opacity, checkOpacity: opacity })) return false;
+        } catch {}
+      }
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    };
+    const rendered = (el: Element) => {
+      const cv = (el as any).checkVisibility;
+      try {
+        return typeof cv === "function" ? cv.call(el, { visibilityProperty: true }) : true;
+      } catch {
+        return true;
+      }
+    };
+
+    // ---- open modal / overlays ----
+    let modal: Element | null = null;
+    let modalNative = false;
+    try {
+      modal = document.querySelector("dialog:modal");
+      modalNative = !!modal;
+    } catch {}
+    if (!modal) {
+      const ams = document.querySelectorAll('[aria-modal="true"]');
+      for (let i = ams.length - 1; i >= 0; i--) if (shown(ams[i], false)) { modal = ams[i]; break; }
+    }
+    const OVERLAY = 'dialog[open], [aria-modal="true"], [role="dialog"], [role="alertdialog"], [popover]';
+    const inOverlay = (el: Element) => {
+      for (let n: Element | null = el; n; ) {
+        const c: Element | null = n.closest(OVERLAY);
+        if (c) {
+          if (!c.hasAttribute("popover") || safeMatches(c, ":popover-open")) return true;
+          n = c.parentElement;
+          continue;
+        }
+        const host: Element | null = (n.getRootNode() as ShadowRoot).host ?? null;
+        n = host;
+      }
+      return false;
+    };
+
+    // ---- role / name / state ----
+    const INPUT_ROLE: Record<string, string> = {
+      button: "button", submit: "button", reset: "button", image: "button", file: "button",
+      checkbox: "checkbox", radio: "radio", range: "slider", number: "spinbutton", search: "searchbox",
+    };
+    const roleOf = (el: Element): string => {
+      const explicit = (el.getAttribute("role") || "").trim().split(/\s+/)[0];
+      if (explicit) return explicit;
+      const tag = el.tagName.toLowerCase();
+      if (tag === "a") return "link";
+      if (tag === "button" || tag === "summary") return "button";
+      if (tag === "input") return INPUT_ROLE[((el as HTMLInputElement).type || "text").toLowerCase()] || "textbox";
+      if (tag === "select") return (el as HTMLSelectElement).multiple || (el as HTMLSelectElement).size > 1 ? "listbox" : "combobox";
+      if (tag === "textarea" || (el as HTMLElement).isContentEditable) return "textbox";
+      if (tag === "audio" || tag === "video") return tag;
+      return "";
+    };
+    const byIds = (el: Element, ids: string) => {
+      const root = el.getRootNode() as Document | ShadowRoot;
+      let out = "";
+      for (const id of ids.split(/\s+/)) {
+        if (!id) continue;
+        const r = ((root as any).getElementById?.(id) as Element | null) ?? document.getElementById(id);
+        if (r) out += " " + ((r as HTMLElement).innerText || r.textContent || "");
+      }
+      return norm(out);
+    };
+    const isField = (el: Element) => /^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName);
+    const nameOf = (el: Element): string => {
+      const al = el.getAttribute("aria-label");
+      if (al && al.trim()) return norm(al);
+      const lb = el.getAttribute("aria-labelledby");
+      if (lb) {
+        const t = byIds(el, lb);
+        if (t) return t;
+      }
+      if (isField(el)) {
+        const labels = (el as HTMLInputElement).labels;
+        if (labels && labels.length) {
+          const t = norm((labels[0] as HTMLElement).innerText || labels[0].textContent);
+          if (t) return t;
+        }
+        const t = ((el as HTMLInputElement).type || "").toLowerCase();
+        if (el.tagName === "INPUT" && /^(button|submit|reset)$/.test(t)) return norm((el as HTMLInputElement).value);
+        return norm(el.getAttribute("placeholder") || el.getAttribute("title") || el.getAttribute("alt") || "");
+      }
+      if ((el as HTMLElement).isContentEditable) return norm(el.getAttribute("aria-placeholder") || el.getAttribute("data-placeholder") || el.getAttribute("title") || "");
+      const txt = norm((el as HTMLElement).innerText || "");
+      if (txt) return txt;
+      const t = el.getAttribute("title");
+      if (t && t.trim()) return norm(t);
+      try {
+        const inner = el.querySelector("img[alt], [aria-label], svg title");
+        if (inner) return norm(inner.getAttribute("alt") || inner.getAttribute("aria-label") || inner.textContent || "");
+      } catch {}
+      return "";
+    };
+    // [name hint] A discovery hint for NAMELESS elements (icon-only buttons, sidebar items): the first
+    // of aria-describedby text, title (self / first descendant), test id (self / nearest descendant),
+    // data-key/-value/-action, name attr, a non-generated id, or the icon's name (lucide-*, fa-*, bi-*,
+    // data-icon, material ligature). NOT part of the ref fingerprint. Keep in sync with hintOf in ax.ts.
+    const AUTO_ID = /^(radix-|react-aria|headlessui-|mui-|rc[-_]|ember\d|:r|«r|_r_|aria-)|[:«»]|\d{3,}|^[0-9a-f-]{16,}$/i;
+    const ICON_SKIP = /^(fa-(solid|regular|light|thin|duotone|brands|sharp|fw|lg|xs|sm|xl|\dx|spin|pulse|border|inverse|stack.*|rotate.*|flip.*)|lucide-icon|bi-icon)$/;
+    const hintOf = (el: Element, selfOnly = false): string => {
+      const clean = (s: string | null | undefined) => (s || "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\s]+/g, " ").trim().slice(0, 60);
+      const attr = (e: Element | null, a: string) => clean(e ? e.getAttribute(a) : "");
+      const desc = el.getAttribute("aria-describedby");
+      if (desc) {
+        const t = clean(byIds(el, desc));
+        if (t) return t;
+      }
+      const sub = (sel: string): Element | null => {
+        if (safeMatches(el, sel)) return el;
+        if (selfOnly) return null;
+        try {
+          return el.querySelector(sel);
+        } catch {
+          return null;
+        }
+      };
+      const tt = attr(sub("[title]"), "title");
+      if (tt) return tt;
+      for (const a of ["data-testid", "data-test-id", "data-test", "data-cy", "data-qa"]) {
+        const v = attr(sub(`[${a}]`), a);
+        if (v) return `${a}=${v}`;
+      }
+      for (const a of ["data-key", "data-value", "data-action", "name"]) {
+        const v = attr(el, a);
+        if (v) return `${a}=${v}`;
+      }
+      const id = clean(el.id);
+      if (id && !AUTO_ID.test(id)) return `id=${id}`;
+      const di = attr(sub("[data-icon]"), "data-icon");
+      if (di) return `icon:${di}`;
+      let icons: Element[] = [];
+      try {
+        icons = selfOnly ? [] : Array.from(el.querySelectorAll("svg, i, span[class*='icon'], span[class*='material']")).slice(0, 8);
+        if (/^(svg|i)$/i.test(el.tagName)) icons.unshift(el);
+      } catch {}
+      for (const ic of icons) {
+        const cls = (ic.getAttribute("class") || "").split(/\s+/);
+        for (const c of cls) {
+          const m = /^(?:lucide|fa|bi|tabler|ph|ri|mdi|icon)-([a-z0-9-]+)$/i.exec(c);
+          if (m && !ICON_SKIP.test(c)) return `icon:${clean(m[1])}`;
+        }
+        if (cls.some((c) => /^material-(icons|symbols)/.test(c))) {
+          const t = clean(ic.textContent);
+          if (t) return `icon:${t}`;
+        }
+      }
+      return "";
+    };
+    const NO_VALUE = /^(checkbox|radio|file|button|submit|reset|image|password|hidden)$/;
+    // target = element the ref points at; ctl = the control whose state is reported (a hidden checkbox
+    // behind a label: target is the label, ctl the checkbox).
+    const entryFor = (target: Element, ctl: Element, via: string | null) => {
+      const tag = target.tagName.toLowerCase();
+      const ctag = ctl.tagName.toLowerCase();
+      const role = via === "cursor" ? "" : roleOf(ctl);
+      const name = via === "label" ? norm((target as HTMLElement).innerText || target.textContent) || nameOf(ctl) : nameOf(target);
+      const e: any = { tag };
+      if (role && role !== tag) e.role = role;
+      if (name) e.name = name;
+      else {
+        let h = "";
+        try {
+          // a composite widget (listbox, menu, tablist...) must not borrow its first item's icon/testid
+          h = hintOf(target, /^(listbox|menu|menubar|tablist|tree|grid|treegrid|radiogroup|toolbar|combobox)$/.test(role));
+        } catch {}
+        if (h) e.hint = h;
+      }
+      if (ctag === "input") e.type = ((ctl as HTMLInputElement).type || "text").toLowerCase();
+      if (tag === "a" && (target as HTMLAnchorElement).href) e.href = (target as HTMLAnchorElement).href.slice(0, 120);
+      // value
+      let v = "";
+      if (ctag === "input" && !NO_VALUE.test(e.type)) v = (ctl as HTMLInputElement).value;
+      else if (ctag === "textarea") v = (ctl as HTMLTextAreaElement).value;
+      else if (ctag === "select") {
+        const s = ctl as HTMLSelectElement;
+        v = Array.from(s.selectedOptions || []).map((op) => op.text).join(", ");
+      } else if ((ctl as HTMLElement).isContentEditable) v = (ctl as HTMLElement).innerText || "";
+      else if (role === "slider" || role === "spinbutton") v = ctl.getAttribute("aria-valuenow") || "";
+      v = norm(v);
+      if (v) e.value = v;
+      // states
+      const ac = ctl.getAttribute("aria-checked");
+      if (ac === "true") e.checked = true;
+      else if (ac === "false") e.checked = false;
+      else if (ac === "mixed") e.checked = "mixed";
+      else if (ctag === "input" && (e.type === "checkbox" || e.type === "radio")) e.checked = (ctl as HTMLInputElement).checked;
+      if (ctl.getAttribute("aria-selected") === "true") e.selected = true;
+      const ae = ctl.getAttribute("aria-expanded");
+      if (ae === "true") e.expanded = true;
+      else if (ae === "false") e.expanded = false;
+      else if (ctag === "summary" && ctl.parentElement?.tagName === "DETAILS") e.expanded = (ctl.parentElement as HTMLDetailsElement).open;
+      if ((ctl as any).disabled || safeMatches(ctl, ":disabled") || ctl.getAttribute("aria-disabled") === "true") e.disabled = true;
+      if (via) e.via = via;
+      return { e, meta: { tag, role: role || "generic", name } };
+    };
+
+    // ---- single pass: collect candidates ----
+    type Cand = { el: Element; ctl: Element; via: string | null; hiddenCtl?: boolean; dom: number };
+    const cands: Cand[] = [];
+    const seen = new Map<Element, Cand>();
+    const cursorCache = new Map<Element, boolean>();
+    let cursorChecks = 0;
+    let scanCapped = false;
+    let dom = 0;
+    const isPointer = (el: Element): boolean => {
+      const c = cursorCache.get(el);
+      if (c !== undefined) return c;
+      cursorChecks++;
+      let p = false;
+      try {
+        p = getComputedStyle(el).cursor === "pointer";
+      } catch {}
+      cursorCache.set(el, p);
+      return p;
+    };
+    const add = (el: Element, ctl: Element, via: string | null, hiddenCtl = false) => {
+      const prev = seen.get(el);
+      if (prev) {
+        if (via === "label") {
+          prev.ctl = ctl;
+          prev.via = "label";
+        }
+        return;
+      }
+      const c: Cand = { el, ctl, via, hiddenCtl, dom: dom++ };
+      seen.set(el, c);
+      cands.push(c);
+      if (cands.length >= SCAN_CAP) scanCapped = true;
+    };
+    const consider = (el: Element) => {
+      if (SKIP.has(el.tagName)) return;
+      if (safeMatches(el, STRONG)) {
+        const tag = el.tagName;
+        const type = tag === "INPUT" ? ((el as HTMLInputElement).type || "").toLowerCase() : "";
+        if (type === "checkbox" || type === "radio" || type === "file") {
+          // Visually-hidden toggle (opacity 0, 1px sr-only, display:none behind a styled label): expose
+          // it through its visible label - clicking the label toggles the control.
+          const r = el.getBoundingClientRect();
+          const visible = shown(el, true) && r.width > 2 && r.height > 2;
+          if (visible) return add(el, el, null);
+          const labels = Array.from((el as HTMLInputElement).labels || []);
+          const lab = labels.find((l) => shown(l, true));
+          if (lab) return add(lab, el, "label");
+          if (rendered(el) && (r.width > 0 || r.height > 0)) return add(el, el, null, true); // operable, just transparent
+          return;
+        }
+        if (shown(el, true)) add(el, el, null);
+        return;
+      }
+      if (safeMatches(el, WEAK)) {
+        const p = parentOf(el);
+        if (p && p.closest(STRONG)) return; // inside an already-interactive ancestor
+        if (shown(el, true)) add(el, el, null);
+        return;
+      }
+      // handler-only clickable (div/span with cursor:pointer). Emit only the element where the pointer
+      // style ORIGINATES (parent isn't pointer), and never inside an interactive ancestor.
+      if (cursorChecks >= CURSOR_CAP || SVG_INNER.test(el.tagName)) return;
+      if (!isPointer(el)) return;
+      const p = parentOf(el);
+      if (p && p.tagName !== "BODY" && p.tagName !== "HTML" && isPointer(p)) return;
+      if (el.closest(STRONG + ", label") || (p && p.closest(STRONG + ", " + WEAK))) return;
+      if (shown(el, true)) add(el, el, "cursor");
+    };
+    const walk = (root: Document | ShadowRoot) => {
+      let els: NodeListOf<Element>;
+      try {
+        els = root.querySelectorAll("*");
+      } catch {
+        return;
+      }
+      for (let i = 0; i < els.length; i++) {
+        if (scanCapped) return;
+        const el = els[i];
+        consider(el);
+        const sr = (el as HTMLElement).shadowRoot;
+        if (sr) walk(sr);
+      }
+    };
+    // Open overlays FIRST: a portal modal/popover is usually the last child of <body>, so on a page with
+    // more than SCAN_CAP candidates a DOM-order walk would never reach it (and modalOnly would then
+    // return nothing). `seen` de-duplicates when the full walk revisits them.
+    const walkSubtree = (root: Element) => {
+      if (scanCapped) return;
+      consider(root);
+      const sr = (root as HTMLElement).shadowRoot;
+      if (sr) walk(sr);
+      let els: NodeListOf<Element>;
+      try {
+        els = root.querySelectorAll("*");
+      } catch {
+        return;
+      }
+      for (let i = 0; i < els.length; i++) {
+        if (scanCapped) return;
+        consider(els[i]);
+        const s2 = (els[i] as HTMLElement).shadowRoot;
+        if (s2) walk(s2);
+      }
+    };
+    const overlays: Element[] = [];
+    if (modal) overlays.push(modal);
+    try {
+      document.querySelectorAll(OVERLAY).forEach((o) => {
+        if (overlays.includes(o) || overlays.some((x) => x.contains(o))) return;
+        if (o.hasAttribute("popover") && !safeMatches(o, ":popover-open")) return;
+        if (!shown(o, false)) return;
+        overlays.push(o);
+      });
+    } catch {}
+    for (const o of overlays.slice(0, 20)) walkSubtree(o);
+    walk(document);
+
+    // ---- modal handling + priority buckets ----
+    type Ranked = Cand & { bucket: number; inViewport: boolean; behindModal: boolean };
+    const ranked: Ranked[] = [];
+    for (const c of cands) {
+      let behindModal = false;
+      if (c.el.closest("[inert]")) continue; // inert = not operable
+      if (modal && !containsDeep(modal, c.el)) {
+        if (modalNative || c.el.closest('[aria-hidden="true"]')) continue; // made inert / hidden by the modal
+        behindModal = true;
+        if (o.modalOnly) continue;
+      }
+      const r = c.el.getBoundingClientRect();
+      const inViewport = r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw;
+      if (o.viewportOnly && !inViewport) continue;
+      const bucket = behindModal ? 3 : inOverlay(c.el) ? 0 : inViewport ? 1 : 2;
+      ranked.push({ ...c, bucket, inViewport, behindModal });
+    }
+    ranked.sort((a, b) => a.bucket - b.bucket || a.dom - b.dom);
+
+    const filter = (o.filter || "").toLowerCase().trim();
+    const elements: any[] = [];
+    const pending: { el: Element; meta: any }[] = [];
+    let total = 0;
+    for (const c of ranked) {
+      // Without a filter, entries past the limit are only counted (no name/state work for them).
+      if (!filter && elements.length >= LIMIT) {
+        total++;
+        continue;
+      }
+      const { e, meta } = entryFor(c.el, c.ctl, c.via);
+      if (filter) {
+        const hay = `${e.tag} ${e.role || ""} ${e.type || ""} ${e.name || ""} ${e.hint || ""} ${e.value || ""} ${e.href || ""}`.toLowerCase();
+        if (!hay.includes(filter)) continue;
+      }
+      total++;
+      if (elements.length >= LIMIT) continue;
+      e.inViewport = c.inViewport;
+      if (c.behindModal) e.behindModal = true;
+      if (c.hiddenCtl) e.visuallyHidden = true;
+      elements.push(e);
+      pending.push({ el: c.el, meta });
+    }
+    (window as any).__bbPending = { epoch, items: pending };
+    const out: any = { url: location.href, total, elements };
+    if (scanCapped) out.scanCapped = true;
+    if (modal) out.modal = norm(modal.getAttribute("aria-label") || (modal.getAttribute("aria-labelledby") ? byIds(modal, modal.getAttribute("aria-labelledby")!) : "") || (modal as HTMLElement).innerText, 60) || modal.tagName.toLowerCase();
+    return out;
+  } catch (e) {
+    return { error: `snapshot failed: ${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+
+// Phase 2 of snapshot / ax_snapshot: register the first `keep` parked elements as refs offset+1..,
+// with their {tag, role, name} fingerprints in window.__bbRefMeta (the interaction layer verifies a
+// ref still points at the same kind of element). Always reassigns fresh Maps - never merges - so refs
+// from an older snapshot can't leak. A newer snapshot's phase 1 that raced in (different epoch) wins.
+// INVARIANT: every ref locator must inject in the ISOLATED world (this registry lives there).
+function bbCommitRefs(epoch: number, offset: number, keep: number) {
+  const w = window as any;
+  const p = w.__bbPending;
+  if (!p || p.epoch !== epoch) return { error: "superseded by a newer snapshot" };
+  const refs = new Map<number, Element>();
+  const meta = new Map<number, { tag: string; role: string; name: string }>();
+  // [ref fingerprint] The fingerprint is computed from the registered element itself and MUST stay
+  // identical to fpOf in dom-act.ts (bbAct re-checks it before acting on a ref; injected code can't
+  // share helpers). role is the EXPLICIT role attribute only, and inputs are fingerprinted without
+  // their value, so filling a field never makes its own ref stale.
+  const fp = (e: Element) => {
+    const t = e.tagName;
+    const it = t === "INPUT" ? ((e as HTMLInputElement).type || "").toLowerCase() : "";
+    let s: string;
+    if (t === "INPUT" && (it === "submit" || it === "button" || it === "reset")) s = (e as HTMLInputElement).value || e.getAttribute("aria-label") || "";
+    else if (t === "INPUT" || t === "TEXTAREA" || t === "SELECT")
+      s = e.getAttribute("aria-label") || e.getAttribute("placeholder") || e.getAttribute("name") || e.id || e.getAttribute("title") || "";
+    // Editable regions (ProseMirror/Lexical/Slate) change their own text when filled: never use innerText.
+    else if ((e as HTMLElement).isContentEditable)
+      s = e.getAttribute("aria-label") || e.getAttribute("aria-placeholder") || e.getAttribute("placeholder") || e.id || e.getAttribute("title") || "";
+    else s = e.getAttribute("aria-label") || (e as HTMLElement).innerText || e.textContent || e.getAttribute("title") || "";
+    return { tag: t.toLowerCase(), role: e.getAttribute("role") || "", name: s.replace(/\s+/g, " ").trim().slice(0, 80) };
+  };
+  const n = Math.min(keep, p.items.length);
+  for (let i = 0; i < n; i++) {
+    const el = p.items[i].el as Element;
+    refs.set(offset + i + 1, el);
+    try {
+      meta.set(offset + i + 1, fp(el));
+    } catch {}
+  }
+  w.__bbRefs = refs;
+  w.__bbRefMeta = meta;
+  w.__bbEpoch = epoch;
+  w.__bbPending = null;
+  return { ok: true, n };
+}
+
+// Read-only selector locate (per frame) used to pick ONE target before acting. Enumerates matches in
+// deep document order (element, then its open shadow root, then onward) - the SAME order bbAct uses
+// for `nth`, so the index chosen here addresses the same element there.
+function bbLocateAll(sel: string) {
+  try {
+    document.createDocumentFragment().querySelector(sel);
+  } catch (e) {
+    return { error: `Invalid CSS selector ${JSON.stringify(sel)}: ${e instanceof Error ? e.message : String(e)}` };
+  }
+  const vw = window.innerWidth || 0, vh = window.innerHeight || 0;
+  const matches: { index: number; visible: boolean; inViewport: boolean }[] = [];
+  let count = 0;
   const walk = (root: Document | ShadowRoot) => {
-    if (n >= 400) return;
     let els: NodeListOf<Element>;
     try {
       els = root.querySelectorAll("*");
     } catch {
       return;
     }
-    for (const el of Array.from(els)) {
-      if (n >= 400) return;
-      const h = el as HTMLElement;
-      let ok = false;
+    for (let i = 0; i < els.length; i++) {
+      const el = els[i];
+      let m = false;
       try {
-        ok = h.matches(SEL);
-      } catch {
-        ok = false;
+        m = el.matches(sel);
+      } catch {}
+      if (m) {
+        if (matches.length < 100) {
+          const r = el.getBoundingClientRect();
+          let vis = r.width > 0 && r.height > 0;
+          const cv = (el as any).checkVisibility;
+          if (vis && typeof cv === "function") {
+            try {
+              vis = cv.call(el, { visibilityProperty: true, checkVisibilityCSS: true });
+            } catch {}
+          }
+          matches.push({ index: count, visible: vis, inViewport: vis && r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw });
+        }
+        count++;
       }
-      if (ok && (!(h as any).checkVisibility || (h as any).checkVisibility())) emit(h);
-      const sr = h.shadowRoot;
+      const sr = (el as HTMLElement).shadowRoot;
       if (sr) walk(sr);
     }
   };
-  const emit = (h: HTMLElement) => {
-    n++;
-    const ref = refOffset + n;
-    bbRefs.set(ref, h);
-    const label = ((h.innerText ||
-      (h as HTMLInputElement).value ||
-      (h as HTMLInputElement).placeholder ||
-      h.getAttribute("aria-label") ||
-      h.getAttribute("title") ||
-      "") as string)
-      .trim()
-      .replace(/\s+/g, " ")
-      .slice(0, 80);
-    const entry: any = { ref, tag: h.tagName.toLowerCase(), label };
-    if (h.tagName === "A") entry.href = (h as HTMLAnchorElement).href.slice(0, 120);
-    if (h.tagName === "INPUT") entry.type = (h as HTMLInputElement).type;
-    const role = h.getAttribute("role");
-    if (role) entry.role = role;
-    // actionability hints (elements listed are already visible; add enabled + viewport position)
-    const enabled = !(h as any).disabled && h.getAttribute("aria-disabled") !== "true";
-    if (!enabled) entry.enabled = false;
-    const r = h.getBoundingClientRect();
-    entry.inViewport = r.bottom > 0 && r.right > 0 && r.top < (window.innerHeight || 0) && r.left < (window.innerWidth || 0);
-    items.push(entry);
-  };
   walk(document);
-  return { url: location.href, count: items.length, elements: items };
+  return { count, matches };
+}
+
+// Resolve once the DOM has been quiet (no mutations) for quietMs, or after capMs regardless. Used to
+// let a framework finish rendering the result of an action before withSnapshot captures it.
+function bbDomQuiet(quietMs: number, capMs: number) {
+  return new Promise((resolve) => {
+    let quiet: any = null;
+    let cap: any = null;
+    let obs: MutationObserver | null = null;
+    const done = (why: string) => {
+      try {
+        obs?.disconnect();
+      } catch {}
+      clearTimeout(quiet);
+      clearTimeout(cap);
+      resolve({ settled: why });
+    };
+    try {
+      obs = new MutationObserver(() => {
+        clearTimeout(quiet);
+        quiet = setTimeout(() => done("quiet"), quietMs);
+      });
+      obs.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+    } catch {}
+    quiet = setTimeout(() => done("quiet"), quietMs);
+    cap = setTimeout(() => done("cap"), capMs);
+  });
+}
+
+// Scroll the window, a container, or an element into view. Target by ref (__bbRefs) or selector+nth.
+// With a target and no delta: scroll it into view. With a target and a delta/direction: scroll the
+// target's nearest scrollable ancestor (or itself). No target: the window - or, when the document
+// itself can't scroll (Gmail/Slack app shells), the scroll container under the viewport center.
+function bbScroll(p: { ref: number | null; sel: string | null; nth: number | null; dx: number | null; dy: number | null; direction: string | null; amount: number | null }) {
+  try {
+    let target: Element | null = null;
+    if (p.ref != null) {
+      const reg = (window as any).__bbRefs as Map<number, Element> | undefined;
+      const hit = reg && reg.get(p.ref);
+      if (!hit) return { error: `ref ${p.ref} is not in the current snapshot - take a fresh snapshot` };
+      if (!hit.isConnected) return { error: `ref ${p.ref} points at an element that was removed/re-rendered - take a fresh snapshot` };
+      target = hit;
+    } else if (p.sel != null) {
+      try {
+        document.createDocumentFragment().querySelector(p.sel);
+      } catch (e) {
+        return { error: `Invalid CSS selector ${JSON.stringify(p.sel)}: ${e instanceof Error ? e.message : String(e)}` };
+      }
+      let k = 0;
+      const want = p.nth ?? 0;
+      const walk = (root: Document | ShadowRoot): Element | null => {
+        const els = root.querySelectorAll("*");
+        for (let i = 0; i < els.length; i++) {
+          const el = els[i];
+          if (el.matches(p.sel!) && k++ === want) return el;
+          const sr = (el as HTMLElement).shadowRoot;
+          if (sr) {
+            const f = walk(sr);
+            if (f) return f;
+          }
+        }
+        return null;
+      };
+      target = walk(document);
+      if (!target) return { error: `Element not found: ${p.sel}` };
+    }
+    const se = (document.scrollingElement || document.documentElement) as HTMLElement;
+    const isRoot = (el: Element | null) => !el || el === se || el === document.documentElement || el === document.body;
+    const describe = (el: Element | null) => {
+      if (isRoot(el)) return "window";
+      const h = el as HTMLElement;
+      const cls = typeof h.className === "string" ? h.className.trim().split(/\s+/)[0] : "";
+      return h.tagName.toLowerCase() + (h.id ? "#" + h.id : cls ? "." + cls : "");
+    };
+    const parentOf = (n: Element): Element | null => n.parentElement || ((n.getRootNode() as ShadowRoot).host ?? null);
+    const canScroll = (el: Element, axis: "x" | "y") => {
+      const cs = getComputedStyle(el);
+      const ov = axis === "y" ? cs.overflowY : cs.overflowX;
+      if (!/(auto|scroll|overlay)/.test(ov)) return false;
+      return axis === "y" ? el.scrollHeight > el.clientHeight + 1 : el.scrollWidth > el.clientWidth + 1;
+    };
+    const scrollerFor = (el: Element, axis: "x" | "y"): Element | null => {
+      for (let n: Element | null = el; n && !isRoot(n); n = parentOf(n)) if (canScroll(n, axis)) return n;
+      return null; // the window
+    };
+    const state = (c: Element | null, axis: "x" | "y") => {
+      const el = isRoot(c) ? se : (c as Element);
+      const pos = axis === "y" ? el.scrollTop : el.scrollLeft;
+      const size = axis === "y" ? el.scrollHeight : el.scrollWidth;
+      const view = isRoot(c) ? (axis === "y" ? window.innerHeight : window.innerWidth) : axis === "y" ? el.clientHeight : el.clientWidth;
+      return { pos: Math.round(pos), size, view, atStart: pos <= 1, atEnd: pos + view >= size - 2 };
+    };
+    const hasDelta = p.dx != null || p.dy != null || p.direction != null;
+    if (target && !hasDelta) {
+      target.scrollIntoView({ block: "center", inline: "nearest", behavior: "instant" as ScrollBehavior });
+      const c = scrollerFor(parentOf(target) ?? target, "y");
+      const s = state(c, "y");
+      return { scrolled: true, scrolledTo: describe(target), container: describe(c), scrollTop: s.pos, atEnd: s.atEnd };
+    }
+    const dir = (p.direction || "").toLowerCase();
+    const axis: "x" | "y" = dir === "left" || dir === "right" || (p.dx != null && p.dy == null) ? "x" : "y";
+    let container: Element | null;
+    if (target) container = scrollerFor(target, axis);
+    else {
+      const docScrollable = axis === "y" ? se.scrollHeight > window.innerHeight + 1 : se.scrollWidth > window.innerWidth + 1;
+      container = null;
+      if (!docScrollable) {
+        const mid = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2);
+        container = mid ? scrollerFor(mid, axis) : null;
+        if (!container) {
+          let best = 0;
+          const all = document.querySelectorAll("*");
+          for (let i = 0; i < all.length && i < 5000; i++) {
+            const el = all[i];
+            if (el.clientHeight * el.clientWidth <= best) continue;
+            if (canScroll(el, axis)) {
+              best = el.clientHeight * el.clientWidth;
+              container = el;
+            }
+          }
+        }
+      }
+    }
+    const before = state(container, axis);
+    const step = p.amount != null ? p.amount : Math.round(before.view * 0.8);
+    const scroller: any = isRoot(container) ? window : container;
+    if (dir === "top" || dir === "bottom") {
+      const to = dir === "top" ? 0 : before.size;
+      scroller.scrollTo(axis === "y" ? { top: to, behavior: "instant" } : { left: to, behavior: "instant" });
+    } else {
+      let dx = 0, dy = 0;
+      if (dir === "down") dy = step;
+      else if (dir === "up") dy = -step;
+      else if (dir === "right") dx = step;
+      else if (dir === "left") dx = -step;
+      else {
+        dx = p.dx ?? 0;
+        dy = p.dy ?? (p.dx != null ? 0 : 600);
+      }
+      scroller.scrollBy({ left: dx, top: dy, behavior: "instant" });
+    }
+    const after = state(container, axis);
+    const out: any = {
+      scrolled: after.pos !== before.pos,
+      container: describe(container),
+      axis,
+      [axis === "y" ? "scrollTop" : "scrollLeft"]: after.pos,
+      atStart: after.atStart,
+      atEnd: after.atEnd,
+    };
+    if (isRoot(container)) out.scrollY = Math.round(window.scrollY);
+    return out;
+  } catch (e) {
+    return { error: `scroll failed: ${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+
+// One wait_for probe slice in one frame: resolves as soon as the condition holds in THIS frame, or at
+// sliceEnd (epoch ms) with satisfied:false. MutationObserver-driven checks (coalesced to one per
+// animation frame / 50ms) plus a 150ms poll for changes that don't mutate the DOM (CSS transitions).
+// Shadow-aware. Matching: selector and/or role(+name) and/or text, all of which must hold for one element.
+function bbWaitProbe(spec: { sel: string | null; text: string | null; role: string | null; name: string | null; state: string }, sliceEnd: number) {
+  return new Promise((resolve) => {
+    try {
+      const norm = (s: string | null | undefined) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
+      const text = spec.text ? norm(spec.text) : "";
+      const nameQ = spec.name ? norm(spec.name) : "";
+      const roleQ = (spec.role || "").toLowerCase();
+      const INPUT_ROLE: Record<string, string> = {
+        button: "button", submit: "button", reset: "button", image: "button",
+        checkbox: "checkbox", radio: "radio", range: "slider", number: "spinbutton", search: "searchbox",
+      };
+      const TAG_ROLE: Record<string, string> = {
+        button: "button", summary: "button", select: "combobox", textarea: "textbox", dialog: "dialog", nav: "navigation",
+        main: "main", img: "img", ul: "list", ol: "list", li: "listitem", table: "table", form: "form", option: "option",
+        h1: "heading", h2: "heading", h3: "heading", h4: "heading", h5: "heading", h6: "heading",
+      };
+      const roleOf = (el: Element) => {
+        const ex = (el.getAttribute("role") || "").trim().split(/\s+/)[0];
+        if (ex) return ex.toLowerCase();
+        const tag = el.tagName.toLowerCase();
+        if (tag === "a") return el.hasAttribute("href") ? "link" : "";
+        if (tag === "input") {
+          const t = ((el as HTMLInputElement).type || "text").toLowerCase();
+          return t === "hidden" ? "" : INPUT_ROLE[t] || "textbox";
+        }
+        if ((el as HTMLElement).isContentEditable && el.getAttribute("contenteditable") !== null) return "textbox";
+        return TAG_ROLE[tag] || "";
+      };
+      const nameOf = (el: Element) => {
+        const al = el.getAttribute("aria-label");
+        if (al) return norm(al);
+        const lb = el.getAttribute("aria-labelledby");
+        if (lb) {
+          let s = "";
+          for (const id of lb.split(/\s+/)) s += " " + (document.getElementById(id)?.textContent || "");
+          if (s.trim()) return norm(s);
+        }
+        const labels = (el as HTMLInputElement).labels;
+        if (labels && labels.length) return norm(labels[0].textContent);
+        return norm((el as HTMLElement).innerText || el.getAttribute("placeholder") || el.getAttribute("title") || el.getAttribute("alt") || (el as HTMLInputElement).value || "");
+      };
+      const hasText = (el: Element) => norm((el as HTMLElement).innerText ?? el.textContent).includes(text) || norm((el as HTMLInputElement).value).includes(text);
+      const visible = (el: Element) => {
+        const r = el.getBoundingClientRect();
+        if (!(r.width > 0 && r.height > 0)) return false;
+        const cv = (el as any).checkVisibility;
+        try {
+          return typeof cv === "function" ? cv.call(el, { visibilityProperty: true, checkVisibilityCSS: true }) : true;
+        } catch {
+          return true;
+        }
+      };
+      const roots = (): (Document | ShadowRoot)[] => {
+        const out: (Document | ShadowRoot)[] = [document];
+        for (let i = 0; i < out.length; i++) {
+          const els = out[i].querySelectorAll("*");
+          for (let j = 0; j < els.length; j++) {
+            const sr = (els[j] as HTMLElement).shadowRoot;
+            if (sr) out.push(sr);
+          }
+        }
+        return out;
+      };
+      const find = (): Element[] => {
+        const found: Element[] = [];
+        const rs = roots();
+        if (spec.sel || roleQ) {
+          for (const r of rs) {
+            const els = spec.sel ? r.querySelectorAll(spec.sel) : r.querySelectorAll("*");
+            for (let i = 0; i < els.length && found.length < 200; i++) {
+              const el = els[i];
+              if (roleQ && roleOf(el) !== roleQ) continue;
+              if (nameQ && !nameOf(el).includes(nameQ)) continue;
+              if (text && !hasText(el)) continue;
+              found.push(el);
+            }
+          }
+          return found;
+        }
+        // text only: the element owning each matching text node (or, for text split across inline
+        // children, the deepest element whose text contains it).
+        for (const r of rs) {
+          const start = r === document ? document.body : r;
+          if (!start) continue;
+          const tw = document.createTreeWalker(start, NodeFilter.SHOW_TEXT);
+          let hits = 0;
+          for (let n = tw.nextNode(); n && found.length < 200; n = tw.nextNode()) {
+            const pe = n.parentElement;
+            if (!pe || /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(pe.tagName)) continue;
+            if (norm(n.nodeValue).includes(text)) {
+              found.push(pe);
+              hits++;
+            }
+          }
+          // Rendered text only: textContent includes <script>/<style> source, so a page whose inline JS or
+          // JSON data mentions the text would "match" before the text is ever shown.
+          const shownText = (node: Node): string => {
+            let s = "";
+            const w = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+            for (let t = w.nextNode(); t; t = w.nextNode()) {
+              const p = t.parentElement;
+              if (p && /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(p.tagName)) continue;
+              s += t.nodeValue + " ";
+            }
+            return s;
+          };
+          if (!hits && norm(shownText(start)).includes(text)) {
+            let el: Element | null = start instanceof Element ? start : null;
+            let kids: Element[] = Array.from((start as ParentNode).children);
+            for (;;) {
+              const next: Element | undefined = kids.find((k) => !/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(k.tagName) && norm(shownText(k)).includes(text));
+              if (!next) break;
+              el = next;
+              kids = Array.from(next.children);
+            }
+            if (el) found.push(el);
+          }
+        }
+        return found;
+      };
+      let finished = false;
+      let obs: MutationObserver | null = null;
+      let poll: any = null;
+      let end: any = null;
+      const finish = (v: any) => {
+        if (finished) return;
+        finished = true;
+        try {
+          obs?.disconnect();
+        } catch {}
+        clearInterval(poll);
+        clearTimeout(end);
+        resolve(v);
+      };
+      const check = () => {
+        if (finished) return;
+        let els: Element[];
+        try {
+          els = find();
+        } catch (e) {
+          return finish({ error: `wait_for probe failed: ${e instanceof Error ? e.message : String(e)}` });
+        }
+        const vis = els.filter(visible);
+        const st = spec.state;
+        const ok = st === "attached" ? els.length > 0 : st === "detached" ? els.length === 0 : st === "hidden" ? vis.length === 0 : vis.length > 0;
+        if (!ok) return;
+        const out: any = { satisfied: true, count: els.length, visibleCount: vis.length };
+        const first = vis[0] ?? els[0];
+        if (first && (st === "visible" || st === "attached")) {
+          out.tag = first.tagName.toLowerCase();
+          const nm = nameOf(first);
+          if (nm) out.name = nm.slice(0, 80);
+          const reg = (window as any).__bbRefs as Map<number, Element> | undefined;
+          if (reg) for (const [ref, el] of reg) if (el === first) { out.ref = ref; break; }
+        }
+        finish(out);
+      };
+      let scheduled = false;
+      const schedule = () => {
+        if (scheduled || finished) return;
+        scheduled = true;
+        const run = () => {
+          if (!scheduled) return;
+          scheduled = false;
+          check();
+        };
+        try {
+          requestAnimationFrame(run);
+        } catch {}
+        setTimeout(run, 50); // rAF is throttled in background tabs
+      };
+      check();
+      if (finished) return;
+      obs = new MutationObserver(schedule);
+      obs.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+      poll = setInterval(check, 150);
+      end = setTimeout(() => finish({ satisfied: false }), Math.max(0, sliceEnd - Date.now()));
+    } catch (e) {
+      resolve({ error: `wait_for probe failed: ${e instanceof Error ? e.message : String(e)}` });
+    }
+  });
+}
+
+// Validate a CSS selector without touching the page (a syntax error is a clear, immediate error).
+function bbValidateSelector(sel: string) {
+  try {
+    document.createDocumentFragment().querySelector(sel);
+    return { ok: true };
+  } catch (e) {
+    return { error: `Invalid CSS selector ${JSON.stringify(sel)}: ${e instanceof Error ? e.message : String(e)}` };
+  }
 }
 
 // Put an image on the REAL OS clipboard as image/png (converting via canvas if needed). Async; the
@@ -818,35 +1975,150 @@ async function bbClipboardWriteImage(b64: string, mimeType: string) {
 // whose event fired before we attached. A 250ms grace lets a real cross-document nav flip to 'loading'
 // first, so we don't resolve on the previous page's lingering 'complete'. The listener still wins for
 // normal loads (no added latency); the poll only becomes the resolver in the fast/no-op cases.
-function waitForComplete(tabId: number, timeoutMs = 20_000): Promise<void> {
-  return new Promise((resolve) => {
-    const deadline = Date.now() + timeoutMs;
-    let done = false;
-    const finish = () => {
-      if (done) return;
-      done = true;
-      chrome.tabs.onUpdated.removeListener(listener);
-      resolve();
-    };
-    const listener = (id: number, info: chrome.tabs.TabChangeInfo) => {
-      if (id === tabId && info.status === "complete") finish();
-    };
-    chrome.tabs.onUpdated.addListener(listener);
-    void (async () => {
-      await sleep(250); // grace: let a real cross-document nav flip to 'loading' before we poll
-      while (!done && Date.now() < deadline) {
-        let status: string | undefined;
-        try {
-          status = (await chrome.tabs.get(tabId)).status;
-        } catch {
-          return finish(); // tab closed/gone
-        }
-        if (status === "complete") return finish();
-        await sleep(150);
+//
+// Event-driven: listeners are registered BEFORE the navigation is issued (startLoadWait returns a
+// handle; call .wait() after triggering the nav) so a fast load can't slip past. webNavigation tells us
+// when a top-frame navigation actually started, so the no-op case (hash/same URL/bfcache) resolves on
+// the first status check instead of a fixed sleep, and 'domcontentloaded' resolves on the real event.
+// A slow status poll stays as a backstop for events that fired before we were listening.
+type WaitUntil = "load" | "domcontentloaded" | "none";
+interface LoadWaitResult {
+  loadTimedOut?: boolean;
+  dialog?: PendingDialog; // a JS dialog (e.g. beforeunload) opened while we waited
+}
+
+function startLoadWait(
+  tabId: number,
+  opts: { waitUntil?: WaitUntil; timeoutMs?: number; cancelKey?: object; targetUrl?: string } = {}
+): { wait(): Promise<LoadWaitResult>; dispose(): void } {
+  const waitUntil: WaitUntil = opts.waitUntil ?? "load";
+  const timeoutMs = opts.timeoutMs ?? 20_000;
+  let started = false; // a top-frame navigation (or 'loading' status) was observed
+  let reached = false; // the waitUntil milestone was observed
+  let wake: (() => void) | null = null;
+  const poke = () => wake?.();
+  const mine = (id: number) => id === tabId;
+
+  const onUpdated = (id: number, info: chrome.tabs.TabChangeInfo) => {
+    if (!mine(id)) return;
+    if (info.status === "loading") started = true;
+    if (info.status === "complete" && started) reached = true;
+    poke();
+  };
+  const onBefore = (d: { tabId: number; frameId: number }) => {
+    if (mine(d.tabId) && d.frameId === 0) {
+      started = true;
+      poke();
+    }
+  };
+  const onDcl = (d: { tabId: number; frameId: number }) => {
+    if (mine(d.tabId) && d.frameId === 0 && started && waitUntil === "domcontentloaded") {
+      reached = true;
+      poke();
+    }
+  };
+  // Only a load that belongs to a navigation we saw START counts, so a lingering event from the
+  // previous document can't resolve the wait early.
+  const onDone = (d: { tabId: number; frameId: number }) => {
+    if (mine(d.tabId) && d.frameId === 0 && started) {
+      reached = true;
+      poke();
+    }
+  };
+  // Same-document navigations never fire 'complete' - they are done the moment they happen. When we know
+  // the target URL (navigate), only a same-document nav TO it counts: an SPA on the old page calling
+  // pushState/replaceState right after tabs.update must not end the wait before the real load commits.
+  let target: string | null = null;
+  try {
+    target = opts.targetUrl ? new URL(opts.targetUrl).href : null;
+  } catch {
+    target = null;
+  }
+  const onSameDoc = (d: { tabId: number; frameId: number; url?: string }) => {
+    if (mine(d.tabId) && d.frameId === 0 && (!target || d.url === target)) {
+      reached = true;
+      poke();
+    }
+  };
+  const listen = waitUntil !== "none";
+  if (listen) {
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.webNavigation.onBeforeNavigate.addListener(onBefore);
+    chrome.webNavigation.onDOMContentLoaded.addListener(onDcl);
+    chrome.webNavigation.onCompleted.addListener(onDone);
+    chrome.webNavigation.onErrorOccurred.addListener(onDone);
+    chrome.webNavigation.onReferenceFragmentUpdated.addListener(onSameDoc);
+    chrome.webNavigation.onHistoryStateUpdated.addListener(onSameDoc);
+  }
+  const cleanup = () => {
+    if (!listen) return;
+    chrome.tabs.onUpdated.removeListener(onUpdated);
+    chrome.webNavigation.onBeforeNavigate.removeListener(onBefore);
+    chrome.webNavigation.onDOMContentLoaded.removeListener(onDcl);
+    chrome.webNavigation.onCompleted.removeListener(onDone);
+    chrome.webNavigation.onErrorOccurred.removeListener(onDone);
+    chrome.webNavigation.onReferenceFragmentUpdated.removeListener(onSameDoc);
+    chrome.webNavigation.onHistoryStateUpdated.removeListener(onSameDoc);
+  };
+
+  return {
+    dispose: cleanup,
+    async wait(): Promise<LoadWaitResult> {
+      if (!listen) {
+        cleanup();
+        return {};
       }
-      finish(); // timeout ceiling - resolve anyway; caller can read a partial page
-    })();
-  });
+      const t0 = Date.now();
+      const deadline = t0 + timeoutMs;
+      try {
+        for (;;) {
+          if (reached) return {};
+          const dialog = pendingDialogs.get(tabId);
+          if (dialog) return { dialog }; // nothing will load while a dialog holds the page
+          if (isCancelled(opts.cancelKey)) return {};
+          let status: string | undefined;
+          try {
+            status = (await chrome.tabs.get(tabId)).status;
+          } catch {
+            return {}; // tab closed/gone
+          }
+          if (status === "loading") started = true;
+          // 'complete' only counts once a navigation started - or, if none starts within a short
+          // grace, the nav was a no-op (same URL / hash / bfcache) and the page is already there.
+          if (status === "complete" && (started || Date.now() - t0 > 250)) return {};
+          if (Date.now() >= deadline) return { loadTimedOut: true };
+          // Sleep until an event pokes us, with a backstop poll for events we missed.
+          await new Promise<void>((r) => {
+            const timer = setTimeout(done, started ? 500 : 100);
+            function done() {
+              clearTimeout(timer);
+              wake = null;
+              r();
+            }
+            wake = done;
+          });
+        }
+      } finally {
+        cleanup();
+      }
+    },
+  };
+}
+
+const parseWaitUntil = (v: any): WaitUntil => (v === "none" || v === "domcontentloaded" ? v : "load");
+
+// Same page for navigate's "did the URL change?" check (a reload of the current URL is not a failure).
+function sameUrl(a: string | undefined, b: string | undefined): boolean {
+  if (!a || !b) return false;
+  try {
+    const x = new URL(a);
+    const y = new URL(b);
+    x.hash = "";
+    y.hash = "";
+    return x.href.replace(/\/$/, "") === y.href.replace(/\/$/, "");
+  } catch {
+    return a === b;
+  }
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -883,18 +2155,27 @@ const captureInFlight = new Map<string, Promise<{ dataUrl: string; meta: any }>>
  */
 async function awaitPaint(tab: chrome.tabs.Tab, budgetMs: number): Promise<void> {
   const deadline = Date.now() + budgetMs;
+  // Each inject is bounded by what is left of the budget: a page frozen by a JS dialog would otherwise
+  // hold executeScript - and with it the whole per-window capture queue - forever.
+  const left = () => Math.max(50, deadline - Date.now());
   try {
-    await inject(tab, () => {
-      const w = window as any;
-      w.__bbPaint = 0;
-      requestAnimationFrame(() =>
-        requestAnimationFrame(() => {
-          w.__bbPaint = 1;
-        })
-      );
-    });
+    await inject(
+      tab,
+      () => {
+        const w = window as any;
+        w.__bbPaint = 0;
+        requestAnimationFrame(() =>
+          requestAnimationFrame(() => {
+            w.__bbPaint = 1;
+          })
+        );
+      },
+      [],
+      "ISOLATED",
+      { timeoutMs: left(), immediate: true }
+    );
     while (Date.now() < deadline) {
-      if (await inject(tab, () => !!(window as any).__bbPaint)) return;
+      if (await inject(tab, () => !!(window as any).__bbPaint, [], "ISOLATED", { timeoutMs: left(), immediate: true })) return;
       await sleep(8);
     }
   } catch {
@@ -917,7 +2198,10 @@ function serializeCapture<T>(windowId: number, fn: () => Promise<T>): Promise<T>
     const wait = MIN_CAPTURE_INTERVAL_MS - (Date.now() - (lastCaptureAt.get(windowId) ?? 0));
     if (wait > 0) await sleep(wait);
     try {
-      return await fn();
+      // Hard cap so the chain ALWAYS advances: one wedged grab (dialog-frozen page, hung compositor)
+      // used to block every later screenshot in this window - and captureInFlight handed that stuck
+      // promise to every repeat caller. The caller falls back to CDP on this timeout.
+      return await withTimeout(fn(), CAPTURE_STEP_MS, `screenshot capture in window ${windowId} did not complete within ${CAPTURE_STEP_MS / 1000}s`);
     } finally {
       lastCaptureAt.set(windowId, Date.now()); // space the NEXT capture from when this one finished
     }
@@ -933,8 +2217,10 @@ function serializeCapture<T>(windowId: number, fn: () => Promise<T>): Promise<T>
 // Back/forward via the page's own history - chrome.tabs.goBack/goForward fail spuriously
 // ("Cannot find a next page in history") even when history exists. Polls for the URL change
 // so bfcache (instant) restores don't wait on a load-complete event that never fires.
-async function navByHistory(tab: chrome.tabs.Tab, direction: "back" | "forward"): Promise<any> {
+async function navByHistory(tab: chrome.tabs.Tab, direction: "back" | "forward", params: any = {}): Promise<any> {
   const before = (await chrome.tabs.get(tab.id!)).url;
+  // Listen before triggering, so a bfcache restore's events can't be missed.
+  const load = startLoadWait(tab.id!, { waitUntil: parseWaitUntil(params.waitUntil), timeoutMs: 10_000, cancelKey: params });
   await inject(tab, (dir: string) => {
     if (dir === "back") history.back();
     else history.forward();
@@ -943,17 +2229,29 @@ async function navByHistory(tab: chrome.tabs.Tab, direction: "back" | "forward")
   let navigated = false;
   // Check BEFORE sleeping: a bfcache restore is effectively instant, and sleeping first charged it a
   // flat 150ms it never needed.
-  while (Date.now() < deadline) {
+  while (Date.now() < deadline && !isCancelled(params)) {
     const t = await chrome.tabs.get(tab.id!);
     if (t.url && t.url !== before) {
       navigated = true;
-      await sleep(300); // brief settle
       break;
     }
-    await sleep(150);
+    if (pendingDialogs.has(tab.id!)) break; // a beforeunload dialog is holding the navigation
+    await sleep(100);
   }
+  // Settle on the real load signal (instant for bfcache) instead of a fixed 300ms sleep.
+  let waited: LoadWaitResult = {};
+  if (navigated) waited = await load.wait();
+  else load.dispose();
   const fresh = await chrome.tabs.get(tab.id!);
-  return { tabId: fresh.id, title: fresh.title, url: fresh.url, navigated };
+  const dialog = waited.dialog ?? pendingDialogs.get(tab.id!);
+  return {
+    tabId: fresh.id,
+    title: fresh.title,
+    url: fresh.url,
+    navigated,
+    ...(waited.loadTimedOut ? { loadTimedOut: true } : {}),
+    ...(dialog ? { dialog, hint: "a JavaScript dialog is open on this tab - call handle_dialog" } : {}),
+  };
 }
 
 // ---------- chrome.debugger (CDP) session layer ----------
@@ -1006,6 +2304,25 @@ interface PausedEntry {
   responseStatusCode?: number;
   responseHeaders?: any;
   ts: number;
+}
+
+// Continue every held request unmodified (falling back to failing it, so the page never hangs) and
+// clear the map. Returns how many were held.
+async function releasePaused(tabId: number, s: Session): Promise<number> {
+  const held = [...s.paused.values()];
+  s.paused.clear();
+  for (const e of held) {
+    try {
+      await cmd(tabId, e.stage === "Response" ? "Fetch.continueResponse" : "Fetch.continueRequest", { requestId: e.requestId });
+    } catch {
+      try {
+        await cmd(tabId, "Fetch.failRequest", { requestId: e.requestId, errorReason: "Aborted" });
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+  return held.length;
 }
 
 // ---- console/log capture ----
@@ -1077,14 +2394,26 @@ async function restoreIdentities(): Promise<void> {
   }
 }
 
-function cmd(tabId: number, method: string, params?: any): Promise<any> {
-  return new Promise((resolve, reject) => {
+// Default timeout per CDP method. A command that legitimately runs long gets more; one whose duration
+// the CALLER controls (Runtime.evaluate awaiting a user promise, bounded by the tool's own timeoutMs on
+// the server) gets none - the server-side timeout + cancel governs it.
+function cdpTimeoutFor(method: string, params?: any): number {
+  if (method === "Runtime.evaluate" || (method === "Runtime.callFunctionOn" && params?.awaitPromise)) return 0; // user code: the tool's own timeoutMs governs
+  if (method === "Page.captureScreenshot") return 25_000; // inside the server's 30s screenshot budget
+  if (method === "Page.captureSnapshot" || method === "Page.printToPDF") return 60_000;
+  if (method === "Network.getResponseBody" || method === "Fetch.getResponseBody") return 30_000;
+  return CDP_CMD_MS;
+}
+
+function cmd(tabId: number, method: string, params?: any, timeoutMs = cdpTimeoutFor(method, params)): Promise<any> {
+  const p = new Promise<any>((resolve, reject) => {
     chrome.debugger.sendCommand({ tabId }, method, params ?? {}, (result) => {
       const err = chrome.runtime.lastError;
       if (err) reject(new Error(err.message));
       else resolve(result);
     });
   });
+  return withTimeout(p, timeoutMs, () => tabTimeoutMsg(tabId, timeoutMs, `debugger command ${method}`));
 }
 
 function attach(tabId: number): Promise<void> {
@@ -1119,14 +2448,24 @@ async function ensureAttached(tabId: number): Promise<Session> {
   }
   let p = attaching.get(tabId);
   if (!p) {
-    p = (async () => {
+    // Bounded: attach or an enable that never answers used to leave this shared entry pending forever,
+    // wedging EVERY later debugger-backed call on the tab. On timeout the entry is cleared (below), the
+    // half-made attach is detached, and a late success is torn down instead of resurrecting a session.
+    let abandoned = false;
+    const run = (async () => {
       await attach(tabId);
+      if (abandoned) {
+        // Only tear down if no newer session was created for this tab meanwhile.
+        if (!sessions.has(tabId)) await detachSession(tabId).catch(() => {});
+        throw new Error("attach abandoned after timeout");
+      }
       // If an enable fails AFTER a successful attach, detach so we don't strand an orphaned debugger
       // (stuck "being debugged" banner + a leaked attach that nothing will ever clean up).
       try {
-        await Promise.all([cmd(tabId, "DOM.enable"), cmd(tabId, "Page.enable")]);
+        await Promise.all([cmd(tabId, "DOM.enable", undefined, ATTACH_MS), cmd(tabId, "Page.enable", undefined, ATTACH_MS)]);
+        if (abandoned) throw new Error("attach abandoned after timeout");
       } catch (e) {
-        await detachSession(tabId).catch(() => {});
+        if (!sessions.has(tabId)) await detachSession(tabId).catch(() => {});
         throw e;
       }
       const s: Session = {
@@ -1153,6 +2492,14 @@ async function ensureAttached(tabId: number): Promise<Session> {
       sessions.set(tabId, s);
       return s;
     })();
+    p = withTimeout(run, ATTACH_MS + 2_000, () => tabTimeoutMsg(tabId, ATTACH_MS + 2_000, "the debugger attach")).catch(async (e) => {
+      if (isTimeout(e)) {
+        abandoned = true;
+        if (attaching.get(tabId) === p) attaching.delete(tabId);
+        await withTimeout(detachSession(tabId), 3_000, "detach").catch(() => {});
+      }
+      throw e;
+    });
     attaching.set(tabId, p);
     // Clear on settle either way: a failed attach must not be cached, or the tab could never retry.
     void p.catch(() => {}).then(() => attaching.delete(tabId));
@@ -1165,11 +2512,191 @@ async function ensureAttached(tabId: number): Promise<Session> {
 async function detachSession(tabId: number): Promise<void> {
   finalizeCapture(tabId); // flush + close the on-disk sink before the session goes away
   sessions.delete(tabId);
+  forgetEmulation(tabId); // CDP drops every override on detach
+  keepAlives.delete(tabId); // detaching drops the debugger's focus emulation with it
+  pendingDialogs.delete(tabId); // no longer observable once detached - don't report a stale one
   try {
     await new Promise<void>((resolve) => chrome.debugger.detach({ tabId }, () => resolve()));
   } catch {
     /* already gone */
   }
+}
+
+// ---------- hidden tabs: detection + keep-alive ----------
+// A tab whose window is covered/minimized/on another Space - or that sits behind another tab - has
+// document.visibilityState 'hidden': Chrome renders NO frames for it, so requestAnimationFrame never
+// fires and timers are throttled. React-Aria and many UI libraries commit state inside rAF, so an
+// action "succeeds" but the app updates seconds later or never. Worse, CDP Input.dispatchMouseEvent
+// (mouseMoved) waits for a frame that never comes: every trusted click/hover took ~5-6s there.
+//
+// Measured in the e2e harness (raw Chromium, background tab, rAF within 1s):
+//   nothing / debugger attached ........ never        Page.setWebLifecycleState active ... never
+//   Page.startScreencast ............... never        Page.captureScreenshot ............ never
+//   Emulation.setFocusEmulationEnabled . yes (visibilityState flips to 'visible', ~60fps)
+// Focus emulation makes the browser treat the tab as captured, so it renders while enabled. So
+// while an action runs on a hidden tab and a debugger session exists (or the caller passed
+// keepAlive:true, or the action is trusted anyway), focus emulation is switched on for the action
+// plus a short frame settle, then off again. Ref-counted per tab for overlapping actions.
+const HIDDEN_TAB_WARNING =
+  "tab is hidden (window covered/minimized/on another desktop, or another tab is in front): the page may not update until it is visible; " +
+  "call tab_activate or ask the user to bring the window forward (or pass keepAlive:true to keep it rendering during the action via the debugger)";
+const KEPT_ALIVE_NOTE =
+  "tab is hidden; it was kept rendering for this action (debugger focus emulation) but stops again now - later async updates may not render until it is visible";
+const STALLED_WARNING = "the page rendered no frame within 250ms (requestAnimationFrame did not fire): it may be throttled or busy, so updates can lag";
+
+const keepAlives = new Map<number, KeepAliveEntry>();
+
+// Top-frame visibility, bounded short: a page stuck behind a JS dialog can't answer, and that must not
+// add more than a moment to the action. null = unknown.
+async function tabVisibility(tab: chrome.tabs.Tab, rafCapMs = 0): Promise<{ hidden: boolean; raf: boolean | null } | null> {
+  if (!tab.id || !tab.url || RESTRICTED.test(tab.url)) return null;
+  try {
+    const res = await withTimeout(
+      chrome.scripting.executeScript({
+        target: { tabId: tab.id, frameIds: [0] },
+        world: "ISOLATED",
+        injectImmediately: true,
+        func: (cap: number) => {
+          const hidden = document.visibilityState === "hidden";
+          if (hidden || !cap) return { hidden, raf: hidden ? false : null };
+          return new Promise((res) => {
+            let done = false;
+            const fin = (v: boolean) => {
+              if (!done) {
+                done = true;
+                res({ hidden: document.visibilityState === "hidden", raf: v });
+              }
+            };
+            requestAnimationFrame(() => fin(true));
+            setTimeout(() => fin(false), cap);
+          });
+        },
+        args: [rafCapMs],
+      }),
+      rafCapMs + 400,
+      "visibility probe"
+    );
+    const v: any = res?.[0]?.result;
+    return v && typeof v === "object" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+// Wait for n rendered frames in the top frame (bounded) - lets rAF-scheduled commits land.
+async function settleFrames(tabId: number, n: number, capMs: number): Promise<boolean> {
+  try {
+    const res = await withTimeout(
+      chrome.scripting.executeScript({
+        target: { tabId, frameIds: [0] },
+        world: "ISOLATED",
+        injectImmediately: true,
+        func: (n: number, cap: number) =>
+          new Promise<boolean>((res) => {
+            let left = n;
+            const t = setTimeout(() => res(false), cap);
+            const f = () => {
+              if (--left <= 0) {
+                clearTimeout(t);
+                res(true);
+              } else requestAnimationFrame(f);
+            };
+            requestAnimationFrame(f);
+          }),
+        args: [n, capMs],
+      }),
+      capMs + 300,
+      "frame settle"
+    );
+    return res?.[0]?.result === true;
+  } catch {
+    return false;
+  }
+}
+
+type KeepAliveEntry = { refs: number; ready: Promise<boolean> };
+
+// Returns the entry this caller holds a reference on (its token for releaseKeepAlive), or null when
+// focus emulation could not be turned on. A caller only ever releases the entry it acquired, so a
+// stale entry (debugger detached and re-attached in between) can't switch emulation off mid-way
+// through another session's action, and a new session never inherits a dead entry.
+async function acquireKeepAlive(tabId: number): Promise<KeepAliveEntry | null> {
+  let entry = keepAlives.get(tabId);
+  if (entry) entry.refs++;
+  else {
+    entry = { refs: 1, ready: cmd(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true }, 3_000).then(() => true, () => false) };
+    keepAlives.set(tabId, entry);
+  }
+  if (await entry.ready) return entry;
+  releaseKeepAlive(tabId, entry);
+  return null;
+}
+
+function releaseKeepAlive(tabId: number, entry: KeepAliveEntry): void {
+  if (--entry.refs > 0 || keepAlives.get(tabId) !== entry) return;
+  keepAlives.delete(tabId);
+  void entry.ready.then((on) => {
+    if (on && sessions.has(tabId) && !keepAlives.has(tabId)) void cmd(tabId, "Emulation.setFocusEmulationEnabled", { enabled: false }, 3_000).catch(() => {});
+  });
+}
+
+/**
+ * Run an action with hidden-tab handling: probe visibility first; on a hidden tab keep it rendering
+ * (see above) when allowed, settle a couple of frames after the action so rAF commits land, and
+ * report tabHidden + keptAlive/warning on the result. params.keepAlive: true = attach the debugger
+ * if needed; false = never; unset = only when a debugger session already exists (or `trusted`).
+ */
+async function withLiveTab(tab: chrome.tabs.Tab, params: any, trusted: boolean, run: () => Promise<any>): Promise<any> {
+  const tabId = tab.id!;
+  const mode: boolean | undefined = typeof params?.keepAlive === "boolean" ? params.keepAlive : undefined;
+  const vis = await tabVisibility(tab);
+  let held: KeepAliveEntry | null = null;
+  let keepError: string | undefined;
+  let rafProbe: Promise<{ hidden: boolean; raf: boolean | null } | null> | null = null;
+  if (vis?.hidden && mode !== false && (mode === true || trusted || sessions.has(tabId)) && !isCancelled(params)) {
+    try {
+      await ensureAttached(tabId);
+      held = await acquireKeepAlive(tabId);
+    } catch (e) {
+      keepError = e instanceof Error ? e.message : String(e);
+    }
+  } else if (vis && !vis.hidden) {
+    // Visible - but is it actually rendering? Checked alongside the action, so it costs nothing extra.
+    rafProbe = tabVisibility(tab, 250);
+  }
+  const kept = held !== null;
+  let result: any;
+  try {
+    result = await run();
+    // Let rAF-scheduled commits (React-Aria & co) land while frames are still being produced.
+    if (kept && !isCancelled(params)) await settleFrames(tabId, 2, 300);
+  } finally {
+    if (held) releaseKeepAlive(tabId, held);
+  }
+  if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+  const addWarning = (w: string) => {
+    result.warning = result.warning ? `${result.warning}; ${w}` : w;
+  };
+  if (vis?.hidden) {
+    result = { ...result, tabHidden: true };
+    if (kept) {
+      result.keptAlive = true;
+      if (!String(result.note ?? "").includes(KEPT_ALIVE_NOTE)) result.note = result.note ? `${result.note}; ${KEPT_ALIVE_NOTE}` : KEPT_ALIVE_NOTE;
+    } else if (!result.keptAlive) {
+      // A nested withLiveTab (e.g. a covered click escalated to trusted) may already have kept it alive.
+      addWarning(HIDDEN_TAB_WARNING + (keepError ? ` (keepAlive failed: ${keepError})` : ""));
+    }
+  } else if (rafProbe) {
+    const r = await rafProbe;
+    if (r?.hidden) {
+      result = { ...result, tabHidden: true };
+      addWarning(HIDDEN_TAB_WARNING);
+    } else if (r && r.raf === false) {
+      result = { ...result, renderingStalled: true };
+      addWarning(STALLED_WARNING);
+    }
+  }
+  return result;
 }
 
 // After an SW eviction the in-memory `sessions` map is empty, but a debugger attach the dead worker
@@ -1206,7 +2733,9 @@ function idleSweep() {
     // Release paused requests the agent has abandoned FIRST, so a forgotten intercept can't hold the
     // tab (and the banner) open forever via the paused.size check below.
     if (s.paused.size > 0) sweepPaused(tabId, s);
-    if (s.netOn || s.interceptOn || s.logOn || s.paused.size > 0) continue;
+    // Live emulate_* overrides exist only while the debugger is attached: detaching would silently
+    // revert the device/network/locale the agent set, so they count as activity until emulate_reset.
+    if (s.netOn || s.interceptOn || s.logOn || s.paused.size > 0 || hasEmulation(tabId)) continue;
     if (now - s.lastUsedAt > IDLE_DETACH_MS) void detachSession(tabId);
   }
 }
@@ -1226,6 +2755,7 @@ function capExtra(s: Session): void {
 function onDebuggerEvent(source: chrome.debugger.Debuggee, method: string, params: any) {
   const tabId = source.tabId;
   if (tabId == null) return;
+  if (method === "Page.javaScriptDialogOpening" || method === "Page.javaScriptDialogClosed") onDialogEvent(tabId, method, params);
   const s = sessions.get(tabId);
   if (!s) return;
   // Fetch interception + console/log capture run independently of Network capture (netOn).
@@ -1608,32 +3138,31 @@ async function doReplay(tab: chrome.tabs.Tab, params: any): Promise<any> {
   const method = (ov.method || base.method).toUpperCase();
   const body = ov.body !== undefined ? ov.body : base.body;
 
-  // Build request headers: preserve content-type/accept from the base, apply explicit overrides,
-  // and drop headers fetch() forbids (Cookie/Host/Content-Length). Identity is handled via credentials.
-  const headers: Record<string, string> = {};
-  const bh = base.headers || {};
-  const baseCT = bh["content-type"] ?? bh["Content-Type"];
-  const baseAccept = bh["accept"] ?? bh["Accept"];
-  if (baseCT && body != null) headers["content-type"] = baseCT;
-  if (baseAccept) headers["accept"] = baseAccept;
-  for (const [k, v] of Object.entries(ov.headers || {})) {
-    if (!/^(cookie|host|content-length)$/i.test(k)) headers[k] = v as string;
-  }
-
+  // Build request headers: every captured header fetch() can set (auth, CSRF, x-*, accept...), then
+  // explicit overrides, then identity (replay-headers.ts). Cookies ride on `credentials`.
   // identity: current session (default) · anon (no cookies) · captured bearer
   let credentials: RequestCredentials = "include";
   let note: string | undefined;
+  let bearer: string | null = null;
   if (params.identity === "anon") {
     credentials = "omit";
   } else if (params.identity) {
     const id = identities.get(params.identity);
     if (!id) throw new Error(`identity '${params.identity}' not captured - call identity_capture first`);
     if (id.bearer) {
-      headers["authorization"] = id.bearer;
+      bearer = id.bearer;
       credentials = "omit";
     } else {
       note = `identity '${params.identity}' has no bearer; used the current tab session (cookie-jar swap not supported via background fetch)`;
     }
+  }
+  const built = buildReplayHeaders(base.headers, ov.headers, { hasBody: body != null, identity: params.identity ?? null, bearer });
+  const headers = built.headers;
+  let referrer: string | undefined;
+  try {
+    if (built.referrer && /^https?:$/.test(new URL(built.referrer).protocol)) referrer = built.referrer;
+  } catch {
+    /* unparseable Referer: omit */
   }
 
   // viaAppClient: run through the PAGE'S OWN fetch (main world) so the app's CSRF tokens, auth
@@ -1643,9 +3172,11 @@ async function doReplay(tab: chrome.tabs.Tab, params: any): Promise<any> {
     try {
       const res: any = await inject(
         tab,
-        async (u: string, m: string, hh: Record<string, string>, b: string | null) => {
+        async (u: string, m: string, hh: Record<string, string>, b: string | null, ref: string | null) => {
           try {
-            const r = await fetch(u, { method: m, headers: hh, body: b ?? undefined, credentials: "include" });
+            const init: RequestInit = { method: m, headers: hh, body: b ?? undefined, credentials: "include" };
+            if (ref) init.referrer = ref;
+            const r = await fetch(u, init);
             const oh: Record<string, string> = {};
             r.headers.forEach((v, k) => (oh[k] = v));
             let t = "";
@@ -1659,7 +3190,7 @@ async function doReplay(tab: chrome.tabs.Tab, params: any): Promise<any> {
             return { __fetchError: String(e) };
           }
         },
-        [url, method, headers, body ?? null],
+        [url, method, headers, body ?? null, referrer ?? null],
         "MAIN"
       );
       if (res && res.__fetchError) return { error: res.__fetchError, via: "app-fetch", url, method };
@@ -1673,7 +3204,7 @@ async function doReplay(tab: chrome.tabs.Tab, params: any): Promise<any> {
   // cookies, and it is NOT subject to the page's CSP or CORS (unlike an injected fetch).
   const t0 = Date.now();
   try {
-    const r = await fetch(url, { method, headers, body: body ?? undefined, credentials });
+    const r = await fetch(url, { method, headers, body: body ?? undefined, credentials, ...(referrer ? { referrer } : {}) });
     const h: Record<string, string> = {};
     r.headers.forEach((v, k) => (h[k] = v));
     let text = "";
@@ -2099,7 +3630,7 @@ async function viewportMeta(tab: chrome.tabs.Tab): Promise<any> {
       visibilityState: document.visibilityState,
       hidden: document.hidden,
       hasFocus: document.hasFocus(),
-    }), []);
+    }), [], "ISOLATED", { timeoutMs: 2_000, immediate: true }); // read-only; never hold up a capture
     if (v && v.hidden) {
       v.warning =
         "Tab is hidden/occluded - the compositor may be throttling its frames, so this capture can be stale " +
@@ -2165,9 +3696,12 @@ async function cdpScreenshot(tab: chrome.tabs.Tab, params: any): Promise<any> {
     const q: number[] = model.border; // [x1,y1,x2,y2,x3,y3,x4,y4]
     const xs = [q[0], q[2], q[4], q[6]];
     const ys = [q[1], q[3], q[5], q[7]];
+    // DOM.getBoxModel quads are relative to the main frame's VIEWPORT, but Page.captureScreenshot's
+    // clip (with captureBeyondViewport) is in DOCUMENT coordinates - add the scroll offset, exactly
+    // like the viewport branch below (and Puppeteer's ElementHandle.screenshot) does.
     const x = Math.min(...xs);
     const y = Math.min(...ys);
-    clip = { x, y, width: Math.max(...xs) - x, height: Math.max(...ys) - y, scale: clipScale };
+    clip = { x: x + (pd.sx || 0), y: y + (pd.sy || 0), width: Math.max(...xs) - x, height: Math.max(...ys) - y, scale: clipScale };
   } else if (params.fullPage) {
     if (pd.sw * scale > SHOT_MAX_PX || pd.sh * scale > SHOT_MAX_PX) {
       throw new Error(`Page too large for a single capture (${pd.sw}x${pd.sh} @${scale}x, limit ${SHOT_MAX_PX}px). Use a selector, a smaller scale, or capture regions.`);
@@ -2224,8 +3758,10 @@ async function trustedPasteImage(tab: chrome.tabs.Tab, params: any): Promise<any
   }
 
   // find the target element's on-screen center (CSP-safe function injection; handles plain refs + shadow)
-  const loc = await inject(tab, bbAct, ["locate", { sel: params.selector ?? null, ref: params.ref ?? null }]);
-  if (!loc || loc.notFound || loc.staleRef) throw new Error("Target not found (or since re-rendered) for trusted paste - take a fresh snapshot or check the selector.");
+  // (frame-aware: coordinates are mapped to the top-level viewport)
+  const loc = await locateForTrusted(tab, params.ref ?? null, params.selector ?? null).catch((e) => {
+    throw new Error(`Target not found for trusted paste (${e instanceof Error ? e.message : e}) - take a fresh snapshot or check the selector.`);
+  });
   await sleep(150);
 
   // trusted click → focuses the field + grants user activation for the clipboard write
@@ -2254,25 +3790,99 @@ async function trustedPasteImage(tab: chrome.tabs.Tab, params: any): Promise<any
   return { pasted: true, trusted: true, method: "clipboard+trusted-paste", size: w.size };
 }
 
-async function trustedAction(tabId: number, action: string, ref: number | null, selector: string | null, text?: string): Promise<any> {
+// Offset of an extension frame's viewport inside the top-level viewport, via CDP: map the frame to
+// its CDP frame id (by URL in Page.getFrameTree), then take the content box of its owner <iframe>
+// (DOM.getBoxModel is relative to the main frame's viewport). Used when a same-origin
+// window.frameElement walk can't reach the top (cross-origin ancestors).
+async function cdpFrameOffset(tabId: number, frameId: number): Promise<{ x: number; y: number }> {
+  const f = await chrome.webNavigation.getFrame({ tabId, frameId });
+  if (!f?.url) throw new Error(`frame ${frameId} is gone`);
+  const { frameTree } = await cmd(tabId, "Page.getFrameTree");
+  const cdpFrameId = matchCdpFrame(frameTree, f.url);
+  if (!cdpFrameId) throw new Error(`can't map frame ${frameId} (${f.url}) to a CDP frame (no unique URL match)`);
+  const { backendNodeId } = await cmd(tabId, "DOM.getFrameOwner", { frameId: cdpFrameId });
+  try {
+    await cmd(tabId, "DOM.scrollIntoViewIfNeeded", { backendNodeId });
+  } catch {
+    /* best effort */
+  }
+  const { model } = await cmd(tabId, "DOM.getBoxModel", { backendNodeId });
+  const q: number[] = model.content; // [x1,y1,...] - top-left first
+  return { x: Math.min(q[0], q[2], q[4], q[6]), y: Math.min(q[1], q[3], q[5], q[7]) };
+}
+
+// Top-level viewport coordinates of a PLAIN snapshot ref (or a selector) for CDP Input: run bbAct
+// "locate" in the owning frame (scrolls it into view, focuses it, returns its frame-local centre),
+// then add the frame's offset in the page - from the same-origin frameElement chain the locate
+// itself computes, or CDP for cross-origin frames.
+async function locateForTrusted(tab: chrome.tabs.Tab, ref: number | null, selector: string | null): Promise<{ x: number; y: number; frameId: number; reResolved?: boolean }> {
+  const { result: loc, frameId } = await actAllFrames(tab, ["locate", { ref, sel: selector, value: null } satisfies BbActParams]);
+  if (!loc || loc.notFound || frameId == null) {
+    throw new Error(ref != null ? `ref ${ref} is not in the page's ref registry - take a new snapshot` : `Element not found for selector: ${selector}`);
+  }
+  if (loc.staleRef) throw new Error(staleRefMessage(ref, loc));
+  let x = loc.x, y = loc.y;
+  if (frameId !== 0 && !loc.isTop) {
+    if (!loc.crossOrigin) {
+      x += loc.ox;
+      y += loc.oy;
+    } else {
+      const off = await cdpFrameOffset(tab.id!, frameId);
+      x += off.x;
+      y += off.y;
+    }
+  }
+  return { x, y, frameId, ...(loc.reResolved ? { reResolved: true } : {}) };
+}
+
+function staleRefMessage(ref: number | null, v: any): string {
+  if (v?.was) {
+    return `stale-ref: element ${ref} changed since the snapshot (was ${v.was}, now ${v.now})${v.ambiguous ? " and several elements now match it" : ""}; take a new snapshot`;
+  }
+  return `stale-ref: the element ref ${ref} pointed at is gone from the DOM (re-render/navigation) - take a new snapshot`;
+}
+
+// Trusted (isTrusted, CDP Input) click/hover/type. Deep-snapshot refs (>= DEEP_REF_BASE) resolve to
+// CDP nodes; plain snapshot refs and selectors are located in-page (frame- and shadow-aware) and
+// mapped to top-level viewport coordinates. A selector the in-page locate can't find falls back to
+// CDP DOM.querySelector.
+async function trustedAction(tab: chrome.tabs.Tab, action: string, ref: number | null, selector: string | null, text?: string): Promise<any> {
+  const tabId = tab.id!;
   await ensureAttached(tabId);
-  const nodeId = await cdpResolve(tabId, ref, selector);
+  let x: number, y: number;
+  let extra: any = {};
+  let nodeId: number | null = null;
+  if (ref != null && ref >= DEEP_REF_BASE) nodeId = await cdpResolveByRef(tabId, ref);
+  else {
+    try {
+      const loc = await locateForTrusted(tab, ref, selector);
+      x = loc.x;
+      y = loc.y;
+      if (loc.reResolved) extra.reResolved = true;
+    } catch (e) {
+      if (ref != null || !selector) throw e;
+      nodeId = await cdpResolveBySelector(tabId, selector);
+    }
+  }
   if (action === "type") {
-    await cmd(tabId, "DOM.focus", { nodeId });
+    // the in-page locate already focused the element; a CDP-resolved node is focused via DOM.focus
+    if (nodeId != null) await cmd(tabId, "DOM.focus", { nodeId });
     for (const ch of Array.from(text ?? "")) {
       await cmd(tabId, "Input.dispatchKeyEvent", { type: "keyDown", text: ch, unmodifiedText: ch, key: ch });
       await cmd(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: ch });
       await sleep(15); // real inter-keystroke timing
     }
-    return { typed: (text ?? "").length, trusted: true };
+    return { typed: (text ?? "").length, trusted: true, ...extra };
   }
-  const { x, y } = await cdpCenter(tabId, nodeId);
+  if (nodeId != null) ({ x, y } = await cdpCenter(tabId, nodeId));
+  x = x!;
+  y = y!;
   await cmd(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, buttons: 0 });
-  if (action === "hover") return { hovered: true, trusted: true, x, y };
+  if (action === "hover") return { hovered: true, trusted: true, x, y, ...extra };
   if (action === "click") {
     await cmd(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
     await cmd(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
-    return { clicked: true, trusted: true, x, y };
+    return { clicked: true, trusted: true, x, y, ...extra };
   }
   throw new Error(`Unknown trusted action: ${action}`);
 }
@@ -2280,37 +3890,7 @@ async function trustedAction(tabId: number, action: string, ref: number | null, 
 // ---- coordinate-level trusted input (CDP Input) — for canvas / remote-desktop / game targets ----
 // Coords are CSS VIEWPORT pixels (top-left origin). Screenshots are device pixels, so map with the
 // dpr the screenshot tool returns: inputCoord = screenshotPixel / dpr.
-const CDP_MODS: Record<string, number> = { alt: 1, option: 1, ctrl: 2, control: 2, meta: 4, cmd: 4, command: 4, super: 4, win: 4, shift: 8 };
-
-// Resolve a key name ("Enter", "ArrowUp", "c", "F5") → { key, code, vk } for CDP Input.dispatchKeyEvent.
-function keyInfo(name: string): { key: string; code: string; vk: number } {
-  const named: Record<string, [string, string, number]> = {
-    enter: ["Enter", "Enter", 13], return: ["Enter", "Enter", 13],
-    tab: ["Tab", "Tab", 9], escape: ["Escape", "Escape", 27], esc: ["Escape", "Escape", 27],
-    backspace: ["Backspace", "Backspace", 8], delete: ["Delete", "Delete", 46], del: ["Delete", "Delete", 46],
-    space: [" ", "Space", 32], spacebar: [" ", "Space", 32],
-    up: ["ArrowUp", "ArrowUp", 38], arrowup: ["ArrowUp", "ArrowUp", 38],
-    down: ["ArrowDown", "ArrowDown", 40], arrowdown: ["ArrowDown", "ArrowDown", 40],
-    left: ["ArrowLeft", "ArrowLeft", 37], arrowleft: ["ArrowLeft", "ArrowLeft", 37],
-    right: ["ArrowRight", "ArrowRight", 39], arrowright: ["ArrowRight", "ArrowRight", 39],
-    home: ["Home", "Home", 36], end: ["End", "End", 35],
-    pageup: ["PageUp", "PageUp", 33], pagedown: ["PageDown", "PageDown", 34],
-    insert: ["Insert", "Insert", 45], ins: ["Insert", "Insert", 45],
-  };
-  const lk = name.toLowerCase();
-  if (named[lk]) return { key: named[lk][0], code: named[lk][1], vk: named[lk][2] };
-  const fm = /^f([1-9]|1[0-2])$/i.exec(name);
-  if (fm) { const n = Number(fm[1]); return { key: "F" + n, code: "F" + n, vk: 111 + n }; }
-  if (name.length === 1) {
-    const ch = name;
-    const up = ch.toUpperCase();
-    if (/[a-z]/i.test(ch)) return { key: ch, code: "Key" + up, vk: up.charCodeAt(0) };
-    if (/[0-9]/.test(ch)) return { key: ch, code: "Digit" + ch, vk: ch.charCodeAt(0) };
-    return { key: ch, code: "", vk: up.charCodeAt(0) };
-  }
-  return { key: name, code: "", vk: 0 };
-}
-
+// (CDP_MODS / keyInfo live in act-logic.ts - pure and unit-tested.)
 async function cdpInput(tabId: number, params: any): Promise<any> {
   const action: string = params.action;
   if (params.activate) {
@@ -2408,10 +3988,15 @@ async function cdpInput(tabId: number, params: any): Promise<any> {
 
 // CDP deep snapshot: walks the pierced DOM tree (incl. CLOSED shadow roots and iframe docs),
 // stamps refs -> backendNodeId in the session so trusted interaction can act on them.
-async function cdpDeepSnapshot(tabId: number): Promise<any> {
+async function cdpDeepSnapshot(tabId: number, limit = SNAPSHOT_DEFAULT_LIMIT): Promise<any> {
   const s = await ensureAttached(tabId);
   const { root } = await cmd(tabId, "DOM.getDocument", { depth: -1, pierce: true });
-  const INTERACTIVE = new Set(["A", "BUTTON", "INPUT", "SELECT", "TEXTAREA"]);
+  const INTERACTIVE = new Set(["BUTTON", "SELECT", "TEXTAREA", "SUMMARY"]);
+  const ROLES = new Set([
+    "button", "link", "tab", "menuitem", "menuitemcheckbox", "menuitemradio", "option", "checkbox", "radio",
+    "switch", "combobox", "textbox", "searchbox", "treeitem", "slider", "spinbutton", "gridcell", "listbox",
+  ]);
+  let total = 0;
   const items: any[] = [];
   s.refNodes = new Map();
   s.deepGen++;
@@ -2432,15 +4017,20 @@ async function cdpDeepSnapshot(tabId: number): Promise<any> {
   };
   const isInteractive = (node: any, attrs: Record<string, string>): boolean => {
     if (INTERACTIVE.has(node.nodeName)) return true;
-    if (attrs.role && ["button", "link", "tab", "menuitem"].includes(attrs.role)) return true;
-    if (attrs.contenteditable === "true") return true;
+    if (node.nodeName === "A") return "href" in attrs || "onclick" in attrs || !!attrs.role;
+    if (node.nodeName === "INPUT") return (attrs.type || "").toLowerCase() !== "hidden";
+    if ((node.nodeName === "VIDEO" || node.nodeName === "AUDIO") && "controls" in attrs) return true;
+    if (attrs.role && ROLES.has(attrs.role.trim().split(/\s+/)[0])) return true;
+    if ("contenteditable" in attrs && attrs.contenteditable !== "false") return true;
+    if ("onclick" in attrs) return true;
+    if ("tabindex" in attrs && attrs.tabindex !== "-1") return true;
     return false;
   };
   const walk = (node: any) => {
-    if (!node || n >= 400) return;
+    if (!node) return;
     if (node.nodeType === 1) {
       const attrs = attrsOf(node);
-      if (isInteractive(node, attrs)) {
+      if (isInteractive(node, attrs) && ++total <= limit) {
         n++;
         const ref = genBase + n;
         const label = (textOf(node) || attrs["aria-label"] || attrs.placeholder || attrs.value || attrs.title || "")
@@ -2460,78 +4050,194 @@ async function cdpDeepSnapshot(tabId: number): Promise<any> {
     if (node.contentDocument) walk(node.contentDocument); // iframe subtree
   };
   walk(root);
-  return { url: root.documentURL, count: items.length, elements: items, deep: true };
+  const out: any = { url: root.documentURL, count: items.length, total, truncated: total > items.length, deep: true };
+  if (out.truncated) out.hint = `${total - items.length} more elements not listed; pass limit (max ${SNAPSHOT_MAX_LIMIT})`;
+  out.elements = items;
+  return out;
 }
 
-// Banner-free shallow snapshot across all frames, injected concurrently. Each frame's ref offset
-// is derived from its index (not its neighbor's actual element count) so every frame's injection
-// can fire in parallel instead of waiting on the previous frame to resolve first; bbSnapshot caps
-// at 400 elements per frame, so a 500-wide stride can never let two frames' ref ranges collide.
-async function shallowSnapshot(tab: chrome.tabs.Tab): Promise<any> {
-  assertScriptable(tab);
+// ---- snapshot / ax_snapshot orchestration (two-phase, budgeted, routed refs) ----
+// Every snapshot bumps an epoch. Phase 1 (bbSnapshot / bbAxSnapshot) runs in each frame concurrently
+// and parks its priority-ordered candidates; the SW then splits the ref budget fairly across frames
+// (snapshot-plan.ts), numbers each frame's refs as one dense, disjoint range, and phase 2
+// (bbCommitRefs) registers them. The per-tab route table remembers which frame owns which range, so a
+// ref is only ever resolved in the frame that issued it: a frame whose re-snapshot failed keeps its OLD
+// __bbRefs map, but no current ref routes there, so its stale entries can't collide with a new range.
+let snapEpoch = 0;
+const refRoutes = new Map<number, { epoch: number; routes: RefRoute[] }>();
+
+async function frameList(tab: chrome.tabs.Tab): Promise<number[]> {
   let frames: { frameId: number }[];
   try {
     frames = (await chrome.webNavigation.getAllFrames({ tabId: tab.id! })) ?? [{ frameId: 0 }];
   } catch {
     frames = [{ frameId: 0 }];
   }
-  const FRAME_REF_STRIDE = 500;
-  const results = await Promise.all(
-    frames.map(async (f, i) => {
-      try {
-        const res = await chrome.scripting.executeScript({
-          target: { tabId: tab.id!, frameIds: [f.frameId] },
-          func: bbSnapshot as any,
-          args: [i * FRAME_REF_STRIDE],
-        });
-        return { frameId: f.frameId, v: res?.[0]?.result as any };
-      } catch {
-        return null; // frame not injectable (about:blank, sandboxed, gone)
-      }
-    })
-  );
-  const all: any[] = [];
-  for (const r of results) {
-    if (!r || !r.v || !r.v.elements) continue;
-    for (const e of r.v.elements) all.push(r.frameId === 0 ? e : { ...e, frameId: r.frameId });
-  }
-  if (all.length > 400) all.length = 400;
-  return { url: tab.url, count: all.length, elements: all };
+  const ids = frames.map((f) => f.frameId);
+  ids.sort((a, b) => (a === 0 ? -1 : b === 0 ? 1 : 0)); // top frame first, rest in Chrome's order
+  if (!ids.includes(0)) ids.unshift(0);
+  return ids;
 }
 
-// Banner-free accessibility-tree snapshot, injected per-frame (same scheme as shallowSnapshot: each
-// frame gets a disjoint ref-offset stride, and each interactive node is registered in that frame's
-// window.__bbRefs so its ref works with click/fill/hover/type). The extension returns the structured
-// per-frame trees; the server renders the compact text (server/src/ax.ts).
-async function axSnapshot(tab: chrome.tabs.Tab): Promise<any> {
+interface PlannedFrame {
+  frameId: number;
+  v: any; // the frame's phase-1 result
+  offset: number;
+  keep: number; // refs registered (0 = none)
+}
+
+async function twoPhaseSnapshot(
+  tab: chrome.tabs.Tab,
+  func: (...a: any[]) => any,
+  extraArgs: any[],
+  limit: number,
+  countOf: (v: any) => number
+): Promise<{ epoch: number; frames: PlannedFrame[]; skippedFrames: number[] }> {
   assertScriptable(tab);
-  let frames: { frameId: number }[];
-  try {
-    frames = (await chrome.webNavigation.getAllFrames({ tabId: tab.id! })) ?? [{ frameId: 0 }];
-  } catch {
-    frames = [{ frameId: 0 }];
-  }
-  const FRAME_REF_STRIDE = 500;
+  const epoch = ++snapEpoch;
+  const ids = await frameList(tab);
+  const skipped: number[] = []; // child frames that didn't answer in time (wedged ad/embed)
   const results = await Promise.all(
-    frames.map(async (f, i) => {
+    ids.map(async (frameId) => {
       try {
-        const res = await chrome.scripting.executeScript({
-          target: { tabId: tab.id!, frameIds: [f.frameId] },
-          func: bbAxSnapshot as any,
-          args: [i * FRAME_REF_STRIDE],
-        });
-        return { frameId: f.frameId, v: res?.[0]?.result as any };
-      } catch {
+        const ms = frameId === 0 ? INJECT_TOP_MS : INJECT_CHILD_MS;
+        const res = await withTimeout(
+          chrome.scripting.executeScript({
+            target: { tabId: tab.id!, frameIds: [frameId] },
+            func: func as any,
+            args: clean([epoch, ...extraArgs]),
+          }),
+          ms,
+          () => tabTimeoutMsg(tab.id, ms, frameId ? `frame ${frameId}` : "")
+        );
+        const v = res?.[0]?.result as any;
+        if (!v || typeof v !== "object") return null;
+        if (typeof v.error === "string") {
+          if (frameId === 0) throw new Error(v.error);
+          return null;
+        }
+        return { frameId, v };
+      } catch (e) {
+        // a hung top frame is an error, not an empty page; a hung child frame is skipped and reported
+        if (frameId === 0 && (isTimeout(e) || (e instanceof Error && !/Cannot access|No frame|was removed/i.test(e.message)))) throw e;
+        if (frameId !== 0 && isTimeout(e)) skipped.push(frameId);
         return null; // frame not injectable (about:blank, sandboxed, gone)
       }
     })
   );
+  const ok = results.filter((r): r is { frameId: number; v: any } => !!r);
+  const budgets = allocateFrameBudgets(ok.map((r) => countOf(r.v)), limit);
+  const offsets = frameOffsets(budgets);
+  const planned: PlannedFrame[] = ok.map((r, i) => ({ frameId: r.frameId, v: r.v, offset: offsets[i], keep: budgets[i] }));
+  await Promise.all(
+    planned.map(async (p) => {
+      try {
+        const ms = p.frameId === 0 ? INJECT_TOP_MS : INJECT_CHILD_MS;
+        const res = await withTimeout(
+          chrome.scripting.executeScript({
+            target: { tabId: tab.id!, frameIds: [p.frameId] },
+            func: bbCommitRefs as any,
+            args: [epoch, p.offset, p.keep],
+          }),
+          ms,
+          () => tabTimeoutMsg(tab.id, ms, p.frameId ? `frame ${p.frameId}` : "")
+        );
+        const v = res?.[0]?.result as any;
+        if (!v || v.error) p.keep = 0;
+      } catch {
+        p.keep = 0; // frame went away between phases - its refs are not handed out
+      }
+    })
+  );
+  // Two snapshots racing on one tab (e.g. click{withSnapshot} + snapshot): the OLDER one finishing last
+  // must not overwrite the newer routing, or refs the agent was just handed would be rejected as stale.
+  const prevRoute = refRoutes.get(tab.id!);
+  if (!prevRoute || epoch >= prevRoute.epoch) {
+    refRoutes.set(tab.id!, {
+      epoch,
+      routes: planned.filter((p) => p.keep > 0).map((p) => ({ frameId: p.frameId, lo: p.offset + 1, hi: p.offset + p.keep })),
+    });
+  }
+  return { epoch, frames: planned, skippedFrames: skipped };
+}
+
+// Frame that owns `ref` in the latest snapshot of this tab. undefined = no route table (e.g. the
+// service worker restarted since the snapshot) so the caller falls back to asking every frame;
+// null = the table exists but the ref isn't in it (from an older snapshot) -> stale.
+function ownerFrameForRef(tabId: number, ref: number): number | null | undefined {
+  const t = refRoutes.get(tabId);
+  if (!t) return undefined;
+  return routeRef(t.routes, ref);
+}
+
+// Banner-free plain snapshot across all frames.
+async function shallowSnapshot(tab: chrome.tabs.Tab, params: any = {}): Promise<any> {
+  const limit = clampLimit(params.limit);
+  const opts = { limit, viewportOnly: !!params.viewportOnly, modalOnly: !!params.modalOnly, filter: params.filter ? String(params.filter) : null };
+  const { frames, skippedFrames } = await twoPhaseSnapshot(tab, bbSnapshot, [opts], limit, (v) => (v.elements ? v.elements.length : 0));
+  const elements: any[] = [];
+  let total = 0;
+  let scanCapped = false;
+  let modal: string | undefined;
+  for (const f of frames) {
+    total += f.v.total ?? 0;
+    if (f.v.scanCapped) scanCapped = true;
+    if (f.v.modal && !modal) modal = f.frameId === 0 ? f.v.modal : `${f.v.modal} (frame ${f.frameId})`;
+    const els: any[] = f.v.elements ?? [];
+    for (let i = 0; i < f.keep && i < els.length; i++) {
+      const e = { ref: f.offset + i + 1, ...els[i] };
+      if (f.frameId !== 0) e.frameId = f.frameId;
+      elements.push(e);
+    }
+  }
+  const truncated = total > elements.length || scanCapped;
+  const out: any = { url: tab.url, count: elements.length, total, truncated };
+  if (skippedFrames.length) out.skippedFrames = skippedFrames; // child frames that timed out (not listed)
+  if (truncated) {
+    out.hint =
+      `${Math.max(0, total - elements.length)}${scanCapped ? "+" : ""} more elements not listed (priority order: open dialogs/popovers, then in-viewport, then the rest); ` +
+      `pass limit (max ${SNAPSHOT_MAX_LIMIT}), or filter:"text", or viewportOnly:true`;
+  }
+  if (modal) {
+    out.modal = modal;
+    out.modalOnly = "a modal dialog is open: elements behind it are marked behindModal:true (likely not clickable); pass modalOnly:true to list only the dialog";
+  }
+  out.elements = elements;
+  return out;
+}
+
+// Banner-free accessibility-tree snapshot (same two-phase ref scheme). The extension returns the
+// structured per-frame trees; the server renders the compact text (server/src/ax.ts).
+async function axSnapshot(tab: chrome.tabs.Tab, params: any = {}): Promise<any> {
+  const limit = clampLimit(params.limit);
+  const { frames, skippedFrames } = await twoPhaseSnapshot(tab, bbAxSnapshot, [], limit, (v) => v.total ?? 0);
   const outFrames: any[] = [];
-  for (const r of results) {
-    if (!r || !r.v) continue;
-    outFrames.push({ frameId: r.frameId, url: r.v.url, root: r.v.root ?? null, truncated: !!r.v.truncated });
+  for (const f of frames) {
+    const assigned = assignAxRefs(f.v.root, f.offset, f.keep);
+    const fr: any = { frameId: f.frameId, url: f.v.url, root: f.v.root ?? null, truncated: !!f.v.truncated };
+    if ((f.v.total ?? 0) > assigned) {
+      fr.refsTotal = f.v.total;
+      fr.refsAssigned = assigned;
+    }
+    if (f.v.modal) fr.modal = f.v.modal;
+    outFrames.push(fr);
   }
-  return { url: tab.url, frames: outFrames };
+  const axOut: any = { url: tab.url, limit, frames: outFrames };
+  if (skippedFrames.length) axOut.skippedFrames = skippedFrames; // child frames that timed out
+  return axOut;
+}
+
+// Give a framework a moment to render an action's result before withSnapshot captures it: wait for
+// the top frame's DOM to be mutation-quiet for 150ms (capped at 800ms). Best-effort.
+async function waitDomQuiet(tab: chrome.tabs.Tab, quietMs = 150, capMs = 800): Promise<void> {
+  try {
+    await Promise.race([
+      chrome.scripting.executeScript({ target: { tabId: tab.id!, frameIds: [0] }, func: bbDomQuiet as any, args: [quietMs, capMs] }),
+      sleep(capMs + 200),
+    ]);
+  } catch {
+    /* navigating / not injectable - snapshot anyway */
+  }
 }
 
 // Optionally attaches a fresh shallow snapshot to an interaction result (params.withSnapshot),
@@ -2540,12 +4246,309 @@ async function axSnapshot(tab: chrome.tabs.Tab): Promise<any> {
 async function withSnapshotIfRequested(tab: chrome.tabs.Tab, params: any, result: any): Promise<any> {
   if (!params?.withSnapshot || !result || typeof result !== "object") return result;
   try {
+    await waitDomQuiet(tab);
     result.snapshot = await shallowSnapshot(tab);
   } catch (e) {
     result.snapshot = { error: e instanceof Error ? e.message : String(e) };
   }
   return result;
 }
+
+// After-action effect summary for click / press_key: {url, title, urlChanged, newTabId?}, so the
+// agent doesn't need 2-3 follow-up calls to learn what its action did. Start the watch BEFORE the
+// action (so a new tab opened by it isn't missed), then finish() after: it waits up to maxMs for the
+// first of a URL change on this tab, a new tab opened from it (openerTabId), or the DOM settling
+// (EFFECT_IDLE_MS / EFFECT_QUIET_MS). Cheap and best-effort - it never throws, and an in-page probe that can't run (page
+// navigating, a dialog open) is simply bounded by the timer.
+const EFFECT_IDLE_MS = 50; // no mutation at all within this -> the action had no (sync-ish) DOM effect
+const EFFECT_QUIET_MS = 75; // after a mutation: this long without another one = the render settled
+
+function startEffectWatch(tab: chrome.tabs.Tab) {
+  const tabId = tab.id!;
+  const beforeUrl = tab.url ?? "";
+  let newTabId: number | undefined;
+  let urlChanged = false;
+  let wake: (() => void) | null = null;
+  const onCreated = (t: chrome.tabs.Tab) => {
+    if (t.openerTabId === tabId && t.id != null && newTabId == null) {
+      newTabId = t.id;
+      wake?.();
+    }
+  };
+  const onUpdated = (id: number, info: chrome.tabs.TabChangeInfo) => {
+    if (id === tabId && info.url && info.url !== beforeUrl) {
+      urlChanged = true;
+      wake?.();
+    }
+  };
+  chrome.tabs.onCreated.addListener(onCreated);
+  chrome.tabs.onUpdated.addListener(onUpdated);
+  const stop = () => {
+    chrome.tabs.onCreated.removeListener(onCreated);
+    chrome.tabs.onUpdated.removeListener(onUpdated);
+  };
+  return {
+    stop,
+    async finish(maxMs = 500): Promise<{ url: string; title: string; urlChanged: boolean; newTabId?: number }> {
+      try {
+        if (!urlChanged && newTabId == null) {
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, maxMs);
+            wake = () => {
+              clearTimeout(timer);
+              resolve();
+            };
+            chrome.scripting
+              .executeScript({
+                target: { tabId, frameIds: [0] },
+                world: "ISOLATED",
+                // Cheap settle: resolve after idleMs if the page shows no mutation at all (most
+                // clicks), else once the DOM has been quiet for quietMs after the last mutation (a
+                // framework commit), capped. Was a flat 150ms quiet window - the bulk of a click.
+                func: (idleMs: number, quietMs: number, capMs: number) =>
+                  new Promise<boolean>((res) => {
+                    // A hidden tab (not kept alive) renders nothing and throttles these timers to ~1s:
+                    // waiting would only burn the whole cap. URL/new-tab effects are still caught by
+                    // the tab listeners.
+                    if (document.visibilityState === "hidden") return res(true);
+                    let t: any;
+                    let cap: any;
+                    const obs = new MutationObserver(() => {
+                      clearTimeout(t);
+                      t = setTimeout(() => done(true), quietMs);
+                    });
+                    const done = (v: boolean) => {
+                      obs.disconnect();
+                      clearTimeout(t);
+                      clearTimeout(cap);
+                      res(v);
+                    };
+                    obs.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+                    t = setTimeout(() => done(true), idleMs);
+                    cap = setTimeout(() => done(false), capMs);
+                  }),
+                args: [EFFECT_IDLE_MS, EFFECT_QUIET_MS, Math.max(50, maxMs - 50)],
+              })
+              .then((r) => {
+                if (r?.[0]?.result === true) wake?.();
+              })
+              .catch(() => {});
+          });
+        }
+      } catch {
+        /* never fail the action */
+      } finally {
+        wake = null;
+        stop();
+      }
+      let fresh: chrome.tabs.Tab | null = null;
+      try {
+        fresh = await chrome.tabs.get(tabId);
+      } catch {}
+      const url = fresh?.pendingUrl || fresh?.url || beforeUrl;
+      const out: { url: string; title: string; urlChanged: boolean; newTabId?: number } = {
+        url,
+        title: fresh?.title ?? "",
+        urlChanged: urlChanged || url !== beforeUrl,
+      };
+      if (newTabId != null) out.newTabId = newTabId;
+      return out;
+    },
+  };
+}
+
+// Attach the effect summary to a successful action result; never lets it fail the action.
+// ---- per-action dialog guard ----
+// Chrome cannot answer an alert/confirm/prompt through chrome.debugger unless the debugger was attached
+// BEFORE the dialog opened (a late session gets "No dialog is showing" and Page.enable hangs behind the
+// blocked renderer - verified against bare Chromium). So when the agent opts in with onDialog, the action
+// briefly replaces window.alert/confirm/prompt in the page's MAIN world (every frame), answers as told,
+// and records what was shown on a DOM attribute named with a per-call random nonce (so a page cannot
+// pre-plant fake dialog reports into the agent's result). The guard is removed as soon as the action
+// finishes (collectGuardedDialogs, also on failure), on pagehide, or by a TTL backstop. Overlapping guards
+// on one page are tracked in a registry so removing one never strands another or the page's originals.
+// beforeunload is not covered (it is not a window method). Without onDialog nothing is installed.
+function newGuardNonce(): string {
+  return Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function armDialogGuard(tab: chrome.tabs.Tab, nonce: string, mode: "accept" | "dismiss", promptText: string | null, ttlMs: number): Promise<void> {
+  await injectAllFrames(
+    tab,
+    (nonce: string, mode: string, promptText: string | null, ttl: number) => {
+      const w = window as any;
+      let reg = w.__bbDlgGuard;
+      if (!reg || !(reg.guards instanceof Map) || !reg.real) {
+        reg = { real: { alert: w.alert, confirm: w.confirm, prompt: w.prompt }, guards: new Map() };
+        Object.defineProperty(w, "__bbDlgGuard", { value: reg, configurable: true, writable: true, enumerable: false });
+        const active = () => {
+          let last: any = null;
+          for (const g of reg.guards.values()) last = g; // most recently armed wins
+          return last;
+        };
+        const rec = (g: any, type: string, msg: unknown, answer: unknown) => {
+          const attr = "data-bb-dlg-" + g.nonce;
+          let list: any[] = [];
+          try {
+            list = JSON.parse(document.documentElement.getAttribute(attr) || "[]");
+          } catch {}
+          list.push({ type, message: String(msg ?? "").slice(0, 500), accepted: g.accept, answer });
+          document.documentElement.setAttribute(attr, JSON.stringify(list.slice(-10)));
+        };
+        w.alert = function (m?: unknown) {
+          const g = active();
+          if (!g) return reg.real.alert.call(w, m);
+          rec(g, "alert", m, null);
+        };
+        w.confirm = function (m?: unknown) {
+          const g = active();
+          if (!g) return reg.real.confirm.call(w, m);
+          rec(g, "confirm", m, g.accept);
+          return g.accept;
+        };
+        w.prompt = function (m?: unknown, d?: unknown) {
+          const g = active();
+          if (!g) return reg.real.prompt.call(w, m, d);
+          const v = g.accept ? (g.promptText ?? (d == null ? "" : String(d))) : null;
+          rec(g, "prompt", m, v);
+          return v;
+        };
+        reg.removeAll = () => {
+          for (const g of reg.guards.values()) clearTimeout(g.t);
+          reg.guards.clear();
+          w.alert = reg.real.alert;
+          w.confirm = reg.real.confirm;
+          w.prompt = reg.real.prompt;
+          delete w.__bbDlgGuard;
+        };
+        reg.remove = (n: string) => {
+          const g = reg.guards.get(n);
+          if (g) clearTimeout(g.t);
+          reg.guards.delete(n);
+          if (!reg.guards.size) reg.removeAll();
+        };
+        // A navigation away (incl. into bfcache) must not keep answering dialogs when the user comes back.
+        w.addEventListener("pagehide", () => reg.removeAll?.(), { once: true });
+      }
+      reg.guards.set(nonce, { nonce, accept: mode === "accept", promptText, t: setTimeout(() => reg.remove(nonce), ttl) });
+      return true;
+    },
+    [nonce, mode, promptText, ttlMs],
+    "MAIN"
+  );
+}
+
+/** Remove this action's guard (every frame) and return the dialogs it answered. Never throws. */
+async function collectGuardedDialogs(tab: chrome.tabs.Tab, nonce: string): Promise<any[]> {
+  await injectAllFrames(
+    tab,
+    (n: string) => {
+      (window as any).__bbDlgGuard?.remove?.(n);
+      return true;
+    },
+    [nonce],
+    "MAIN"
+  ).catch(() => {});
+  try {
+    const res = await injectAllFrames(
+      tab,
+      (n: string) => {
+        const attr = "data-bb-dlg-" + n;
+        const raw = document.documentElement.getAttribute(attr);
+        document.documentElement.removeAttribute(attr);
+        try {
+          const v = raw ? JSON.parse(raw) : [];
+          return Array.isArray(v) ? v.slice(0, 10) : [];
+        } catch {
+          return [];
+        }
+      },
+      [nonce]
+    );
+    return res.flatMap((r: any) => (Array.isArray(r?.result) ? r.result : []));
+  } catch {
+    return [];
+  }
+}
+
+/** Run one action under an optional dialog guard; the guard is always removed, even if the action throws. */
+async function withDialogGuard(tab: chrome.tabs.Tab, params: any, ttlMs: number, run: () => Promise<any>): Promise<any> {
+  const mode = params.onDialog === "accept" || params.onDialog === "dismiss" ? (params.onDialog as "accept" | "dismiss") : null;
+  if (!mode) return run();
+  const nonce = newGuardNonce();
+  await armDialogGuard(tab, nonce, mode, typeof params.promptText === "string" ? params.promptText : null, ttlMs);
+  let result: any;
+  try {
+    result = await run();
+  } catch (e) {
+    await collectGuardedDialogs(tab, nonce);
+    throw e;
+  }
+  const dialogs = await collectGuardedDialogs(tab, nonce);
+  if (dialogs.length && result && typeof result === "object") result = { ...result, dialogs };
+  return result;
+}
+
+async function withEffects(watch: ReturnType<typeof startEffectWatch>, result: any, succeeded: boolean): Promise<any> {
+  if (!succeeded || !result || typeof result !== "object") {
+    watch.stop();
+    return result;
+  }
+  try {
+    return { ...result, ...(await watch.finish()) };
+  } catch {
+    return result;
+  }
+}
+
+// Synthetic press_key in the frame that holds focus (all-frames probe of document.hasFocus()).
+async function pressKeySynthetic(tab: chrome.tabs.Tab, combo: string): Promise<any> {
+  const k = parseKeyCombo(combo);
+  if (!k.key) throw new Error(`press_key: can't parse key ${JSON.stringify(combo)}`);
+  let frameId = 0;
+  try {
+    const probes = await injectAllFrames(tab, () => {
+      let a: Element | null = document.activeElement;
+      while (a && (a as HTMLElement).shadowRoot && (a as HTMLElement).shadowRoot!.activeElement) a = (a as HTMLElement).shadowRoot!.activeElement;
+      return {
+        hasFocus: document.hasFocus(),
+        activeIsFrame: !!a && (a.tagName === "IFRAME" || a.tagName === "FRAME"),
+        activeIsBody: !a || a === document.body || a === document.documentElement,
+      };
+    });
+    const list: FocusProbe[] = [];
+    for (const r of probes) if (r?.result && typeof r.result === "object") list.push({ frameId: r.frameId, ...(r.result as any) });
+    frameId = pickFocusedFrame(list);
+  } catch {
+    frameId = 0;
+  }
+  const keyInit = { key: k.key, code: k.code, vk: k.vk, shift: k.shift, ctrl: k.ctrl, alt: k.alt, meta: k.meta };
+  const v = await actInFrame(tab, frameId, ["key", { keyInit } satisfies BbActParams]);
+  if (!v || v.notFound) throw new Error("press_key: the focused frame could not be scripted");
+  return { ...v, pressed: combo, ...(frameId !== 0 ? { frameId } : {}) };
+}
+
+// Trusted press_key via CDP Input.dispatchKeyEvent (isTrusted; Enter carries "\r" so it submits /
+// activates like a real key). Goes to whatever the page has focused.
+async function pressKeyTrusted(tab: chrome.tabs.Tab, combo: string): Promise<any> {
+  const tabId = tab.id!;
+  await ensureAttached(tabId);
+  const k = parseKeyCombo(combo);
+  if (!k.key) throw new Error(`press_key: can't parse key ${JSON.stringify(combo)}`);
+  const printable = k.key.length === 1 && !k.ctrl && !k.meta && !k.alt;
+  const text = k.key === "Enter" ? "\r" : printable ? (k.shift ? k.key.toUpperCase() : k.key) : undefined;
+  const common: any = { key: k.key, code: k.code, windowsVirtualKeyCode: k.vk, nativeVirtualKeyCode: k.vk, modifiers: k.modifiers };
+  const down: any = { ...common, type: text ? "keyDown" : "rawKeyDown" };
+  if (text) {
+    down.text = text;
+    down.unmodifiedText = k.key === "Enter" ? "\r" : k.key;
+  }
+  await cmd(tabId, "Input.dispatchKeyEvent", down);
+  await cmd(tabId, "Input.dispatchKeyEvent", { ...common, type: "keyUp" });
+  return { pressed: combo, trusted: true };
+}
+
+const HOVER_REVEAL_WAIT_MS = 1000;
 
 // Run a synthetic interaction with auto-wait actionability retry + trusted escalation.
 // Retries while the element is missing or transiently not-actionable (hidden/disabled) up to
@@ -2555,17 +4558,37 @@ async function withSnapshotIfRequested(tab: chrome.tabs.Tab, params: any, result
 async function interact(tab: chrome.tabs.Tab, action: string, ref: number | null, sel: string | null, value: string | null, params: any): Promise<any> {
   const timeoutMs = params.timeoutMs ?? 5000;
   const deadline = Date.now() + timeoutMs;
-  const args: any[] = [action, { ref, sel, value } satisfies BbActParams];
+  // Deep-snapshot refs are CDP node handles, not entries in the page's ref registry - the synthetic
+  // path can never resolve them, so say exactly what to do instead of "unknown ref".
+  if (ref != null && ref >= DEEP_REF_BASE) {
+    return {
+      notActionable: true,
+      reason: "deep-ref-needs-trusted",
+      detail:
+        action === "fill"
+          ? `ref ${ref} is from snapshot({deep:true}); deep refs only work with trusted actions. Take a plain snapshot() and fill by its ref, or use type with trusted:true.`
+          : `ref ${ref} is from snapshot({deep:true}); deep refs only work with trusted actions - pass trusted:true.`,
+      ref,
+    };
+  }
+  let args: any[] = [action, { ref, sel, value } satisfies BbActParams];
   let last: any = null;
   let ownerFrame: number | null = null; // once a frame owns the element, retry only there
+  let pickInfo: { matchCount?: number; note?: string } = {};
+  let skippedFrames = 0; // child frames that did not answer (not searched) on the latest all-frames pass
   for (;;) {
     if (ownerFrame == null) {
-      const r = await actAllFrames(tab, args);
+      const r = await actAllFrames(tab, [action, { ref, sel, value } satisfies BbActParams]);
       last = r.result;
       ownerFrame = r.frameId;
+      skippedFrames = r.skipped ?? 0;
+      if (r.nth != null) args = [action, { ref, sel, value, nth: r.nth } satisfies BbActParams];
+      if (r.matchCount != null) pickInfo = { matchCount: r.matchCount, note: r.note };
     } else {
       last = await actInFrame(tab, ownerFrame, args);
       if (last?.notFound) ownerFrame = null; // the frame lost the element - re-search all frames
+      // A selector whose chosen match is (still) hidden: re-locate next tick, a visible match may have appeared.
+      else if (sel != null && ref == null && last?.notActionable && last.reason === "hidden") ownerFrame = null;
     }
     // A ref that no frame can resolve will NOT recover by waiting: window.__bbRefs is only
     // repopulated by a new snapshot, and a detached node never reattaches. Retrying it just burned
@@ -2578,35 +4601,56 @@ async function interact(tab: chrome.tabs.Tab, action: string, ref: number | null
         notActionable: true,
         reason: stale ? "stale-ref" : "unknown-ref",
         detail: stale
-          ? "the element this ref pointed at is gone from the DOM (re-render/navigation) - take a new snapshot"
-          : "this ref is not in the page's ref registry (it was reset by a navigation, or a newer snapshot replaced it) - take a new snapshot",
+          ? staleRefMessage(ref, last)
+          : "this ref is not from the latest snapshot (taking any snapshot - snapshot or ax_snapshot - invalidates earlier refs; a navigation clears them too) - take a new snapshot",
         ref,
+        ...(stale && last.was ? { was: last.was, now: last.now } : {}),
       };
     }
     const retryable = last && (last.notFound || (last.notActionable && last.reason !== "covered"));
-    if (!retryable || Date.now() >= deadline) break;
+    if (!retryable || Date.now() >= deadline || isCancelled(params)) break; // server gave up: stop acting
+    // A 0x0 target inside a visible container is almost always hover-revealed (only a trusted hover
+    // shows it): waiting the full default 5s won't help, so give up after ~1s with the hover hint.
+    if (last.hoverReveal && params.timeoutMs == null && Date.now() >= deadline - timeoutMs + HOVER_REVEAL_WAIT_MS) break;
     await sleep(150);
   }
+  // Selector disambiguation info rides along when the selector matched more than one element.
+  const withPick = (r: any) => (r && typeof r === "object" && (pickInfo.matchCount ?? 0) > 1 ? { ...r, matchCount: pickInfo.matchCount, note: pickInfo.note } : r);
   if (action === "click" && last?.notActionable && last.reason === "covered" && params.autoTrusted !== false && !params.noEscalate) {
     try {
-      const t = await trustedAction(tab.id!, "click", ref, sel);
-      return { ...t, via: "trusted", wasCovered: true, coveredBy: last.coveredBy };
-    } catch {
-      return last; // trusted also failed - report the covered state
+      // Escalation attaches the debugger: keep a hidden tab rendering for it (ref-counted, so nesting
+      // inside the click's own withLiveTab is fine) - CDP mouse input otherwise waits ~5s per event.
+      const t = await withLiveTab(tab, params, true, () => trustedAction(tab, "click", ref, sel));
+      return withPick({ ...t, via: "trusted", wasCovered: true, coveredBy: last.coveredBy });
+    } catch (e) {
+      // trusted also failed - report the covered state, and why escalation didn't help
+      return withPick({ ...last, escalationError: e instanceof Error ? e.message : String(e) });
     }
   }
-  if (last?.notFound) return { notActionable: true, reason: `not-found-after-${timeoutMs}ms`, ref, selector: sel };
-  return last;
+  if (last?.notFound) {
+    const out: any = { notActionable: true, reason: `not-found-after-${timeoutMs}ms`, ref, selector: sel };
+    if (skippedFrames) {
+      out.skippedFrames = skippedFrames;
+      out.detail = `${skippedFrames} child frame(s) did not respond within ${INJECT_CHILD_MS / 1000}s and were not searched - the target may be inside one of them (still loading?)`;
+    }
+    return out;
+  }
+  return withPick(last);
 }
 
 async function dispatch(method: string, params: any): Promise<any> {
   switch (method) {
     case "tabs_list": {
       const tabs = await chrome.tabs.query({});
+      // A tab frozen by a JS dialog is otherwise invisible until a tool times out on it.
+      const dlg = (t: chrome.tabs.Tab) => {
+        const d = t.id != null ? pendingDialogs.get(t.id) : undefined;
+        return d ? { dialog: { type: d.type, message: d.message } } : {};
+      };
       if (params?.short) {
-        return tabs.map((t) => ({ id: t.id, title: t.title, origin: safeOrigin(t.url), active: t.active }));
+        return tabs.map((t) => ({ id: t.id, title: t.title, origin: safeOrigin(t.url), active: t.active, ...dlg(t) }));
       }
-      return tabs.map((t) => ({ id: t.id, title: t.title, url: t.url, active: t.active, windowId: t.windowId, incognito: t.incognito }));
+      return tabs.map((t) => ({ id: t.id, title: t.title, url: t.url, active: t.active, windowId: t.windowId, incognito: t.incognito, ...dlg(t) }));
     }
 
     case "tab_new": {
@@ -2621,9 +4665,17 @@ async function dispatch(method: string, params: any): Promise<any> {
           tab = window.tabs[0];
         }
       } else tab = await chrome.tabs.create({ url: params.url });
-      await waitForComplete(tab.id!);
+      const load = startLoadWait(tab.id!, { waitUntil: parseWaitUntil(params.waitUntil), cancelKey: params });
+      const waited = await load.wait();
       const fresh = await chrome.tabs.get(tab.id!);
-      return { tabId: fresh.id, title: fresh.title, url: fresh.url, incognito: fresh.incognito };
+      return {
+        tabId: fresh.id,
+        title: fresh.title,
+        url: fresh.url,
+        incognito: fresh.incognito,
+        ...(waited.loadTimedOut ? { loadTimedOut: true } : {}),
+        ...(waited.dialog ? { dialog: waited.dialog } : {}),
+      };
     }
 
     case "tab_activate": {
@@ -2651,10 +4703,35 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "navigate": {
       const tab = await targetTab(params.tabId);
-      await chrome.tabs.update(tab.id!, { url: params.url });
-      await waitForComplete(tab.id!);
+      const before = tab.url;
+      // Listen BEFORE issuing the navigation so a fast load can't complete unseen.
+      const load = startLoadWait(tab.id!, { waitUntil: parseWaitUntil(params.waitUntil), cancelKey: params, targetUrl: params.url });
+      try {
+        await chrome.tabs.update(tab.id!, { url: params.url });
+      } catch (e) {
+        load.dispose();
+        throw e;
+      }
+      const waited = await load.wait();
       const fresh = await chrome.tabs.get(tab.id!);
-      return { tabId: fresh.id, title: fresh.title, url: fresh.url, incognito: fresh.incognito };
+      const out: any = { tabId: fresh.id, title: fresh.title, url: fresh.url, incognito: fresh.incognito };
+      if (waited.loadTimedOut) out.loadTimedOut = true;
+      const dialog = waited.dialog ?? pendingDialogs.get(tab.id!);
+      // A beforeunload ("Leave site?") dialog holds or cancels the navigation and the tab stays on the
+      // old page. Reporting plain success there had agents reasoning about a page that never loaded.
+      if (dialog) {
+        out.navigated = false;
+        out.dialog = dialog;
+        out.error =
+          `navigation is blocked by a JavaScript ${dialog.type} dialog ("${dialog.message.slice(0, 120)}") - ` +
+          `call handle_dialog (accept:true to leave the page, false to stay), then retry if needed`;
+      } else if (params.waitUntil !== "none" && fresh.url === before && !fresh.pendingUrl && !sameUrl(before, params.url)) {
+        out.navigated = false;
+        out.warning =
+          "the tab's URL did not change - a beforeunload ('Leave site?') dialog may have blocked the navigation " +
+          "(call handle_dialog), or the site redirected back to the same page";
+      }
+      return out;
     }
 
     case "get_page_text": {
@@ -2668,48 +4745,73 @@ async function dispatch(method: string, params: any): Promise<any> {
         if (r.frameId === 0) combined += v.text;
         else combined += `\n\n--- frame: ${v.url} ---\n${v.text}`;
       }
-      return { title: top?.title ?? tab.title, url: top?.url ?? tab.url, text: combined };
+      const out: any = { title: top?.title ?? tab.title, url: top?.url ?? tab.url, text: combined };
+      // Child frames that did not answer within INJECT_CHILD_MS: their text is missing from `text`.
+      if (results.skippedFrames?.length) out.skippedFrames = results.skippedFrames.map((f) => ({ frameId: f.frameId, url: f.url }));
+      return out;
     }
 
     case "snapshot": {
       const tab = await targetTab(params.tabId);
-      if (params.deep) return cdpDeepSnapshot(tab.id!);
-      return shallowSnapshot(tab);
+      // Visibility is probed alongside the snapshot (no added latency) and reported on it.
+      const vis = tabVisibility(tab);
+      const snap = params.deep ? await cdpDeepSnapshot(tab.id!, clampLimit(params.limit)) : await shallowSnapshot(tab, params);
+      const v = await vis;
+      if (v?.hidden && snap && typeof snap === "object") return { tabHidden: true, warning: HIDDEN_TAB_WARNING, ...snap };
+      return snap;
     }
 
     case "click": {
       const tab = await targetTab(params.tabId);
-      const result = params.trusted
-        ? { ...(await trustedAction(tab.id!, "click", params.ref, params.selector)), via: "trusted" }
-        : await interact(tab, "click", params.ref, params.selector, null, params);
+      // Guard TTL covers the auto-wait (timeoutMs) plus a possible trusted escalation (attach ~12s).
+      const result = await withDialogGuard(tab, params, (params.timeoutMs ?? 5_000) + 15_000, () =>
+        withLiveTab(tab, params, !!params.trusted, async () => {
+          const watch = startEffectWatch(tab);
+          let r: any;
+          try {
+            r = params.trusted
+              ? { ...(await trustedAction(tab, "click", params.ref ?? null, params.selector ?? null)), via: "trusted" }
+              : await interact(tab, "click", params.ref, params.selector, null, params);
+          } catch (e) {
+            watch.stop();
+            throw e;
+          }
+          return withEffects(watch, r, !!r?.clicked);
+        })
+      );
       return withSnapshotIfRequested(tab, params, result);
     }
 
     case "fill": {
       const tab = await targetTab(params.tabId);
-      const result = await interact(tab, "fill", params.ref, params.selector, params.value ?? null, params);
+      const result = await withLiveTab(tab, params, false, () => interact(tab, "fill", params.ref, params.selector, params.value ?? null, params));
       return withSnapshotIfRequested(tab, params, result);
     }
 
     case "hover": {
       const tab = await targetTab(params.tabId);
-      const result = params.trusted
-        ? await trustedAction(tab.id!, "hover", params.ref, params.selector)
-        : await interact(tab, "hover", params.ref, params.selector, null, params);
+      const result = await withLiveTab(tab, params, !!params.trusted, () =>
+        params.trusted
+          ? trustedAction(tab, "hover", params.ref ?? null, params.selector ?? null)
+          : interact(tab, "hover", params.ref, params.selector, null, params)
+      );
       return withSnapshotIfRequested(tab, params, result);
     }
 
     case "type": {
       const tab = await targetTab(params.tabId);
-      const result = params.trusted
-        ? await trustedAction(tab.id!, "type", params.ref, params.selector, params.text)
-        : await interact(tab, "type", params.ref, params.selector, params.text ?? null, params);
+      const result = await withLiveTab(tab, params, !!params.trusted, () =>
+        params.trusted
+          ? trustedAction(tab, "type", params.ref ?? null, params.selector ?? null, params.text)
+          : interact(tab, "type", params.ref, params.selector, params.text ?? null, params)
+      );
       return withSnapshotIfRequested(tab, params, result);
     }
 
     case "input": {
       const tab = await targetTab(params.tabId);
-      return cdpInput(tab.id!, params);
+      // Always trusted (CDP Input): keep a hidden tab rendering, or every mouse move waits ~5s for a frame.
+      return withLiveTab(tab, params, true, () => cdpInput(tab.id!, params));
     }
 
     case "file_upload": {
@@ -2765,10 +4867,63 @@ async function dispatch(method: string, params: any): Promise<any> {
     }
 
     case "go_back":
-      return navByHistory(await targetTab(params.tabId), "back");
+      return navByHistory(await targetTab(params.tabId), "back", params);
 
     case "go_forward":
-      return navByHistory(await targetTab(params.tabId), "forward");
+      return navByHistory(await targetTab(params.tabId), "forward", params);
+
+    case "handle_dialog": {
+      const tab = await targetTab(params.tabId);
+      const tabId = tab.id!;
+      const known = pendingDialogs.get(tabId);
+      const accept = params.accept !== false;
+      // Do NOT use ensureAttached here: its DOM.enable needs the renderer's main thread, which an open
+      // alert/confirm/prompt is blocking, so it hangs until the attach timeout - exactly when this tool is
+      // needed. Answering a dialog is handled in the browser process, so a bare attach is enough. Page.enable
+      // is attempted briefly (it also re-announces an already-open dialog) but its failure is not fatal.
+      let tempAttach = false;
+      if (!sessions.get(tabId)) {
+        if (attaching.has(tabId)) await attaching.get(tabId)!.catch(() => {});
+        if (!sessions.get(tabId)) {
+          try {
+            await withTimeout(attach(tabId), 5_000, "debugger attach for handle_dialog");
+            tempAttach = true;
+          } catch (e) {
+            const m = e instanceof Error ? e.message : String(e);
+            if (!/already attached/i.test(m)) throw e; // a stale attach of ours is fine: just send the command
+          }
+          await cmd(tabId, "Page.enable", undefined, 2_000).catch(() => {});
+        }
+      }
+      try {
+        await cmd(
+          tabId,
+          "Page.handleJavaScriptDialog",
+          { accept, ...(typeof params.promptText === "string" ? { promptText: params.promptText } : {}) },
+          5_000
+        );
+      } catch (e) {
+        const m = e instanceof Error ? e.message : String(e);
+        if (/no dialog/i.test(m)) {
+          pendingDialogs.delete(tabId);
+          return {
+            handled: false,
+            tabId,
+            message:
+              `Chrome reports no dialog it can answer on tab ${tabId}. Either none is open, or it opened before ` +
+              `the debugger was attached - Chrome only lets a debugger answer dialogs that open while it is ` +
+              `attached. If the tab is stuck behind a dialog, the user has to click it in Chrome. To avoid this, ` +
+              `pass onDialog:"accept"|"dismiss" to click/press_key so the action answers its own dialogs.`,
+          };
+        }
+        throw e;
+      } finally {
+        // A temporary bare attach must not linger: no session tracks it (banner + reconcile would detach it later anyway).
+        if (tempAttach) await new Promise<void>((r) => chrome.debugger.detach({ tabId }, () => { void chrome.runtime.lastError; r(); }));
+      }
+      pendingDialogs.delete(tabId);
+      return { handled: true, tabId, accepted: accept, type: known?.type, message: known?.message, url: known?.url };
+    }
 
     // ---- chrome.debugger (CDP) tools ----
 
@@ -3019,7 +5174,7 @@ async function dispatch(method: string, params: any): Promise<any> {
         const s = sessions.get(params.tabId);
         const detach = lastDetach.get(params.tabId);
         return s
-          ? { tabId: params.tabId, attached: true, capturing: s.netOn, bufferedRequests: s.net.size, deepRefs: s.refNodes.size, idleMs: Date.now() - s.lastUsedAt }
+          ? { tabId: params.tabId, attached: true, capturing: s.netOn, bufferedRequests: s.net.size, deepRefs: s.refNodes.size, idleMs: Date.now() - s.lastUsedAt, emulating: emulationState(params.tabId) }
           : { tabId: params.tabId, attached: false, lastDetach: detach };
       }
       return {
@@ -3028,6 +5183,7 @@ async function dispatch(method: string, params: any): Promise<any> {
           capturing: s.netOn,
           bufferedRequests: s.net.size,
           idleMs: Date.now() - s.lastUsedAt,
+          emulating: emulationState(tabId),
         })),
         // Why a capture stopped, when it stopped on its own. "canceled_by_user" = the human dismissed
         // the debugging banner; "replaced_with_devtools" = they opened DevTools on that tab.
@@ -3037,40 +5193,72 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "press_key": {
       const tab = await targetTab(params.tabId);
-      const result = await inject(
-        tab,
-        (key: string) => {
-          const el = (document.activeElement as HTMLElement) ?? document.body;
-          const opts = { key, bubbles: true, cancelable: true };
-          el.dispatchEvent(new KeyboardEvent("keydown", opts));
-          el.dispatchEvent(new KeyboardEvent("keyup", opts));
-          if (key === "Enter") {
-            const form = (el as HTMLInputElement).form;
-            if (form) form.requestSubmit();
+      const result = await withDialogGuard(tab, params, 15_000, () =>
+        withLiveTab(tab, params, !!params.trusted, async () => {
+          const watch = startEffectWatch(tab);
+          let r: any;
+          try {
+            // synthetic: dispatched (deferred) in the frame holding focus; Enter submits only when not
+            // preventDefault()ed, Tab moves focus. trusted: real CDP key events.
+            r = params.trusted ? await pressKeyTrusted(tab, String(params.key ?? "")) : await pressKeySynthetic(tab, String(params.key ?? ""));
+          } catch (e) {
+            watch.stop();
+            throw e;
           }
-          return { pressed: key, target: el.tagName.toLowerCase() };
-        },
-        [params.key]
+          return withEffects(watch, r, true);
+        })
       );
       return withSnapshotIfRequested(tab, params, result);
     }
 
     case "scroll": {
       const tab = await targetTab(params.tabId);
-      const result = await inject(
-        tab,
-        (dy: number | undefined, sel: string | undefined) => {
-          if (sel) {
-            const el = document.querySelector(sel);
-            if (!el) return { error: `Element not found: ${sel}` };
-            el.scrollIntoView({ block: "center", behavior: "instant" as ScrollBehavior });
-            return { scrolledTo: sel };
-          }
-          window.scrollBy(0, dy ?? 600);
-          return { scrolledBy: dy ?? 600, scrollY: window.scrollY };
-        },
-        [params.dy, params.selector]
+      assertScriptable(tab);
+      // Resolve the frame that owns the target: a ref routes to its issuing frame; a selector is
+      // located across frames and one match is picked (same rules as click/fill); else the top frame.
+      let frameId = 0;
+      let nth: number | null = null;
+      let pickNote: string | undefined;
+      if (params.ref != null) {
+        const owner = ownerFrameForRef(tab.id!, params.ref);
+        if (owner === null) throw new Error(`ref ${params.ref} is not from the latest snapshot (taking any snapshot invalidates earlier refs) - take a fresh snapshot`);
+        if (owner !== undefined) frameId = owner;
+      } else if (params.selector) {
+        const pick = await locateOne(tab, params.selector);
+        if (!pick.chosen)
+          throw new Error(
+            `Element not found in any frame: ${params.selector}` +
+              (pick.skipped ? ` (${pick.skipped} child frame(s) did not respond within ${INJECT_CHILD_MS / 1000}s and were not searched)` : "")
+          );
+        frameId = pick.chosen.frameId;
+        nth = pick.chosen.index;
+        pickNote = pick.note;
+      }
+      const scrollMs = frameId === 0 ? INJECT_TOP_MS : INJECT_CHILD_MS + 2_000;
+      const res = await withTimeout(
+        chrome.scripting.executeScript({
+          target: { tabId: tab.id!, frameIds: [frameId] },
+          func: bbScroll as any,
+          args: clean([
+            {
+              ref: params.ref ?? null,
+              sel: params.ref != null ? null : params.selector ?? null,
+              nth,
+              dx: params.dx ?? null,
+              dy: params.dy ?? null,
+              direction: params.direction ?? null,
+              amount: params.amount ?? null,
+            },
+          ]),
+        }),
+        scrollMs,
+        () => tabTimeoutMsg(tab.id, scrollMs, frameId === 0 ? "scroll" : `scroll (frame ${frameId})`)
       );
+      const result: any = res?.[0]?.result;
+      if (!result || typeof result !== "object") throw new Error("scroll: no result from the page (frame navigating?)");
+      if (typeof result.error === "string") throw new Error(result.error);
+      if (frameId !== 0) result.frameId = frameId;
+      if (pickNote) result.note = pickNote;
       return withSnapshotIfRequested(tab, params, result);
     }
 
@@ -3141,6 +5329,9 @@ async function dispatch(method: string, params: any): Promise<any> {
         // respawn lost the queue timestamps. Retry once through the queue, then fall back to CDP -
         // Page.captureScreenshot has no quota and targets the tab directly, so a screenshot should
         // never hard-fail just because the window was busy a moment ago.
+        // A grab that hit the queue's hard timeout (wedged / dialog-frozen tab) goes straight to CDP:
+        // retrying it through the same queue would only wait out another timeout.
+        if (isTimeout(e)) return cdpScreenshot(tab, { ...params, format: fmt });
         if (!/quota|readback|Failed to capture|Cannot access contents/i.test(msg)) throw e;
         try {
           shot = await serializeCapture(tab.windowId!, grab);
@@ -3155,13 +5346,34 @@ async function dispatch(method: string, params: any): Promise<any> {
       const tab = await targetTab(params.tabId);
       // Force the CDP path (Runtime.evaluate) - bypasses CSP unsafe-eval; shows the debugger banner.
       if (params.cdp) return cdpEvaluate(tab.id!, params.code, params.awaitPromise ?? true);
+      // The in-page path awaits a returned thenable too (like the CDP path's awaitPromise), bounded a
+      // little inside the server's own timeout so a never-settling promise reports instead of hanging.
+      const awaitP = params.awaitPromise !== false;
+      const budget = Math.max(1_000, (typeof params.timeoutMs === "number" ? params.timeoutMs : 30_000) - 1_500);
       try {
         return await inject(
         tab,
-        (code: string) => {
+        async (code: string, awaitP: boolean, ms: number) => {
           try {
             // eslint-disable-next-line no-eval
-            const value = (0, eval)(code);
+            let value = (0, eval)(code);
+            if (awaitP && value != null && typeof value.then === "function") {
+              const TIMEOUT = {};
+              let timer: any;
+              try {
+                value = await Promise.race([
+                  Promise.resolve(value),
+                  new Promise((res) => {
+                    timer = setTimeout(() => res(TIMEOUT), ms);
+                  }),
+                ]);
+              } catch (e) {
+                return { error: `Promise rejected: ${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}` };
+              } finally {
+                clearTimeout(timer);
+              }
+              if (value === TIMEOUT) return { error: `eval_js: the returned Promise did not settle within ${ms}ms (raise timeoutMs, or pass awaitPromise:false)` };
+            }
             let out: string;
             try {
               out = typeof value === "object" && value !== null ? JSON.stringify(value) : String(value);
@@ -3173,8 +5385,9 @@ async function dispatch(method: string, params: any): Promise<any> {
             return { error: String(e) };
           }
         },
-        [params.code],
-        "MAIN"
+        [params.code, awaitP, budget],
+        "MAIN",
+        { timeoutMs: Math.max(INJECT_TOP_MS, budget + 1_000) }
       );
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
@@ -3197,33 +5410,94 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "wait_for": {
       const tab = await targetTab(params.tabId);
-      const timeoutMs = params.timeoutMs ?? (params.selector ? 10_000 : 1_000);
-      if (!params.selector) {
-        await sleep(timeoutMs);
-        return { slept: timeoutMs };
+      const hasTarget = !!(params.selector || params.text || params.role);
+      if (!hasTarget) {
+        // No target: a plain sleep of timeoutMs (default 1000ms).
+        const ms = params.timeoutMs ?? 1_000;
+        await sleep(ms);
+        return { slept: ms };
       }
-      const deadline = Date.now() + timeoutMs;
+      assertScriptable(tab);
+      const timeoutMs = params.timeoutMs ?? 10_000;
+      const state: string = params.state ?? "visible";
+      if (!["attached", "visible", "hidden", "detached"].includes(state)) throw new Error(`wait_for: unknown state "${state}" (attached|visible|hidden|detached)`);
+      if (params.selector) await inject(tab, bbValidateSelector, [params.selector]); // throws a clear syntax error
+      const spec = { sel: params.selector ?? null, text: params.text ?? null, role: params.role ?? null, name: params.name ?? null, state };
+      const what = [params.selector && `selector ${params.selector}`, params.role && `role=${params.role}${params.name ? ` name~"${params.name}"` : ""}`, params.text && `text "${params.text}"`]
+        .filter(Boolean)
+        .join(" + ");
+      const started = Date.now();
+      const deadline = started + timeoutMs;
+      const positive = state === "visible" || state === "attached";
       let lastErr: string | null = null;
+      const skippedFrames = new Set<number>();
+      // Each round probes every frame concurrently for a slice (<=1.5s, re-listing frames between
+      // slices so new iframes / navigations are picked up). In-page probes resolve the moment the
+      // condition holds. A probe that fails because the page is mid-navigation is just "not yet".
+      // Every probe is bounded: a frame that never reaches document_idle (a wedged ad/embed) or a tab
+      // behind a JS dialog would otherwise never answer and stall the loop until the hub timeout.
       while (Date.now() < deadline) {
-        // A poll that lands while the page is committing a navigation throws ("Frame with ID 0 was
-        // removed") - which is the single most common way to call wait_for: click a link, then wait
-        // for the next page's element. Treating that as a hard failure made the tool fail ~7 times
-        // in 12 under concurrent load, telling the agent its step broke when the page was merely
-        // still loading. A failed poll is just "not there yet"; only the deadline is fatal, and the
-        // last error rides along so a genuinely dead tab still reports why.
-        try {
-          const found = await inject(tab, (sel: string) => !!document.querySelector(sel), [params.selector]);
-          if (found) return { found: true, selector: params.selector };
-          lastErr = null;
-        } catch (e) {
-          lastErr = e instanceof Error ? e.message : String(e);
+        const sliceEnd = Math.min(deadline, Date.now() + 1_500);
+        const ids = await frameList(tab);
+        const probe = (frameId: number) =>
+          withTimeout(
+            chrome.scripting.executeScript({
+              target: { tabId: tab.id!, frameIds: [frameId] },
+              func: bbWaitProbe as any,
+              args: clean([spec, sliceEnd]),
+            }),
+            frameId === 0 ? Math.max(INJECT_TOP_MS, sliceEnd - Date.now() + 1_000) : sliceEnd - Date.now() + 1_000,
+            () => tabTimeoutMsg(tab.id, INJECT_TOP_MS, "wait_for")
+          )
+            .then((r) => ({ frameId, v: r?.[0]?.result as any }))
+            .catch((e) => {
+              if (frameId === 0) {
+                if (isTimeout(e)) throw e; // the top frame not answering at all is a hung tab, not "not yet"
+                lastErr = e instanceof Error ? e.message : String(e);
+              } else if (isTimeout(e)) skippedFrames.add(frameId);
+              return { frameId, v: null as any };
+            });
+        if (positive) {
+          // First frame that satisfies wins; otherwise wait for every probe's slice to end.
+          const hit = await new Promise<{ frameId: number; v: any } | null>((resolve, reject) => {
+            let pending = ids.length;
+            if (!pending) resolve(null);
+            for (const id of ids) {
+              probe(id).then(
+                (r) => {
+                  if (r.v && typeof r.v.error === "string") lastErr = r.v.error;
+                  if (r.v?.satisfied) resolve(r);
+                  if (--pending === 0) resolve(null);
+                },
+                reject // top frame timed out: surface the actionable hung-tab error
+              );
+            }
+          });
+          if (hit) {
+            const out: any = { found: true, state, elapsedMs: Date.now() - started, matchCount: hit.v.count };
+            if (skippedFrames.size) out.skippedFrames = [...skippedFrames];
+            if (hit.frameId !== 0) out.frameId = hit.frameId;
+            if (hit.v.tag) out.tag = hit.v.tag;
+            if (hit.v.name) out.name = hit.v.name;
+            if (hit.v.ref != null) out.ref = hit.v.ref;
+            if (params.selector) out.selector = params.selector;
+            return out;
+          }
+        } else {
+          // hidden/detached must hold in EVERY frame that answered (and the top frame must answer).
+          const rs = await Promise.all(ids.map(probe));
+          const answered = rs.filter((r) => r.v && typeof r.v === "object" && typeof r.v.error !== "string");
+          for (const r of rs) if (r.v && typeof r.v.error === "string") lastErr = r.v.error;
+          if (answered.some((r) => r.frameId === 0) && answered.every((r) => r.v.satisfied)) {
+            const out: any = { found: true, state, elapsedMs: Date.now() - started };
+            if (skippedFrames.size) out.skippedFrames = [...skippedFrames];
+            return out;
+          }
         }
-        await sleep(100); // 250ms meant ~125ms of average overshoot past the element appearing
+        if (Date.now() < deadline) await sleep(50);
       }
-      throw new Error(
-        `Timed out after ${timeoutMs}ms waiting for selector: ${params.selector}` +
-          (lastErr ? ` (last poll failed: ${lastErr})` : "")
-      );
+      const skippedNote = skippedFrames.size ? `; ${skippedFrames.size} child frame(s) did not respond and were not checked` : "";
+      throw new Error(`Timed out after ${timeoutMs}ms waiting for ${what} to be ${state}` + (lastErr ? ` (last probe error: ${lastErr})` : "") + skippedNote);
     }
 
     case "download_resource": {
@@ -3256,6 +5530,10 @@ async function dispatch(method: string, params: any): Promise<any> {
         mime: item.mime,
         error: item.error,
         exists: item.exists,
+        // A dangerous-file verdict or a pause holds a download indefinitely; the server fails fast on them.
+        danger: item.danger,
+        paused: item.paused,
+        canResume: item.canResume,
       };
     }
 
@@ -3270,10 +5548,14 @@ async function dispatch(method: string, params: any): Promise<any> {
       const s = await ensureAttached(tab.id!);
       const patterns = params.patterns ?? defaultFetchPatterns(params.stage);
       s.interceptRules = Array.isArray(params.rules) ? params.rules : [];
-      s.paused.clear();
+      // A second intercept_start must not just forget requests the previous one is holding: the page's
+      // fetches would hang forever. Release them unmodified first (as intercept_stop does).
+      const released = await releasePaused(tab.id!, s);
       await cmd(tab.id!, "Fetch.enable", { patterns });
       s.interceptOn = true;
-      return { intercepting: true, tabId: tab.id!, patterns, rules: s.interceptRules.length };
+      const out: any = { intercepting: true, tabId: tab.id!, patterns, rules: s.interceptRules.length };
+      if (released) out.releasedPaused = released;
+      return out;
     }
 
     case "intercept_pending": {
@@ -3334,14 +5616,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       if (s) {
         s.interceptOn = false;
         s.interceptRules = [];
-        for (const e of s.paused.values()) {
-          try {
-            await cmd(tab.id!, e.stage === "Response" ? "Fetch.continueResponse" : "Fetch.continueRequest", { requestId: e.requestId });
-          } catch {
-            /* already gone */
-          }
-        }
-        s.paused.clear();
+        await releasePaused(tab.id!, s);
         try {
           await cmd(tab.id!, "Fetch.disable");
         } catch {
@@ -3656,7 +5931,7 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "ax_snapshot": {
       const tab = await targetTab(params.tabId);
-      return axSnapshot(tab);
+      return axSnapshot(tab, params);
     }
 
     // ---- environment emulation (CDP; shows the debugger banner). Thin: the server resolved presets
@@ -3730,10 +6005,20 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   lastDetach.set(source.tabId, { reason: String(reason ?? "unknown"), at: Date.now() });
   finalizeCapture(source.tabId); // flush + close the sink (user closed banner / DevTools opened / tab gone)
   sessions.delete(source.tabId);
+  forgetEmulation(source.tabId);
+  keepAlives.delete(source.tabId); // focus emulation died with the session; holders release a stale entry harmlessly
+  pendingDialogs.delete(source.tabId);
+});
+// A committed top-frame navigation means any dialog the old document showed is gone.
+chrome.webNavigation.onCommitted.addListener((d) => {
+  if (d.frameId === 0) pendingDialogs.delete(d.tabId);
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
+  pendingDialogs.delete(tabId);
   finalizeCapture(tabId);
   sessions.delete(tabId);
+  forgetEmulation(tabId);
+  keepAlives.delete(tabId);
   const rec = sessionRecordings.get(tabId);
   if (rec) {
     sessionRecordings.delete(tabId);
@@ -3821,24 +6106,9 @@ chrome.tabs.onActivated.addListener((info) => {
     );
   });
 });
-// SPA route changes seen from the browser side, belt-and-braces with the page's own history patch
-// (which only exists when console:true registered the MAIN-world script).
-chrome.webNavigation.onCommitted.addListener((d) => {
-  if (d.frameId !== 0) return;
-  void ready().then(() => {
-    const g = watchForTab(d.tabId);
-    if (!g || g.consoleMode === "off") return;
-    // A fresh document has no shim: it is injected as an inline function, not a registered script.
-    chrome.scripting
-      .executeScript({
-        target: { tabId: d.tabId, allFrames: true },
-        func: bbWatchMainShim,
-        args: [g.consoleMode],
-        world: "MAIN",
-      } as chrome.scripting.ScriptInjection<any, any>)
-      .catch(() => undefined);
-  });
-});
+// (The MAIN-world shim for a fresh document is injected from the bb-watch-hello handshake, paired
+// with the secret that document's isolated watcher chose - see injectWatchMain.)
+// SPA route changes seen from the browser side, belt-and-braces with the page's own history patch.
 chrome.webNavigation.onHistoryStateUpdated.addListener((d) => {
   if (d.frameId !== 0) return;
   void ready().then(() => {
@@ -3856,14 +6126,18 @@ chrome.downloads.onDeterminingFilename.addListener((_item, suggest) => {
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && (changes.token || changes.port)) {
     ws?.close();
+    pendingWs?.close();
     reconnectDelay = 1_000;
+    replacedUntil = 0;
     connect();
   }
 });
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.cmd === "reconnect") {
     ws?.close();
+    pendingWs?.close();
     reconnectDelay = 1_000;
+    replacedUntil = 0;
     connect();
     sendResponse({ ok: true });
     return false;
@@ -3888,6 +6162,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const tabId = sender.tab?.id;
     void ready().then(() => {
       const g = tabId != null ? watchForTab(tabId) : undefined;
+      if (g && g.consoleMode !== "off" && tabId != null && sender.frameId != null && typeof msg.mainNonce === "string" && !msg.mainPaired) {
+        void injectWatchMain(tabId, [{ frameId: sender.frameId, nonce: msg.mainNonce }], g.consoleMode).then((main) => {
+          if (sender.frameId === 0) lastInject.set(tabId, { isolated: "ok", main, at: Date.now() });
+        });
+      }
       sendResponse({ ok: true, armed: !!g, watchId: g?.watchId, consoleMode: g?.consoleMode });
     });
     return true; // async: hydration may still be in flight right after an SW restart

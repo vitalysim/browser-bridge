@@ -48,7 +48,11 @@ export interface Truncation {
   truncated: boolean;
 }
 
-const HINT = "narrow with limit/filter";
+// The default hint must be TRUE for any tool: most tools have no limit/filter/paging parameter, and
+// telling an agent to use one it doesn't have sends it on a retry loop. Tools that DO have a way to
+// ask for less pass their own hint (see textResult(value, hint) in tools.ts).
+export const DEFAULT_TRUNCATION_HINT =
+  "result trimmed to fit the response budget; if this tool has a narrowing/paging parameter, re-request a smaller slice";
 
 // Largest k in [0,n] for which build(k) fits maxChars, by binary search. Returns null when even the
 // zero-item envelope is over budget (the caller then falls back to a prefix preview). `build` may
@@ -68,7 +72,7 @@ function fitArray(build: (k: number) => string, n: number, maxChars: number): st
 // Structure-aware trim: a top-level array, or the largest array-valued property of an object, has its
 // trailing items dropped until the whole thing fits. Returns valid JSON, or null when there is no
 // array to trim (the caller falls back to a prefix preview).
-function truncateArrayPayload(value: unknown, maxChars: number): string | null {
+function truncateArrayPayload(value: unknown, maxChars: number, HINT: string): string | null {
   if (Array.isArray(value)) {
     return fitArray(
       (k) =>
@@ -112,7 +116,7 @@ function truncateArrayPayload(value: unknown, maxChars: number): string | null {
  *  - any other oversized JSON falls back to a valid-JSON wrapper around a prefix preview;
  *  - a plain oversized string (not JSON to begin with) gets a clean cut plus an explicit flag.
  */
-export function truncateForText(value: unknown, maxChars: number): Truncation {
+export function truncateForText(value: unknown, maxChars: number, hint: string = DEFAULT_TRUNCATION_HINT): Truncation {
   if (typeof value === "string") {
     if (value.length <= maxChars) return { text: value, truncated: false };
     const keep = Math.max(0, maxChars - 60);
@@ -123,16 +127,89 @@ export function truncateForText(value: unknown, maxChars: number): Truncation {
   const full = JSON.stringify(value);
   if (full.length <= maxChars) return { text: full, truncated: false };
 
-  const arrayCut = truncateArrayPayload(value, maxChars);
+  const arrayCut = truncateArrayPayload(value, maxChars, hint);
   if (arrayCut) return { text: arrayCut, truncated: true };
 
-  const budget = Math.max(0, maxChars - 200);
-  const text = JSON.stringify({
-    truncated: true,
-    bytes: full.length,
-    hint: HINT,
-    note: "result too large; showing a prefix of the JSON",
-    preview: full.slice(0, budget),
-  });
+  // Keep the tab the call actually ran on: when tabId was omitted the extension picked the active tab,
+  // and the prefix preview would otherwise cut that information off.
+  const rawTab = value && typeof value === "object" && !Array.isArray(value) ? (value as any).tabId : undefined;
+  const tabId = typeof rawTab === "number" ? rawTab : undefined;
+  const build = (n: number) =>
+    JSON.stringify({
+      ...(tabId !== undefined ? { tabId } : {}),
+      truncated: true,
+      bytes: full.length,
+      hint,
+      note: "result too large; showing a prefix of the JSON",
+      preview: full.slice(0, n),
+    });
+  // The envelope (hint length varies) and the re-escaping of the preview both cost characters, so
+  // size the preview from the actual overhead and shrink until it fits.
+  let n = Math.max(0, maxChars - build(0).length);
+  let text = build(n);
+  while (text.length > maxChars && n > 0) {
+    n = Math.max(0, n - Math.max(1, text.length - maxChars));
+    text = build(n);
+  }
   return { text, truncated: true };
+}
+
+// ---- step outcome (browser_batch halting + per-call logging) ----
+
+export interface StepFailure {
+  outcome: "error" | "notActionable";
+  reason: string;
+}
+
+/** The first text block of an MCP tool result ("" when there is none). */
+export function resultText(out: any): string {
+  const content = Array.isArray(out?.content) ? out.content : [];
+  return content.find((c: any) => c?.type === "text")?.text ?? "";
+}
+
+/** The first text block parsed as a top-level JSON object, or null (array, plain text, invalid JSON). */
+export function resultObject(out: any): Record<string, any> | null {
+  const t = resultText(out).trimStart();
+  if (!t.startsWith("{")) return null;
+  try {
+    const v = JSON.parse(t);
+    return v && typeof v === "object" && !Array.isArray(v) ? v : null;
+  } catch {
+    return null; // plain text that happens to start with "{": not something we can judge
+  }
+}
+
+/**
+ * Decide whether a tool's MCP result is a failure, even when it was returned normally. click/fill/
+ * hover/type report {notActionable, reason} or {filled:false} as an ordinary result, so a batch that
+ * only stopped on isError would keep going and type into the wrong place. Returns null for success.
+ * Only the top-level JSON object is inspected; a non-JSON text result is a success.
+ */
+export function stepFailure(out: any, parsed: any = resultObject(out)): StepFailure | null {
+  if (out?.isError) return { outcome: "error", reason: resultText(out) || "tool returned an error" };
+  const v = parsed;
+  if (!v) return null;
+  if (v.notActionable === true) return { outcome: "notActionable", reason: `notActionable: ${v.reason ?? "unknown reason"}` };
+  if (v.filled === false) return { outcome: "notActionable", reason: `filled:false${v.reason ? ` (${v.reason})` : ""}` };
+  if (v.error !== undefined && v.error !== null && v.error !== false && v.error !== "") {
+    return { outcome: "error", reason: typeof v.error === "string" ? v.error : JSON.stringify(v.error) };
+  }
+  return null;
+}
+
+// ---- actionable error messages ----
+
+export const NOT_CONNECTED_MESSAGE =
+  "The browser extension is reconnecting or not connected; retry in 2-3 seconds. If it persists, make sure " +
+  "Chrome is running, the Browser Bridge extension is loaded, and the token in the extension options matches " +
+  "the server token (bridge_status shows the connection state).";
+
+/** A generic extension timeout plus the likely causes and what to try next. */
+export function explainTimeout(method: string, timeoutMs: number): string {
+  return (
+    `Extension call '${method}' timed out after ${timeoutMs}ms. Likely causes: the tab may be showing a ` +
+    "JavaScript dialog (try handle_dialog; if it reports none, the user must close it in Chrome - pass onDialog to " +
+    "click/press_key to avoid this), still loading, or hung; try screenshot or tabs_list to see its state, " +
+    "then retry or pass an explicit tabId."
+  );
 }
