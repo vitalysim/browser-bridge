@@ -1,0 +1,15 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>late confirm</title></head>
+<body>
+<h1>Button enabled after ~4s, then asks confirm()</h1>
+<button id="del" disabled>Delete project</button>
+<p id="out">waiting</p>
+<script>
+  window.__answer = null;
+  setTimeout(() => { document.getElementById("del").disabled = false; }, 4000);
+  document.getElementById("del").addEventListener("click", () => {
+    window.__answer = confirm("Delete the project for good?");
+    document.getElementById("out").textContent = "answered: " + window.__answer;
+  });
+</script>
+</body></html>

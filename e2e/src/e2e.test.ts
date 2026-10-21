@@ -331,3 +331,74 @@ scenario("batch-halts-on-notActionable", async (c) => {
   c.expect(after === "", `fill after a notActionable click still ran (#after=${JSON.stringify(after)})`);
   c.expect(typeof r.json?.stoppedAt === "number" && (r.json?.executed ?? 2) < 2, `batch did not report stopping at the click: ${trim(r.text, 160)}`);
 });
+
+// ---- regressions found in review of the merged fixes ----------------------------------------------
+
+// wait_for + scroll must stay bounded when a child frame never reaches document_idle.
+scenario("wait-for-text-with-hung-iframe", async (c) => {
+  const tabId = await c.open("slow-iframe-late.html");
+  const r = await c.call("wait_for", { text: "Report ready", timeoutMs: 9_000, tabId }, { timeoutMs: 14_000, allowTimeout: true });
+  c.note(`wait_for -> ${r.timedOut ? "HUNG" : trim(r.text, 160)} in ${r.ms}ms`);
+  c.expect(!r.timedOut && !r.isError, `wait_for did not resolve: ${trim(r.text, 160)}`);
+  c.expect(r.ms >= 1_000 && r.ms < 7_000, `wait_for took ${r.ms}ms (text appears at ~2s)`);
+});
+
+scenario("scroll-with-hung-iframe", async (c) => {
+  const tabId = await c.open("slow-iframe-late.html");
+  const r = await c.call("scroll", { selector: "#pane", direction: "down", tabId }, { timeoutMs: 12_000, allowTimeout: true });
+  c.note(`scroll -> ${r.timedOut ? "HUNG" : trim(r.text, 160)} in ${r.ms}ms`);
+  c.expect(!r.timedOut && !r.isError, `scroll failed: ${trim(r.text, 160)}`);
+  c.expect(r.ms < 5_000, `scroll took ${r.ms}ms`);
+  c.expect(Number(await c.evalJs(tabId, "document.getElementById('pane').scrollTop")) > 0, "the pane did not scroll");
+});
+
+// A portal modal appended after >6000 interactive elements must still get a ref.
+scenario("huge-page-portal-modal", async (c) => {
+  const tabId = await c.open("huge-modal.html");
+  const { elements, json } = await c.snapshot(tabId, { timeoutMs: 20_000 });
+  const confirm = findEl(elements, (e) => /^Confirm$/.test(String(e.name ?? e.label ?? "").trim()));
+  c.note(`snapshot: count=${json?.count} total=${json?.total} truncated=${json?.truncated} modal=${json?.modal}`);
+  c.expect(!!confirm, "the modal's Confirm button has no ref on a 7000-element page");
+  const mo = await c.call("snapshot", { tabId, modalOnly: true });
+  const moEls = (mo.json?.elements ?? []) as any[];
+  c.expect(moEls.some((e) => /^Confirm$/.test(String(e.name ?? "").trim())), `modalOnly snapshot lacks Confirm (${moEls.length} elements)`);
+  if (confirm) {
+    await c.call("click", { ref: confirm.ref, tabId });
+    c.expect((await c.evalJs(tabId, "window.__confirmed")) === true, "clicking Confirm did not run its handler");
+  }
+});
+
+// The dialog guard must outlive the action's auto-wait: the button only becomes clickable at ~4s.
+scenario("on-dialog-after-auto-wait", async (c) => {
+  const tabId = await c.open("late-confirm.html");
+  const { elements } = await c.snapshot(tabId);
+  const btn = findEl(elements, byLabel(/Delete project/));
+  if (!btn) throw new Error("button not in snapshot");
+  const before = c.h.seenDialogs.length;
+  const r = await c.call("click", { ref: btn.ref, tabId, onDialog: "accept", timeoutMs: 8_000 }, { timeoutMs: 20_000, allowTimeout: true });
+  const shown = (r.json?.dialogs ?? []) as any[];
+  c.note(`click -> ${trim(r.text, 200)} in ${r.ms}ms`);
+  c.expect(!r.timedOut && !r.isError && r.json?.clicked === true, `click failed: ${trim(r.text, 160)}`);
+  c.expect(r.ms >= 3_000, `click returned in ${r.ms}ms - before the button was enabled?`);
+  c.expect(shown.some((d) => d.type === "confirm" && /for good/.test(d.message ?? "")), "dialogs[] does not report the confirm()");
+  c.expect(c.h.seenDialogs.length === before, "a native dialog opened despite onDialog");
+  c.expect((await c.evalJs(tabId, "window.__answer")) === true, "page did not get the accepted answer");
+  // The guard is gone afterwards: a page call to confirm() reaches the real (native) implementation again.
+  const restored = await c.evalJs(tabId, "String(window.confirm).includes('[native code]') && !('__bbDlgGuard' in window)");
+  c.expect(restored === true, "dialog guard still installed after the action");
+});
+
+// Filling a contenteditable must not make its own ref stale (fingerprint ignores the editor's text).
+scenario("contenteditable-refill", async (c) => {
+  const tabId = await c.open("contenteditable.html");
+  const { elements } = await c.snapshot(tabId);
+  const ed = findEl(elements, (e) => String(e.tag) === "div" || /textbox/.test(String(e.role ?? "")));
+  if (!ed) throw new Error(`editor not in snapshot: ${trim(JSON.stringify(elements), 200)}`);
+  const a = await c.call("fill", { ref: ed.ref, value: "first draft", tabId });
+  const b = await c.call("fill", { ref: ed.ref, value: "second draft", tabId });
+  c.note(`fill1 -> ${trim(a.text, 120)}; fill2 -> ${trim(b.text, 160)}`);
+  c.expect(!a.isError && a.json?.filled !== false, `first fill failed: ${trim(a.text, 160)}`);
+  c.expect(!b.isError && b.json?.filled !== false && b.json?.notActionable !== true, `second fill on the same ref failed: ${trim(b.text, 160)}`);
+  const text = String(await c.evalJs(tabId, "document.getElementById('ed').innerText")).trim();
+  c.expect(text === "second draft", `editor text is ${JSON.stringify(text)}`);
+});
