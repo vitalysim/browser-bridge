@@ -1,8 +1,7 @@
 import express from "express";
 import { createServer } from "http";
-import { randomUUID, randomBytes } from "crypto";
-import { readFileSync, writeFileSync, mkdirSync } from "fs";
-import { homedir } from "os";
+import { randomUUID } from "crypto";
+import { readFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -12,9 +11,13 @@ import { ExtensionHub } from "./hub.js";
 import { registerTools, startWatchNetCapture } from "./tools.js";
 import { renderActions, watchRegistry } from "./watch.js";
 import { sessionsToReap, type SessionState } from "./session-reaper.js";
-import { log } from "./log.js";
+import { log, initFileLog, trimLaunchdLog, DEFAULT_LOG_MAX_BYTES, DEFAULT_LOG_KEEP } from "./log.js";
 import { handleListenError } from "./listen.js";
 import { TOOLSETS, parseToolsets } from "./toolsets.js";
+import { dataDir, ensureDataDirs, tightenPermissions } from "./datadir.js";
+import { loadToken, TokenError } from "./token.js";
+import { parseRetentionDays, scheduleRetention } from "./retention.js";
+import { safeEqual } from "./ws-auth.js";
 
 const PORT = Number(process.env.BRIDGE_PORT ?? 8765);
 const HOST = "127.0.0.1";
@@ -30,28 +33,46 @@ const VERSION = (() => {
   }
 })();
 
-function loadToken(): string {
-  if (process.env.BRIDGE_TOKEN) return process.env.BRIDGE_TOKEN;
-  const dir = join(homedir(), ".browser-bridge");
-  const file = join(dir, "token");
-  try {
-    return readFileSync(file, "utf8").trim();
-  } catch {
-    mkdirSync(dir, { recursive: true });
-    const token = randomBytes(16).toString("hex");
-    writeFileSync(file, token + "\n", { mode: 0o600 });
-    return token;
-  }
+// Everything this process creates - token, logs, captures (cookies, auth headers, bodies), recordings
+// (cleartext form input), watch digests, and files under caller-chosen savePaths - is owner-only.
+process.umask(0o077);
+
+const DATA_DIR = dataDir();
+// Create ~/.browser-bridge + playbooks/recordings/watch (0700) before anything is written.
+ensureDataDirs(DATA_DIR);
+
+// The server owns its log file and rotates it (launchd can't rotate StandardErrorPath). launchd.log is
+// only the pre-logger crash catcher; keep it small. See log.ts / scripts/install-service.mjs.
+const LOG_FILE = process.env.BRIDGE_LOG_FILE ?? join(DATA_DIR, "server.log");
+if (LOG_FILE && LOG_FILE !== "off" && LOG_FILE !== "0") {
+  initFileLog(LOG_FILE, {
+    maxBytes: Number(process.env.BRIDGE_LOG_MAX_MB) > 0 ? Number(process.env.BRIDGE_LOG_MAX_MB) * 1024 * 1024 : DEFAULT_LOG_MAX_BYTES,
+    keep: Number(process.env.BRIDGE_LOG_KEEP) >= 1 ? Number(process.env.BRIDGE_LOG_KEEP) : DEFAULT_LOG_KEEP,
+  });
+}
+trimLaunchdLog(join(DATA_DIR, "launchd.log"));
+
+let token: string;
+try {
+  token = loadToken({ dir: DATA_DIR });
+} catch (e: any) {
+  log(`[browser-bridge] FATAL: ${e instanceof TokenError ? e.message : `cannot load token: ${e?.message ?? e}`}`);
+  process.exit(1);
 }
 
-const token = loadToken();
+// Tighten whatever an older version left world/group-readable. Async + best-effort: never blocks or
+// fails startup.
+void tightenPermissions(DATA_DIR)
+  .then((r) => {
+    if (r.dirs || r.files) log(`[browser-bridge] tightened permissions under ${DATA_DIR}: ${r.dirs} dir(s) -> 0700, ${r.files} file(s) -> 0600`);
+  })
+  .catch(() => undefined);
 
-// Ensure the playbooks + recordings homes exist (advertised to agents via the MCP instructions below).
-try {
-  mkdirSync(join(homedir(), ".browser-bridge", "playbooks"), { recursive: true });
-  mkdirSync(join(homedir(), ".browser-bridge", "recordings"), { recursive: true });
-} catch {
-  /* best-effort */
+// Opt-in retention (BRIDGE_RETENTION_DAYS): OFF unless set - nothing is deleted by default.
+const retentionDays = parseRetentionDays(process.env.BRIDGE_RETENTION_DAYS);
+if (retentionDays) {
+  log(`[browser-bridge] retention: pruning recordings/ + watch/ items older than ${retentionDays}d (BRIDGE_RETENTION_DAYS), at startup and daily`);
+  scheduleRetention(DATA_DIR, retentionDays, log);
 }
 
 // Delivered to every connected agent (Claude Code + Codex) in the MCP initialize response.
@@ -70,8 +91,11 @@ const PLAYBOOK_INSTRUCTIONS =
   "something happens. Trust health.state: 'blind' means capture is down, not that the user is idle. See docs/WATCH.md.";
 
 const app = express();
-// A supported 10 MB image grows to about 13.4 MB when encoded as base64 in an MCP request.
-app.use(express.json({ limit: "20mb" }));
+app.disable("x-powered-by");
+// Body parsing is mounted on /mcp AFTER the auth check (below), so an unauthenticated caller can't make
+// the server buffer and parse a 20 MB body. A supported 10 MB image grows to about 13.4 MB when encoded
+// as base64 in an MCP request.
+const jsonBody = express.json({ limit: "20mb" });
 
 const httpServer = createServer(app);
 const hub = new ExtensionHub(httpServer, token, VERSION);
@@ -179,19 +203,21 @@ setInterval(() => reapIdleSessions(), 5 * 60 * 1000).unref();
 function authorized(req: express.Request): boolean {
   const host = (req.headers.host ?? "").split(":")[0];
   if (host !== "127.0.0.1" && host !== "localhost") return false;
-  return req.headers.authorization === `Bearer ${token}`;
+  const h = req.headers.authorization;
+  // Constant-time: a plain === leaks how many leading characters matched.
+  return typeof h === "string" && safeEqual(h, `Bearer ${token}`);
 }
 
-app.all("/mcp", async (req, res) => {
-  if (!authorized(req)) {
-    res.status(401).json({
-      jsonrpc: "2.0",
-      error: { code: -32001, message: "Unauthorized: missing or invalid bearer token" },
-      id: null,
-    });
-    return;
-  }
+function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction): void {
+  if (authorized(req)) return next();
+  res.status(401).json({
+    jsonrpc: "2.0",
+    error: { code: -32001, message: "Unauthorized: missing or invalid bearer token" },
+    id: null,
+  });
+}
 
+app.all("/mcp", requireAuth, jsonBody, async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   let transport = sessionId ? transports.get(sessionId) : undefined;
 
@@ -296,6 +322,23 @@ app.get("/watch", (req, res) => {
   );
 });
 
+// Last in the chain: express's default handler echoes the stack trace unless NODE_ENV=production
+// (launchd doesn't set it). A malformed/oversized body is the caller's problem - answer with a generic
+// JSON-RPC 400/413 and never internals.
+app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  const status = typeof err?.status === "number" && err.status >= 400 && err.status < 500 ? err.status : 500;
+  if (status >= 500) log(`[http] internal error: ${err?.name ?? "error"}: ${String(err?.message ?? err).slice(0, 200)}`);
+  if (res.headersSent) return;
+  res.status(status).json({
+    jsonrpc: "2.0",
+    error: {
+      code: status === 400 ? -32700 : status >= 500 ? -32603 : -32600,
+      message: status === 413 ? "Request body too large" : status >= 500 ? "Internal error" : "Bad request",
+    },
+    id: null,
+  });
+});
+
 // Sink writes are async (see CaptureSink), so drain them before exiting or an abrupt kill loses the
 // tail of an in-progress capture / session recording / playbook draft. Guarded against a double
 // signal, and time-boxed so a wedged fsync can't hang the shutdown.
@@ -327,8 +370,8 @@ httpServer.listen(PORT, HOST, () => {
   if (toolsets.enabled) log(`[browser-bridge] toolsets: ${[...toolsets.enabled].join(", ")} (BRIDGE_TOOLSETS)`);
   log(`[browser-bridge] listening on http://${HOST}:${PORT}`);
   log(`[browser-bridge] MCP endpoint:  http://${HOST}:${PORT}/mcp  (Authorization: Bearer <token>)`);
-  log(`[browser-bridge] extension WS:  ws://${HOST}:${PORT}/ws?token=<token>`);
-  // Log the token FILE PATH, never the token value: launchd persists stderr to
-  // ~/.browser-bridge/server.log indefinitely, so a printed secret would linger there forever.
-  log(`[browser-bridge] token file: ${join(homedir(), ".browser-bridge", "token")}`);
+  log(`[browser-bridge] extension WS:  ws://${HOST}:${PORT}/ws  (HMAC challenge-response; the token never crosses the wire)`);
+  // Log the token FILE PATH, never the token value: a printed secret would linger in the log files.
+  log(`[browser-bridge] token file: ${process.env.BRIDGE_TOKEN !== undefined ? "(BRIDGE_TOKEN env)" : join(DATA_DIR, "token")}`);
+  if (LOG_FILE && LOG_FILE !== "off" && LOG_FILE !== "0") log(`[browser-bridge] log file: ${LOG_FILE} (rotated)`);
 });

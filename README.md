@@ -320,7 +320,7 @@ This is deliberately **not** derived from the rrweb recording stream. That was m
 
 ### Prerequisites
 
-- **Node.js 18+** and **Chrome, Chromium, or Edge** - on **Linux, macOS, or Windows** (Chromium-based; not Brave/Arc, not WSL)
+- **Node.js 20+** and **Chrome, Chromium, or Edge** - on **Linux, macOS, or Windows** (Chromium-based; not Brave/Arc, not WSL)
 - **Claude Code ≥ 2.0.73** and/or **OpenAI Codex CLI**
 
 ### 1 · Build
@@ -334,7 +334,7 @@ cd browser-bridge
 
 ### 2 · Run the server
 
-The server generates a random bearer token on first run and stores it at `~/.browser-bridge/token`. The startup log prints that **file path**, not the token itself - launchd persists stderr to `~/.browser-bridge/server.log` indefinitely, so the secret is never written there. Read it with `cat ~/.browser-bridge/token`. Pick one:
+The server generates a random bearer token on first run and stores it at `~/.browser-bridge/token` (0600). The startup log prints that **file path**, never the token itself. Read it with `cat ~/.browser-bridge/token`. The server refuses to start with an empty or too-short token. Pick one:
 
 **Autostart (recommended)** - one command installs a background service for your OS (**systemd** user service on Linux, **launchd** LaunchAgent on macOS):
 
@@ -347,7 +347,7 @@ cd server && npm run install-service     # runs at login, restarts on crash
 **Manual** - just run it in a terminal:
 
 ```bash
-cd server && npm start        # or: nohup node dist/index.js >~/.browser-bridge/server.log 2>&1 &
+cd server && npm start        # or: nohup node dist/index.js >/dev/null 2>&1 &   (it writes ~/.browser-bridge/server.log itself)
 ```
 
 **Environment variables** (all optional):
@@ -355,12 +355,16 @@ cd server && npm start        # or: nohup node dist/index.js >~/.browser-bridge/
 | Variable | Default | Effect |
 |---|---|---|
 | `BRIDGE_PORT` | `8765` | Port for the MCP endpoint, the extension WebSocket and `/health` (always bound to `127.0.0.1`). Set the same port in the extension options page |
-| `BRIDGE_TOKEN` | contents of `~/.browser-bridge/token` | Use this bearer token instead of the token file |
+| `BRIDGE_TOKEN` | contents of `~/.browser-bridge/token` | Use this bearer token instead of the token file (must be at least 16 characters; an empty value refuses to start) |
+| `BRIDGE_RETENTION_DAYS` | off | **Opt-in.** Delete files and directories in `~/.browser-bridge/recordings/` and `~/.browser-bridge/watch/` whose last modification is older than this many days - at startup and then daily. Nothing is ever deleted while it is unset. Playbooks, the token and the logs are never touched |
+| `BRIDGE_LOG_FILE` | `~/.browser-bridge/server.log` | Where the server writes its own log (`off` disables the file) |
+| `BRIDGE_LOG_MAX_MB` / `BRIDGE_LOG_KEEP` | `10` / `3` | Size-based rotation: `server.log` rolls to `server.log.1` … `.3` at 10 MB |
+| `BRIDGE_LOG_STDERR` | `1` | `0` stops mirroring log lines to stderr (the LaunchAgent sets this - see Logs) |
 | `BRIDGE_TOOLSETS` | all tools | Comma list of tool groups to register, e.g. `core,devtools`. Groups: `core` (tabs, navigation, reading, interaction, screenshots, `eval_js`, `browser_batch` - always included), `devtools` (network/console capture, cookies, storage, HAR/curl), `security` (identities, replay, `authz_matrix`, intercept, `fuzz`, `analyze`, `jwt_decode`, `response_diff`), `watch` (`watch_*`), `record` (`session_record_*`, `playbook_*`, `render_recording_video`), `emulate` (`emulate_*`). Each group's descriptions + schemas are sent to the agent every session (all 77 tools ≈ 16k tokens; `core` alone ≈ 6.7k), so trimming unused groups saves context. Unknown names are logged and ignored |
 
-**Logs.** Every line in the server log is prefixed with an ISO timestamp, and each tool call writes one line - `<time> [call] <tool> tab=<id> <ms>ms ok|error|notActionable <short reason>` - so failures and latency can be measured from the log. Parameter values are never logged. If the port is already taken (usually a second instance), the server logs one line saying so and exits after 30 s instead of crash-looping under launchd/systemd.
+**Logs.** The server writes its own log to `~/.browser-bridge/server.log` and rotates it by size (10 MB × 3 old files, all 0600) - launchd can't rotate a `StandardErrorPath`, which is how the old setup grew a single unbounded log. The macOS LaunchAgent points launchd's stdout/stderr at a separate `~/.browser-bridge/launchd.log` and sets `BRIDGE_LOG_STDERR=0`, so that file only ever receives output from before the logger starts (an import-time crash after a bad build, a fatal Node error); the server trims it on startup if it ever passes 1 MB. Under systemd, stderr also goes to the journal. Every line in the server log is prefixed with an ISO timestamp, and each tool call writes one line - `<time> [call] <tool> tab=<id> <ms>ms ok|error|notActionable <short reason>` - so failures and latency can be measured from the log. Parameter values are never logged. If the port is already taken (usually a second instance), the server logs one line saying so and exits after 30 s instead of crash-looping under launchd/systemd.
 
-Verify: `curl -s http://127.0.0.1:8765/health` → `{"ok":true,"extensionConnected":false}` (becomes `true` once the extension is loaded). Logs: Linux `journalctl --user -u browser-bridge -f`; macOS/manual `tail -f ~/.browser-bridge/server.log`.
+Verify: `curl -s http://127.0.0.1:8765/health` → `{"ok":true,"extensionConnected":false}` (becomes `true` once the extension is loaded). Logs: `tail -f ~/.browser-bridge/server.log` (Linux also `journalctl --user -u browser-bridge -f`; macOS early-crash output: `~/.browser-bridge/launchd.log`).
 
 ### 3 · Load the extension
 
@@ -368,9 +372,15 @@ Verify: `curl -s http://127.0.0.1:8765/health` → `{"ok":true,"extensionConnect
 2. **Load unpacked** → select the `extension/` folder.
 3. Open the extension's popup/options → paste the token from `~/.browser-bridge/token` → **Save & connect**. The status turns green.
 
+The token never travels over the WebSocket: the server sends a nonce, the extension answers with an HMAC of it keyed by the token, and the server must answer with its own HMAC before the extension sends anything or runs any command. Something else squatting the port while the bridge is down therefore learns nothing and gets no control; the status shows **Server failed authentication**. Extension and server versions must match - a v0.18-or-older server rejects the new handshake (status: **version mismatch**), so rebuild/restart the server when you update the extension. (The server still accepts the old `?token=` URL from an older extension for one release, logging it as deprecated.)
+
 Verify: `curl -s http://127.0.0.1:8765/health` → `{"ok":true,"extensionConnected":true}`.
 
 **Which build is actually running?** `bridge_status` reports the server version and the loaded extension's build stamp. Reloading an unpacked extension gives no feedback, and a stale bundle is indistinguishable from a code bug - if the stamp predates your last `npm run build`, reload at `chrome://extensions`. Likewise, if a rebuilt server seems to have no effect, check that only one instance is running: `launchctl list | grep browser-bridge` (macOS) should show exactly one job, and `lsof -nP -iTCP:8765 -sTCP:LISTEN` exactly one listener. A second, older service that loses the port race will keep serving stale code while restarts appear to succeed - `npm run uninstall-service && npm run install-service` resolves it.
+
+**Data directory.** Everything under `~/.browser-bridge` is owner-only: the server runs with umask 077, creates its directories 0700 and files 0600, and on startup tightens existing ones in `playbooks/`, `recordings/`, `watch/` (captures and recordings contain cookies, auth headers and cleartext form input). `recordings/` and `watch/` grow without bound unless you opt into `BRIDGE_RETENTION_DAYS`.
+
+**Rotating the token** (e.g. after it leaked into an old log): `node scripts/rotate-token.mjs --dry-run --update-claude-configs` shows what would change; drop `--dry-run` to write a new token (the old one is kept as `token.prev` for rollback) and update literal `Bearer` headers for browser-bridge in `~/.claude.json` / `~/.claude-shadow/.claude.json` (a `.bak` is written first). Then paste the new token into the extension options, restart the service, and open a new shell if you export `BROWSER_BRIDGE_TOKEN`. To remove historical log lines that contain the token: `node scripts/scrub-log.mjs --dry-run` (counts only), then without `--dry-run`, then restart the service.
 
 > Reloading the extension after an update may prompt for new permissions (e.g. `webNavigation`, `debugger`, `downloads`) - re-enable it if Chrome disables it.
 
