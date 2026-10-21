@@ -103,9 +103,15 @@ const hub = new ExtensionHub(httpServer, token, VERSION);
 // ---- watch mode wiring ----
 // The registry is a module singleton (registerTools runs per MCP session), so this is attached once,
 // here, rather than inside a tool closure.
-hub.registerTap((msg, receivedAt) => {
-  if (msg.type === "watch") {
+function handleWatchBatch(msg: any, receivedAt: number): void {
+  {
     let session = msg.watchId ? watchRegistry.get(msg.watchId) : watchRegistry.forTab(msg.tabId);
+    // A watch_start is in flight and this batch may be its first: hold it until the session exists with
+    // the caller's opts (see WatchRegistry.beginStart), instead of adopting it with defaults.
+    if (!session && msg.watchId && watchRegistry.startPending) {
+      watchRegistry.bufferPending(msg, receivedAt);
+      return;
+    }
     // A batch for a watch the server lost (a restart, before the extension's hello re-announce lands):
     // adopt it rather than dropping the human's browsing on the floor. The page has been holding these
     // events; recreating the session lets them - and every later one - land.
@@ -128,6 +134,14 @@ hub.registerTap((msg, receivedAt) => {
         log(`[watch] could not capture network on tab ${msg.tabId}: ${e?.message ?? e}`);
       });
     }
+    return;
+  }
+}
+watchRegistry.setBatchHandler(handleWatchBatch);
+
+hub.registerTap((msg, receivedAt) => {
+  if (msg.type === "watch") {
+    handleWatchBatch(msg, receivedAt);
     return;
   }
   // Net rows arrive on the capture channel (persist:true with no sink registered). Only fold the

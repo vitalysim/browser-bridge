@@ -658,3 +658,20 @@ scenario(
   },
   { timeout: 120_000 }
 );
+
+// watch_start must keep the caller's options even when the page watcher's first batch beats the
+// extension's reply to the server (it used to be adopted with defaults and reported as resumed).
+scenario("watch-start-keeps-options", async (c) => {
+  if (!c.h.toolSchemas.has("watch_start")) c.skip("watch tools not exposed");
+  const tabId = await c.open("basic.html");
+  try {
+    const ws = await c.call("watch_start", { tabId, redact: "all" });
+    c.note(`watch_start -> ${trim(ws.text, 260)}`);
+    c.expect(!ws.isError, `watch_start failed: ${trim(ws.text, 160)}`);
+    c.expect(ws.json?.resumed !== true, "a fresh watch_start was reported as resumed (options lost)");
+    c.expect(ws.json?.redact === "all", `redact option not applied: ${ws.json?.redact}`);
+    c.expect(typeof ws.json?.digestPath === "string", "default digest file was not created");
+  } finally {
+    await c.call("watch_stop", {}).catch(() => undefined);
+  }
+});

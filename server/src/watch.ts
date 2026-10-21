@@ -1324,6 +1324,44 @@ export class WatchRegistry {
     return s;
   }
 
+  // ---- watch_start / first-batch race ----
+  // The page watcher's first batch can reach the server BEFORE the extension's watch_start reply, so
+  // the tap would adopt the watch with default opts and watch_start would then report it as "resumed",
+  // losing the caller's digest/redaction/network settings. While any watch_start is in flight, batches
+  // for an unknown watchId are buffered instead, and replayed once the session exists with its real opts.
+  private startsInFlight = 0;
+  private pendingBatches: { msg: any; receivedAt: number }[] = [];
+  private batchHandler: ((msg: any, receivedAt: number) => void) | null = null;
+
+  /** The hub tap's watch handler, so buffered batches replay through exactly the same path. */
+  setBatchHandler(fn: (msg: any, receivedAt: number) => void): void {
+    this.batchHandler = fn;
+  }
+  get startPending(): boolean {
+    return this.startsInFlight > 0;
+  }
+  beginStart(): void {
+    this.startsInFlight++;
+  }
+  /** Buffer a batch for a watch the server doesn't know yet, while a watch_start is in flight. */
+  bufferPending(msg: any, receivedAt: number): void {
+    if (this.pendingBatches.length < 2000) this.pendingBatches.push({ msg, receivedAt });
+  }
+  /** End one in-flight start; when none remain, replay everything buffered (adopting what is still unknown). */
+  endStart(): void {
+    this.startsInFlight = Math.max(0, this.startsInFlight - 1);
+    if (this.startsInFlight > 0) return;
+    const batches = this.pendingBatches;
+    this.pendingBatches = [];
+    for (const b of batches) {
+      try {
+        this.batchHandler?.(b.msg, b.receivedAt);
+      } catch {
+        /* one bad batch must not drop the rest */
+      }
+    }
+  }
+
   get(watchId: string): WatchSession | undefined {
     return this.sessions.get(watchId);
   }

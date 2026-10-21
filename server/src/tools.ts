@@ -1853,6 +1853,17 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         ringCount: Math.max(100, Math.min(args.ringSize ?? 5000, 50_000)),
       });
 
+      // Hold first batches for unknown watches until this start has created its session (see
+      // WatchRegistry.beginStart); the finally below replays them into it.
+      watchRegistry.beginStart();
+      let startEnded = false;
+      const endStart = () => {
+        if (!startEnded) {
+          startEnded = true;
+          watchRegistry.endStart();
+        }
+      };
+      try {
       const r = await hub.call("watch_start", { tabId: args.tabId, console: args.console ?? true });
       if (r?.tabId == null || !r?.watchId) throw new Error("extension did not return the watch id/tab");
       // Already watching this tab (e.g. after a server restart): adopt the existing browser-side
@@ -1872,6 +1883,9 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       }
 
       const session = watchRegistry.create(r.watchId, r.tabId, opts, now);
+      // Taken BEFORE the held first batches replay into the session, so watch_read({since: cursor})
+      // still returns them.
+      const startCursor = session.cursorAt;
       const defaultBase = join(
         homedir(),
         ".browser-bridge",
@@ -1886,6 +1900,8 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         sink.append([{ kind: "watch-header", watchId: session.watchId, startedAt: now, rootTabId: r.tabId, version }]);
         session.setSink(sink);
       }
+
+      endStart(); // session + digest sink exist: replay the held first batches into them now
 
       // Network capture serves BOTH consumers off one stream: the hub tap folds each row into the
       // timeline, and the CaptureSink writes the full row (headers + bodies) to disk. The tap runs
@@ -1910,7 +1926,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         watchId: session.watchId,
         tabId: r.tabId,
         url: r.url,
-        cursor: session.cursorAt,
+        cursor: startCursor,
         banner,
         // What actually happened when the listener was injected. Surfaced because a failed injection
         // is otherwise indistinguishable from a quiet user.
@@ -1920,6 +1936,9 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         redact: opts.redact,
         note: "Browse normally, then call watch_read({since: cursor}) - it returns everything new plus the next cursor.",
       });
+      } finally {
+        endStart();
+      }
     }
   );
 
