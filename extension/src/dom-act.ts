@@ -16,6 +16,10 @@ export interface BbActParams {
   mimeType?: string | null;
   b64?: string | null;
   method?: string | null;
+  // With sel: act on the nth match (0-based) in deep document order - element, then its open shadow
+  // root, then onward (the same order background.ts bbLocateAll indexes). Set by actAllFrames after
+  // it picked one match across frames.
+  nth?: number | null;
 }
 
 export function bbAct(op: string, p: BbActParams): any {
@@ -52,6 +56,32 @@ export function bbAct(op: string, p: BbActParams): any {
     if (!hit) return { notFound: true };
     if (!(hit as Element).isConnected) return { staleRef: true };
     el = hit as HTMLElement;
+  } else if (p.sel != null && p.nth != null) {
+    let k = 0;
+    const walkNth = (root: Document | ShadowRoot): HTMLElement | null => {
+      let els: NodeListOf<Element>;
+      try {
+        els = root.querySelectorAll("*");
+      } catch {
+        return null;
+      }
+      for (let i = 0; i < els.length; i++) {
+        const e = els[i];
+        let m = false;
+        try {
+          m = e.matches(p.sel!);
+        } catch {}
+        if (m && k++ === p.nth) return e as HTMLElement;
+        const sr = (e as HTMLElement).shadowRoot;
+        if (sr) {
+          const f = walkNth(sr);
+          if (f) return f;
+        }
+      }
+      return null;
+    };
+    el = walkNth(document);
+    if (!el) return { notFound: true };
   } else if (p.sel != null) {
     try {
       el = document.querySelector(p.sel) as HTMLElement | null;

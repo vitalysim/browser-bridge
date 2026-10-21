@@ -5,6 +5,7 @@ import { NetRing, applyRedirectResponse, capBody, Semaphore, type NetEntry } fro
 // bbAct is the ONE find-and-act helper the interaction tools share; bbAxSnapshot is the ARIA walker.
 import { bbAct, type BbActParams } from "./dom-act";
 import { bbAxSnapshot } from "./ax";
+import { allocateFrameBudgets, assignAxRefs, clampLimit, frameOffsets, pickSelectorTarget, routeRef, SNAPSHOT_DEFAULT_LIMIT, SNAPSHOT_MAX_LIMIT, type LocateMatch, type RefRoute } from "./snapshot-plan";
 import { emulateDevice, emulateNetwork, emulateCpu, emulateLocale, emulateGeolocation, emulateReset } from "./emulate.js";
 
 // Injected at build time by build.mjs (esbuild define) from extension/package.json - single
@@ -609,6 +610,18 @@ async function injectAllFrames(
 // Run an element-interaction func in every frame; exactly the frame that owns the element acts.
 // Frames without the element return { notFound: true }; a real failure returns { error }.
 async function injectAllAggregate(tab: chrome.tabs.Tab, func: (...args: any[]) => any, args: any[] = []): Promise<any> {
+  // A snapshot ref is only valid in the frame that issued it (see twoPhaseSnapshot).
+  const ref = args[1]?.ref;
+  if (ref != null) {
+    const owner = ownerFrameForRef(tab.id!, ref);
+    if (owner === null) throw new Error(`ref ${ref} is not from the latest snapshot (taking any snapshot invalidates earlier refs) - take a fresh snapshot`);
+    if (owner !== undefined) {
+      const v = await actInFrame(tab, owner, args, func);
+      if (v?.staleRef) throw new Error("Ref matched an element that was since removed/re-rendered - take a fresh snapshot");
+      if (!v || v.notFound) throw new Error("Element not found - take a fresh snapshot");
+      return v;
+    }
+  }
   const results = await injectAllFrames(tab, func, args);
   let acted: any = null;
   let stale = false;
@@ -628,7 +641,39 @@ async function injectAllAggregate(tab: chrome.tabs.Tab, func: (...args: any[]) =
 // re-inject into just that frame instead of walking every frame's DOM again each tick. Unlike
 // injectAllAggregate it does NOT throw on not-found/stale - it returns a structured result the retry
 // loop interprets (a real {error} still throws). frameId is null when no frame located the element.
-async function actAllFrames(tab: chrome.tabs.Tab, args: any[]): Promise<{ result: any; frameId: number | null }> {
+//
+// Refs route straight to the frame that issued them. Selectors are first LOCATED read-only in every
+// frame and ONE match is chosen (visible > top frame > in viewport > document order), then bbAct runs
+// only in that frame on that match (p.nth) - so a selector can't also fill a lookalike field inside an
+// embedded widget iframe, and a hidden duplicate (mobile nav) doesn't shadow the visible one.
+async function actAllFrames(tab: chrome.tabs.Tab, args: any[]): Promise<{ result: any; frameId: number | null; nth?: number; matchCount?: number; note?: string }> {
+  const p: BbActParams = args[1] ?? {};
+  if (p.ref != null) {
+    const owner = ownerFrameForRef(tab.id!, p.ref);
+    if (owner === null) return { result: { notFound: true }, frameId: null };
+    if (owner !== undefined) {
+      let v: any;
+      try {
+        v = await actInFrame(tab, owner, args);
+      } catch (e) {
+        if (e instanceof Error && /Frame with ID|No frame|was removed/i.test(e.message)) v = { notFound: true };
+        else throw e;
+      }
+      return { result: v, frameId: v?.notFound || v?.staleRef ? null : owner };
+    }
+  } else if (p.sel != null) {
+    const pick = await locateOne(tab, p.sel);
+    if (!pick.chosen) return { result: { notFound: true }, frameId: null };
+    const nthArgs = [args[0], { ...p, nth: pick.chosen.index }, ...args.slice(2)];
+    const v = await actInFrame(tab, pick.chosen.frameId, nthArgs);
+    return {
+      result: v,
+      frameId: v?.notFound ? null : pick.chosen.frameId,
+      nth: pick.chosen.index,
+      matchCount: pick.count,
+      note: pick.note,
+    };
+  }
   const results = await injectAllFrames(tab, bbAct, args);
   let acted: any = null;
   let ownerFrame: number | null = null;
@@ -646,12 +691,26 @@ async function actAllFrames(tab: chrome.tabs.Tab, args: any[]): Promise<{ result
   return { result: stale ? { staleRef: true } : { notFound: true }, frameId: null };
 }
 
+// Read-only locate of a selector in every frame, then pick ONE match (snapshot-plan.ts
+// pickSelectorTarget). An invalid selector throws immediately instead of being retried until timeout.
+async function locateOne(tab: chrome.tabs.Tab, sel: string) {
+  const located = await injectAllFrames(tab, bbLocateAll, [sel]);
+  const matches: LocateMatch[] = [];
+  for (const r of located.slice().sort((a, b) => (a.frameId === 0 ? -1 : b.frameId === 0 ? 1 : 0))) {
+    const v: any = r?.result;
+    if (!v || typeof v !== "object") continue;
+    if (typeof v.error === "string") throw new Error(v.error);
+    for (const m of v.matches ?? []) matches.push({ frameId: r.frameId, index: m.index, visible: m.visible, inViewport: m.inViewport });
+  }
+  return pickSelectorTarget(matches);
+}
+
 // A retry once the owning frame is known: run bbAct in just that one frame.
-async function actInFrame(tab: chrome.tabs.Tab, frameId: number, args: any[]): Promise<any> {
+async function actInFrame(tab: chrome.tabs.Tab, frameId: number, args: any[], func: (...a: any[]) => any = bbAct): Promise<any> {
   const res = await chrome.scripting.executeScript({
     target: { tabId: tab.id!, frameIds: [frameId] },
     world: "ISOLATED",
-    func: bbAct as any,
+    func: func as any,
     args: clean(args),
   });
   const v: any = res?.[0]?.result;
@@ -722,71 +781,728 @@ function bbPageText(includeHidden: boolean) {
   return { title: document.title, url: location.href, text };
 }
 
-function bbSnapshot(refOffset: number) {
-  const SEL =
-    'a[href], button, input, select, textarea, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [contenteditable="true"]';
-  const items: any[] = [];
-  // Fresh ref registry each snapshot: ref (number) -> Element, kept on the frame's ISOLATED-world
-  // global so a later click/fill/hover/type injection (same world) resolves the ref WITHOUT mutating
-  // the page DOM. Reassign a new Map (never merge) so detached nodes from prior snapshots don't leak.
-  // INVARIANT: every ref locator must inject in the ISOLATED world - a MAIN-world locator sees a
-  // different `window` and would miss this registry.
-  const bbRefs: Map<number, Element> = ((window as any).__bbRefs = new Map());
-  let n = 0;
-  // Single fused pass: match-and-emit during the walk instead of materializing EVERY element in the
-  // document into an array and re-looping it. Emission order is identical - the old walk pushed a
-  // host then immediately recursed into its shadow root, which is exactly this traversal order - and
-  // the 400 cap now stops the walk itself rather than only the second loop, so a huge page no longer
-  // traverses tens of thousands of nodes it will never emit. Same elements, same refs, less work.
+// Phase 1 of a plain snapshot (runs per frame). Collects candidate interactive elements in one pass,
+// orders them by priority (open dialog / modal / popover first, then in-viewport, then the rest in
+// DOM order), and returns up to `limit` entries WITHOUT refs. The elements are parked in
+// window.__bbPending (tagged with the snapshot epoch); phase 2 (bbCommitRefs) registers the ones the
+// service worker's cross-frame budget kept, under refs it numbered. Two phases so every frame's ref
+// range is dense and disjoint whatever its size, and child frames get a fair share of the budget.
+function bbSnapshot(epoch: number, o: { limit: number; viewportOnly: boolean; modalOnly: boolean; filter: string | null }) {
+  try {
+    const LIMIT = Math.max(1, Math.min(2000, o.limit || 400));
+    const SCAN_CAP = 6000; // max candidates considered per frame (bounds work on giant pages)
+    const CURSOR_CAP = 3000; // max getComputedStyle(cursor) checks for handler-only clickables
+    const STRONG =
+      'a[href], button, input:not([type="hidden"]), select, textarea, summary, [contenteditable]:not([contenteditable="false"]), ' +
+      'audio[controls], video[controls], [role="button"], [role="link"], [role="tab"], [role="menuitem"], ' +
+      '[role="menuitemcheckbox"], [role="menuitemradio"], [role="option"], [role="checkbox"], [role="radio"], ' +
+      '[role="switch"], [role="combobox"], [role="textbox"], [role="searchbox"], [role="treeitem"], [role="slider"], ' +
+      '[role="spinbutton"], [role="gridcell"], [role="listbox"]';
+    const WEAK = '[tabindex]:not([tabindex="-1"]), [onclick]';
+    const SKIP = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE", "HEAD", "META", "LINK", "TITLE", "BASE", "HTML", "BODY", "BR", "HR", "OPTION", "OPTGROUP", "LABEL", "SLOT", "IFRAME", "FRAME"]);
+    const SVG_INNER = /^(path|g|use|circle|rect|line|polyline|polygon|ellipse|defs|clippath|mask|lineargradient|radialgradient|stop|symbol|tspan|title|desc)$/i;
+    const vw = window.innerWidth || 0, vh = window.innerHeight || 0;
+    const norm = (s: string | null | undefined, max = 80) => (s || "").replace(/\s+/g, " ").trim().slice(0, max);
+    const safeMatches = (el: Element, sel: string) => {
+      try {
+        return el.matches(sel);
+      } catch {
+        return false;
+      }
+    };
+    const parentOf = (n: Node): Element | null => (n.parentElement as Element | null) || ((n.getRootNode() as ShadowRoot).host ?? null);
+    const containsDeep = (a: Element, b: Element) => {
+      for (let n: Node | null = b; n; n = (n.parentNode as Node | null) || ((n as ShadowRoot).host ?? null)) if (n === a) return true;
+      return false;
+    };
+    // Rendered + not visibility:hidden (+ opacity unless the caller is checking a toggle input).
+    const shown = (el: Element, opacity: boolean) => {
+      const cv = (el as any).checkVisibility;
+      if (typeof cv === "function") {
+        try {
+          if (!cv.call(el, { visibilityProperty: true, checkVisibilityCSS: true, opacityProperty: opacity, checkOpacity: opacity })) return false;
+        } catch {}
+      }
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    };
+    const rendered = (el: Element) => {
+      const cv = (el as any).checkVisibility;
+      try {
+        return typeof cv === "function" ? cv.call(el, { visibilityProperty: true }) : true;
+      } catch {
+        return true;
+      }
+    };
+
+    // ---- open modal / overlays ----
+    let modal: Element | null = null;
+    let modalNative = false;
+    try {
+      modal = document.querySelector("dialog:modal");
+      modalNative = !!modal;
+    } catch {}
+    if (!modal) {
+      const ams = document.querySelectorAll('[aria-modal="true"]');
+      for (let i = ams.length - 1; i >= 0; i--) if (shown(ams[i], false)) { modal = ams[i]; break; }
+    }
+    const OVERLAY = 'dialog[open], [aria-modal="true"], [role="dialog"], [role="alertdialog"], [popover]';
+    const inOverlay = (el: Element) => {
+      for (let n: Element | null = el; n; ) {
+        const c: Element | null = n.closest(OVERLAY);
+        if (c) {
+          if (!c.hasAttribute("popover") || safeMatches(c, ":popover-open")) return true;
+          n = c.parentElement;
+          continue;
+        }
+        const host: Element | null = (n.getRootNode() as ShadowRoot).host ?? null;
+        n = host;
+      }
+      return false;
+    };
+
+    // ---- role / name / state ----
+    const INPUT_ROLE: Record<string, string> = {
+      button: "button", submit: "button", reset: "button", image: "button", file: "button",
+      checkbox: "checkbox", radio: "radio", range: "slider", number: "spinbutton", search: "searchbox",
+    };
+    const roleOf = (el: Element): string => {
+      const explicit = (el.getAttribute("role") || "").trim().split(/\s+/)[0];
+      if (explicit) return explicit;
+      const tag = el.tagName.toLowerCase();
+      if (tag === "a") return "link";
+      if (tag === "button" || tag === "summary") return "button";
+      if (tag === "input") return INPUT_ROLE[((el as HTMLInputElement).type || "text").toLowerCase()] || "textbox";
+      if (tag === "select") return (el as HTMLSelectElement).multiple || (el as HTMLSelectElement).size > 1 ? "listbox" : "combobox";
+      if (tag === "textarea" || (el as HTMLElement).isContentEditable) return "textbox";
+      if (tag === "audio" || tag === "video") return tag;
+      return "";
+    };
+    const byIds = (el: Element, ids: string) => {
+      const root = el.getRootNode() as Document | ShadowRoot;
+      let out = "";
+      for (const id of ids.split(/\s+/)) {
+        if (!id) continue;
+        const r = ((root as any).getElementById?.(id) as Element | null) ?? document.getElementById(id);
+        if (r) out += " " + ((r as HTMLElement).innerText || r.textContent || "");
+      }
+      return norm(out);
+    };
+    const isField = (el: Element) => /^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName);
+    const nameOf = (el: Element): string => {
+      const al = el.getAttribute("aria-label");
+      if (al && al.trim()) return norm(al);
+      const lb = el.getAttribute("aria-labelledby");
+      if (lb) {
+        const t = byIds(el, lb);
+        if (t) return t;
+      }
+      if (isField(el)) {
+        const labels = (el as HTMLInputElement).labels;
+        if (labels && labels.length) {
+          const t = norm((labels[0] as HTMLElement).innerText || labels[0].textContent);
+          if (t) return t;
+        }
+        const t = ((el as HTMLInputElement).type || "").toLowerCase();
+        if (el.tagName === "INPUT" && /^(button|submit|reset)$/.test(t)) return norm((el as HTMLInputElement).value);
+        return norm(el.getAttribute("placeholder") || el.getAttribute("title") || el.getAttribute("alt") || "");
+      }
+      if ((el as HTMLElement).isContentEditable) return norm(el.getAttribute("aria-placeholder") || el.getAttribute("data-placeholder") || el.getAttribute("title") || "");
+      const txt = norm((el as HTMLElement).innerText || "");
+      if (txt) return txt;
+      const t = el.getAttribute("title");
+      if (t && t.trim()) return norm(t);
+      try {
+        const inner = el.querySelector("img[alt], [aria-label], svg title");
+        if (inner) return norm(inner.getAttribute("alt") || inner.getAttribute("aria-label") || inner.textContent || "");
+      } catch {}
+      return "";
+    };
+    const NO_VALUE = /^(checkbox|radio|file|button|submit|reset|image|password|hidden)$/;
+    // target = element the ref points at; ctl = the control whose state is reported (a hidden checkbox
+    // behind a label: target is the label, ctl the checkbox).
+    const entryFor = (target: Element, ctl: Element, via: string | null) => {
+      const tag = target.tagName.toLowerCase();
+      const ctag = ctl.tagName.toLowerCase();
+      const role = via === "cursor" ? "" : roleOf(ctl);
+      const name = via === "label" ? norm((target as HTMLElement).innerText || target.textContent) || nameOf(ctl) : nameOf(target);
+      const e: any = { tag };
+      if (role && role !== tag) e.role = role;
+      if (name) e.name = name;
+      if (ctag === "input") e.type = ((ctl as HTMLInputElement).type || "text").toLowerCase();
+      if (tag === "a" && (target as HTMLAnchorElement).href) e.href = (target as HTMLAnchorElement).href.slice(0, 120);
+      // value
+      let v = "";
+      if (ctag === "input" && !NO_VALUE.test(e.type)) v = (ctl as HTMLInputElement).value;
+      else if (ctag === "textarea") v = (ctl as HTMLTextAreaElement).value;
+      else if (ctag === "select") {
+        const s = ctl as HTMLSelectElement;
+        v = Array.from(s.selectedOptions || []).map((op) => op.text).join(", ");
+      } else if ((ctl as HTMLElement).isContentEditable) v = (ctl as HTMLElement).innerText || "";
+      else if (role === "slider" || role === "spinbutton") v = ctl.getAttribute("aria-valuenow") || "";
+      v = norm(v);
+      if (v) e.value = v;
+      // states
+      const ac = ctl.getAttribute("aria-checked");
+      if (ac === "true") e.checked = true;
+      else if (ac === "false") e.checked = false;
+      else if (ac === "mixed") e.checked = "mixed";
+      else if (ctag === "input" && (e.type === "checkbox" || e.type === "radio")) e.checked = (ctl as HTMLInputElement).checked;
+      if (ctl.getAttribute("aria-selected") === "true") e.selected = true;
+      const ae = ctl.getAttribute("aria-expanded");
+      if (ae === "true") e.expanded = true;
+      else if (ae === "false") e.expanded = false;
+      else if (ctag === "summary" && ctl.parentElement?.tagName === "DETAILS") e.expanded = (ctl.parentElement as HTMLDetailsElement).open;
+      if ((ctl as any).disabled || safeMatches(ctl, ":disabled") || ctl.getAttribute("aria-disabled") === "true") e.disabled = true;
+      if (via) e.via = via;
+      return { e, meta: { tag, role: role || "generic", name } };
+    };
+
+    // ---- single pass: collect candidates ----
+    type Cand = { el: Element; ctl: Element; via: string | null; hiddenCtl?: boolean; dom: number };
+    const cands: Cand[] = [];
+    const seen = new Map<Element, Cand>();
+    const cursorCache = new Map<Element, boolean>();
+    let cursorChecks = 0;
+    let scanCapped = false;
+    let dom = 0;
+    const isPointer = (el: Element): boolean => {
+      const c = cursorCache.get(el);
+      if (c !== undefined) return c;
+      cursorChecks++;
+      let p = false;
+      try {
+        p = getComputedStyle(el).cursor === "pointer";
+      } catch {}
+      cursorCache.set(el, p);
+      return p;
+    };
+    const add = (el: Element, ctl: Element, via: string | null, hiddenCtl = false) => {
+      const prev = seen.get(el);
+      if (prev) {
+        if (via === "label") {
+          prev.ctl = ctl;
+          prev.via = "label";
+        }
+        return;
+      }
+      const c: Cand = { el, ctl, via, hiddenCtl, dom: dom++ };
+      seen.set(el, c);
+      cands.push(c);
+      if (cands.length >= SCAN_CAP) scanCapped = true;
+    };
+    const consider = (el: Element) => {
+      if (SKIP.has(el.tagName)) return;
+      if (safeMatches(el, STRONG)) {
+        const tag = el.tagName;
+        const type = tag === "INPUT" ? ((el as HTMLInputElement).type || "").toLowerCase() : "";
+        if (type === "checkbox" || type === "radio" || type === "file") {
+          // Visually-hidden toggle (opacity 0, 1px sr-only, display:none behind a styled label): expose
+          // it through its visible label - clicking the label toggles the control.
+          const r = el.getBoundingClientRect();
+          const visible = shown(el, true) && r.width > 2 && r.height > 2;
+          if (visible) return add(el, el, null);
+          const labels = Array.from((el as HTMLInputElement).labels || []);
+          const lab = labels.find((l) => shown(l, true));
+          if (lab) return add(lab, el, "label");
+          if (rendered(el) && (r.width > 0 || r.height > 0)) return add(el, el, null, true); // operable, just transparent
+          return;
+        }
+        if (shown(el, true)) add(el, el, null);
+        return;
+      }
+      if (safeMatches(el, WEAK)) {
+        const p = parentOf(el);
+        if (p && p.closest(STRONG)) return; // inside an already-interactive ancestor
+        if (shown(el, true)) add(el, el, null);
+        return;
+      }
+      // handler-only clickable (div/span with cursor:pointer). Emit only the element where the pointer
+      // style ORIGINATES (parent isn't pointer), and never inside an interactive ancestor.
+      if (cursorChecks >= CURSOR_CAP || SVG_INNER.test(el.tagName)) return;
+      if (!isPointer(el)) return;
+      const p = parentOf(el);
+      if (p && p.tagName !== "BODY" && p.tagName !== "HTML" && isPointer(p)) return;
+      if (el.closest(STRONG + ", label") || (p && p.closest(STRONG + ", " + WEAK))) return;
+      if (shown(el, true)) add(el, el, "cursor");
+    };
+    const walk = (root: Document | ShadowRoot) => {
+      let els: NodeListOf<Element>;
+      try {
+        els = root.querySelectorAll("*");
+      } catch {
+        return;
+      }
+      for (let i = 0; i < els.length; i++) {
+        if (scanCapped) return;
+        const el = els[i];
+        consider(el);
+        const sr = (el as HTMLElement).shadowRoot;
+        if (sr) walk(sr);
+      }
+    };
+    walk(document);
+
+    // ---- modal handling + priority buckets ----
+    type Ranked = Cand & { bucket: number; inViewport: boolean; behindModal: boolean };
+    const ranked: Ranked[] = [];
+    for (const c of cands) {
+      let behindModal = false;
+      if (c.el.closest("[inert]")) continue; // inert = not operable
+      if (modal && !containsDeep(modal, c.el)) {
+        if (modalNative || c.el.closest('[aria-hidden="true"]')) continue; // made inert / hidden by the modal
+        behindModal = true;
+        if (o.modalOnly) continue;
+      }
+      const r = c.el.getBoundingClientRect();
+      const inViewport = r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw;
+      if (o.viewportOnly && !inViewport) continue;
+      const bucket = behindModal ? 3 : inOverlay(c.el) ? 0 : inViewport ? 1 : 2;
+      ranked.push({ ...c, bucket, inViewport, behindModal });
+    }
+    ranked.sort((a, b) => a.bucket - b.bucket || a.dom - b.dom);
+
+    const filter = (o.filter || "").toLowerCase().trim();
+    const elements: any[] = [];
+    const pending: { el: Element; meta: any }[] = [];
+    let total = 0;
+    for (const c of ranked) {
+      // Without a filter, entries past the limit are only counted (no name/state work for them).
+      if (!filter && elements.length >= LIMIT) {
+        total++;
+        continue;
+      }
+      const { e, meta } = entryFor(c.el, c.ctl, c.via);
+      if (filter) {
+        const hay = `${e.tag} ${e.role || ""} ${e.type || ""} ${e.name || ""} ${e.value || ""} ${e.href || ""}`.toLowerCase();
+        if (!hay.includes(filter)) continue;
+      }
+      total++;
+      if (elements.length >= LIMIT) continue;
+      e.inViewport = c.inViewport;
+      if (c.behindModal) e.behindModal = true;
+      if (c.hiddenCtl) e.visuallyHidden = true;
+      elements.push(e);
+      pending.push({ el: c.el, meta });
+    }
+    (window as any).__bbPending = { epoch, items: pending };
+    const out: any = { url: location.href, total, elements };
+    if (scanCapped) out.scanCapped = true;
+    if (modal) out.modal = norm(modal.getAttribute("aria-label") || (modal.getAttribute("aria-labelledby") ? byIds(modal, modal.getAttribute("aria-labelledby")!) : "") || (modal as HTMLElement).innerText, 60) || modal.tagName.toLowerCase();
+    return out;
+  } catch (e) {
+    return { error: `snapshot failed: ${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+
+// Phase 2 of snapshot / ax_snapshot: register the first `keep` parked elements as refs offset+1..,
+// with their {tag, role, name} fingerprints in window.__bbRefMeta (the interaction layer verifies a
+// ref still points at the same kind of element). Always reassigns fresh Maps - never merges - so refs
+// from an older snapshot can't leak. A newer snapshot's phase 1 that raced in (different epoch) wins.
+// INVARIANT: every ref locator must inject in the ISOLATED world (this registry lives there).
+function bbCommitRefs(epoch: number, offset: number, keep: number) {
+  const w = window as any;
+  const p = w.__bbPending;
+  if (!p || p.epoch !== epoch) return { error: "superseded by a newer snapshot" };
+  const refs = new Map<number, Element>();
+  const meta = new Map<number, { tag: string; role: string; name: string }>();
+  const n = Math.min(keep, p.items.length);
+  for (let i = 0; i < n; i++) {
+    refs.set(offset + i + 1, p.items[i].el);
+    meta.set(offset + i + 1, p.items[i].meta);
+  }
+  w.__bbRefs = refs;
+  w.__bbRefMeta = meta;
+  w.__bbEpoch = epoch;
+  w.__bbPending = null;
+  return { ok: true, n };
+}
+
+// Read-only selector locate (per frame) used to pick ONE target before acting. Enumerates matches in
+// deep document order (element, then its open shadow root, then onward) - the SAME order bbAct uses
+// for `nth`, so the index chosen here addresses the same element there.
+function bbLocateAll(sel: string) {
+  try {
+    document.createDocumentFragment().querySelector(sel);
+  } catch (e) {
+    return { error: `Invalid CSS selector ${JSON.stringify(sel)}: ${e instanceof Error ? e.message : String(e)}` };
+  }
+  const vw = window.innerWidth || 0, vh = window.innerHeight || 0;
+  const matches: { index: number; visible: boolean; inViewport: boolean }[] = [];
+  let count = 0;
   const walk = (root: Document | ShadowRoot) => {
-    if (n >= 400) return;
     let els: NodeListOf<Element>;
     try {
       els = root.querySelectorAll("*");
     } catch {
       return;
     }
-    for (const el of Array.from(els)) {
-      if (n >= 400) return;
-      const h = el as HTMLElement;
-      let ok = false;
+    for (let i = 0; i < els.length; i++) {
+      const el = els[i];
+      let m = false;
       try {
-        ok = h.matches(SEL);
-      } catch {
-        ok = false;
+        m = el.matches(sel);
+      } catch {}
+      if (m) {
+        if (matches.length < 100) {
+          const r = el.getBoundingClientRect();
+          let vis = r.width > 0 && r.height > 0;
+          const cv = (el as any).checkVisibility;
+          if (vis && typeof cv === "function") {
+            try {
+              vis = cv.call(el, { visibilityProperty: true, checkVisibilityCSS: true });
+            } catch {}
+          }
+          matches.push({ index: count, visible: vis, inViewport: vis && r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw });
+        }
+        count++;
       }
-      if (ok && (!(h as any).checkVisibility || (h as any).checkVisibility())) emit(h);
-      const sr = h.shadowRoot;
+      const sr = (el as HTMLElement).shadowRoot;
       if (sr) walk(sr);
     }
   };
-  const emit = (h: HTMLElement) => {
-    n++;
-    const ref = refOffset + n;
-    bbRefs.set(ref, h);
-    const label = ((h.innerText ||
-      (h as HTMLInputElement).value ||
-      (h as HTMLInputElement).placeholder ||
-      h.getAttribute("aria-label") ||
-      h.getAttribute("title") ||
-      "") as string)
-      .trim()
-      .replace(/\s+/g, " ")
-      .slice(0, 80);
-    const entry: any = { ref, tag: h.tagName.toLowerCase(), label };
-    if (h.tagName === "A") entry.href = (h as HTMLAnchorElement).href.slice(0, 120);
-    if (h.tagName === "INPUT") entry.type = (h as HTMLInputElement).type;
-    const role = h.getAttribute("role");
-    if (role) entry.role = role;
-    // actionability hints (elements listed are already visible; add enabled + viewport position)
-    const enabled = !(h as any).disabled && h.getAttribute("aria-disabled") !== "true";
-    if (!enabled) entry.enabled = false;
-    const r = h.getBoundingClientRect();
-    entry.inViewport = r.bottom > 0 && r.right > 0 && r.top < (window.innerHeight || 0) && r.left < (window.innerWidth || 0);
-    items.push(entry);
-  };
   walk(document);
-  return { url: location.href, count: items.length, elements: items };
+  return { count, matches };
+}
+
+// Resolve once the DOM has been quiet (no mutations) for quietMs, or after capMs regardless. Used to
+// let a framework finish rendering the result of an action before withSnapshot captures it.
+function bbDomQuiet(quietMs: number, capMs: number) {
+  return new Promise((resolve) => {
+    let quiet: any = null;
+    let cap: any = null;
+    let obs: MutationObserver | null = null;
+    const done = (why: string) => {
+      try {
+        obs?.disconnect();
+      } catch {}
+      clearTimeout(quiet);
+      clearTimeout(cap);
+      resolve({ settled: why });
+    };
+    try {
+      obs = new MutationObserver(() => {
+        clearTimeout(quiet);
+        quiet = setTimeout(() => done("quiet"), quietMs);
+      });
+      obs.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+    } catch {}
+    quiet = setTimeout(() => done("quiet"), quietMs);
+    cap = setTimeout(() => done("cap"), capMs);
+  });
+}
+
+// Scroll the window, a container, or an element into view. Target by ref (__bbRefs) or selector+nth.
+// With a target and no delta: scroll it into view. With a target and a delta/direction: scroll the
+// target's nearest scrollable ancestor (or itself). No target: the window - or, when the document
+// itself can't scroll (Gmail/Slack app shells), the scroll container under the viewport center.
+function bbScroll(p: { ref: number | null; sel: string | null; nth: number | null; dx: number | null; dy: number | null; direction: string | null; amount: number | null }) {
+  try {
+    let target: Element | null = null;
+    if (p.ref != null) {
+      const reg = (window as any).__bbRefs as Map<number, Element> | undefined;
+      const hit = reg && reg.get(p.ref);
+      if (!hit) return { error: `ref ${p.ref} is not in the current snapshot - take a fresh snapshot` };
+      if (!hit.isConnected) return { error: `ref ${p.ref} points at an element that was removed/re-rendered - take a fresh snapshot` };
+      target = hit;
+    } else if (p.sel != null) {
+      try {
+        document.createDocumentFragment().querySelector(p.sel);
+      } catch (e) {
+        return { error: `Invalid CSS selector ${JSON.stringify(p.sel)}: ${e instanceof Error ? e.message : String(e)}` };
+      }
+      let k = 0;
+      const want = p.nth ?? 0;
+      const walk = (root: Document | ShadowRoot): Element | null => {
+        const els = root.querySelectorAll("*");
+        for (let i = 0; i < els.length; i++) {
+          const el = els[i];
+          if (el.matches(p.sel!) && k++ === want) return el;
+          const sr = (el as HTMLElement).shadowRoot;
+          if (sr) {
+            const f = walk(sr);
+            if (f) return f;
+          }
+        }
+        return null;
+      };
+      target = walk(document);
+      if (!target) return { error: `Element not found: ${p.sel}` };
+    }
+    const se = (document.scrollingElement || document.documentElement) as HTMLElement;
+    const isRoot = (el: Element | null) => !el || el === se || el === document.documentElement || el === document.body;
+    const describe = (el: Element | null) => {
+      if (isRoot(el)) return "window";
+      const h = el as HTMLElement;
+      const cls = typeof h.className === "string" ? h.className.trim().split(/\s+/)[0] : "";
+      return h.tagName.toLowerCase() + (h.id ? "#" + h.id : cls ? "." + cls : "");
+    };
+    const parentOf = (n: Element): Element | null => n.parentElement || ((n.getRootNode() as ShadowRoot).host ?? null);
+    const canScroll = (el: Element, axis: "x" | "y") => {
+      const cs = getComputedStyle(el);
+      const ov = axis === "y" ? cs.overflowY : cs.overflowX;
+      if (!/(auto|scroll|overlay)/.test(ov)) return false;
+      return axis === "y" ? el.scrollHeight > el.clientHeight + 1 : el.scrollWidth > el.clientWidth + 1;
+    };
+    const scrollerFor = (el: Element, axis: "x" | "y"): Element | null => {
+      for (let n: Element | null = el; n && !isRoot(n); n = parentOf(n)) if (canScroll(n, axis)) return n;
+      return null; // the window
+    };
+    const state = (c: Element | null, axis: "x" | "y") => {
+      const el = isRoot(c) ? se : (c as Element);
+      const pos = axis === "y" ? el.scrollTop : el.scrollLeft;
+      const size = axis === "y" ? el.scrollHeight : el.scrollWidth;
+      const view = isRoot(c) ? (axis === "y" ? window.innerHeight : window.innerWidth) : axis === "y" ? el.clientHeight : el.clientWidth;
+      return { pos: Math.round(pos), size, view, atStart: pos <= 1, atEnd: pos + view >= size - 2 };
+    };
+    const hasDelta = p.dx != null || p.dy != null || p.direction != null;
+    if (target && !hasDelta) {
+      target.scrollIntoView({ block: "center", inline: "nearest", behavior: "instant" as ScrollBehavior });
+      const c = scrollerFor(parentOf(target) ?? target, "y");
+      const s = state(c, "y");
+      return { scrolled: true, scrolledTo: describe(target), container: describe(c), scrollTop: s.pos, atEnd: s.atEnd };
+    }
+    const dir = (p.direction || "").toLowerCase();
+    const axis: "x" | "y" = dir === "left" || dir === "right" || (p.dx != null && p.dy == null) ? "x" : "y";
+    let container: Element | null;
+    if (target) container = scrollerFor(target, axis);
+    else {
+      const docScrollable = axis === "y" ? se.scrollHeight > window.innerHeight + 1 : se.scrollWidth > window.innerWidth + 1;
+      container = null;
+      if (!docScrollable) {
+        const mid = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2);
+        container = mid ? scrollerFor(mid, axis) : null;
+        if (!container) {
+          let best = 0;
+          const all = document.querySelectorAll("*");
+          for (let i = 0; i < all.length && i < 5000; i++) {
+            const el = all[i];
+            if (el.clientHeight * el.clientWidth <= best) continue;
+            if (canScroll(el, axis)) {
+              best = el.clientHeight * el.clientWidth;
+              container = el;
+            }
+          }
+        }
+      }
+    }
+    const before = state(container, axis);
+    const step = p.amount != null ? p.amount : Math.round(before.view * 0.8);
+    const scroller: any = isRoot(container) ? window : container;
+    if (dir === "top" || dir === "bottom") {
+      const to = dir === "top" ? 0 : before.size;
+      scroller.scrollTo(axis === "y" ? { top: to, behavior: "instant" } : { left: to, behavior: "instant" });
+    } else {
+      let dx = 0, dy = 0;
+      if (dir === "down") dy = step;
+      else if (dir === "up") dy = -step;
+      else if (dir === "right") dx = step;
+      else if (dir === "left") dx = -step;
+      else {
+        dx = p.dx ?? 0;
+        dy = p.dy ?? (p.dx != null ? 0 : 600);
+      }
+      scroller.scrollBy({ left: dx, top: dy, behavior: "instant" });
+    }
+    const after = state(container, axis);
+    const out: any = {
+      scrolled: after.pos !== before.pos,
+      container: describe(container),
+      axis,
+      [axis === "y" ? "scrollTop" : "scrollLeft"]: after.pos,
+      atStart: after.atStart,
+      atEnd: after.atEnd,
+    };
+    if (isRoot(container)) out.scrollY = Math.round(window.scrollY);
+    return out;
+  } catch (e) {
+    return { error: `scroll failed: ${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+
+// One wait_for probe slice in one frame: resolves as soon as the condition holds in THIS frame, or at
+// sliceEnd (epoch ms) with satisfied:false. MutationObserver-driven checks (coalesced to one per
+// animation frame / 50ms) plus a 150ms poll for changes that don't mutate the DOM (CSS transitions).
+// Shadow-aware. Matching: selector and/or role(+name) and/or text, all of which must hold for one element.
+function bbWaitProbe(spec: { sel: string | null; text: string | null; role: string | null; name: string | null; state: string }, sliceEnd: number) {
+  return new Promise((resolve) => {
+    try {
+      const norm = (s: string | null | undefined) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
+      const text = spec.text ? norm(spec.text) : "";
+      const nameQ = spec.name ? norm(spec.name) : "";
+      const roleQ = (spec.role || "").toLowerCase();
+      const INPUT_ROLE: Record<string, string> = {
+        button: "button", submit: "button", reset: "button", image: "button",
+        checkbox: "checkbox", radio: "radio", range: "slider", number: "spinbutton", search: "searchbox",
+      };
+      const TAG_ROLE: Record<string, string> = {
+        button: "button", summary: "button", select: "combobox", textarea: "textbox", dialog: "dialog", nav: "navigation",
+        main: "main", img: "img", ul: "list", ol: "list", li: "listitem", table: "table", form: "form", option: "option",
+        h1: "heading", h2: "heading", h3: "heading", h4: "heading", h5: "heading", h6: "heading",
+      };
+      const roleOf = (el: Element) => {
+        const ex = (el.getAttribute("role") || "").trim().split(/\s+/)[0];
+        if (ex) return ex.toLowerCase();
+        const tag = el.tagName.toLowerCase();
+        if (tag === "a") return el.hasAttribute("href") ? "link" : "";
+        if (tag === "input") {
+          const t = ((el as HTMLInputElement).type || "text").toLowerCase();
+          return t === "hidden" ? "" : INPUT_ROLE[t] || "textbox";
+        }
+        if ((el as HTMLElement).isContentEditable && el.getAttribute("contenteditable") !== null) return "textbox";
+        return TAG_ROLE[tag] || "";
+      };
+      const nameOf = (el: Element) => {
+        const al = el.getAttribute("aria-label");
+        if (al) return norm(al);
+        const lb = el.getAttribute("aria-labelledby");
+        if (lb) {
+          let s = "";
+          for (const id of lb.split(/\s+/)) s += " " + (document.getElementById(id)?.textContent || "");
+          if (s.trim()) return norm(s);
+        }
+        const labels = (el as HTMLInputElement).labels;
+        if (labels && labels.length) return norm(labels[0].textContent);
+        return norm((el as HTMLElement).innerText || el.getAttribute("placeholder") || el.getAttribute("title") || el.getAttribute("alt") || (el as HTMLInputElement).value || "");
+      };
+      const hasText = (el: Element) => norm((el as HTMLElement).innerText ?? el.textContent).includes(text) || norm((el as HTMLInputElement).value).includes(text);
+      const visible = (el: Element) => {
+        const r = el.getBoundingClientRect();
+        if (!(r.width > 0 && r.height > 0)) return false;
+        const cv = (el as any).checkVisibility;
+        try {
+          return typeof cv === "function" ? cv.call(el, { visibilityProperty: true, checkVisibilityCSS: true }) : true;
+        } catch {
+          return true;
+        }
+      };
+      const roots = (): (Document | ShadowRoot)[] => {
+        const out: (Document | ShadowRoot)[] = [document];
+        for (let i = 0; i < out.length; i++) {
+          const els = out[i].querySelectorAll("*");
+          for (let j = 0; j < els.length; j++) {
+            const sr = (els[j] as HTMLElement).shadowRoot;
+            if (sr) out.push(sr);
+          }
+        }
+        return out;
+      };
+      const find = (): Element[] => {
+        const found: Element[] = [];
+        const rs = roots();
+        if (spec.sel || roleQ) {
+          for (const r of rs) {
+            const els = spec.sel ? r.querySelectorAll(spec.sel) : r.querySelectorAll("*");
+            for (let i = 0; i < els.length && found.length < 200; i++) {
+              const el = els[i];
+              if (roleQ && roleOf(el) !== roleQ) continue;
+              if (nameQ && !nameOf(el).includes(nameQ)) continue;
+              if (text && !hasText(el)) continue;
+              found.push(el);
+            }
+          }
+          return found;
+        }
+        // text only: the element owning each matching text node (or, for text split across inline
+        // children, the deepest element whose text contains it).
+        for (const r of rs) {
+          const start = r === document ? document.body : r;
+          if (!start) continue;
+          const tw = document.createTreeWalker(start, NodeFilter.SHOW_TEXT);
+          let hits = 0;
+          for (let n = tw.nextNode(); n && found.length < 200; n = tw.nextNode()) {
+            const pe = n.parentElement;
+            if (!pe || /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(pe.tagName)) continue;
+            if (norm(n.nodeValue).includes(text)) {
+              found.push(pe);
+              hits++;
+            }
+          }
+          if (!hits && norm(start.textContent).includes(text)) {
+            let el: Element | null = start instanceof Element ? start : null;
+            let kids: Element[] = Array.from((start as ParentNode).children);
+            for (;;) {
+              const next: Element | undefined = kids.find((k) => !/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(k.tagName) && norm(k.textContent).includes(text));
+              if (!next) break;
+              el = next;
+              kids = Array.from(next.children);
+            }
+            if (el) found.push(el);
+          }
+        }
+        return found;
+      };
+      let finished = false;
+      let obs: MutationObserver | null = null;
+      let poll: any = null;
+      let end: any = null;
+      const finish = (v: any) => {
+        if (finished) return;
+        finished = true;
+        try {
+          obs?.disconnect();
+        } catch {}
+        clearInterval(poll);
+        clearTimeout(end);
+        resolve(v);
+      };
+      const check = () => {
+        if (finished) return;
+        let els: Element[];
+        try {
+          els = find();
+        } catch (e) {
+          return finish({ error: `wait_for probe failed: ${e instanceof Error ? e.message : String(e)}` });
+        }
+        const vis = els.filter(visible);
+        const st = spec.state;
+        const ok = st === "attached" ? els.length > 0 : st === "detached" ? els.length === 0 : st === "hidden" ? vis.length === 0 : vis.length > 0;
+        if (!ok) return;
+        const out: any = { satisfied: true, count: els.length, visibleCount: vis.length };
+        const first = vis[0] ?? els[0];
+        if (first && (st === "visible" || st === "attached")) {
+          out.tag = first.tagName.toLowerCase();
+          const nm = nameOf(first);
+          if (nm) out.name = nm.slice(0, 80);
+          const reg = (window as any).__bbRefs as Map<number, Element> | undefined;
+          if (reg) for (const [ref, el] of reg) if (el === first) { out.ref = ref; break; }
+        }
+        finish(out);
+      };
+      let scheduled = false;
+      const schedule = () => {
+        if (scheduled || finished) return;
+        scheduled = true;
+        const run = () => {
+          if (!scheduled) return;
+          scheduled = false;
+          check();
+        };
+        try {
+          requestAnimationFrame(run);
+        } catch {}
+        setTimeout(run, 50); // rAF is throttled in background tabs
+      };
+      check();
+      if (finished) return;
+      obs = new MutationObserver(schedule);
+      obs.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+      poll = setInterval(check, 150);
+      end = setTimeout(() => finish({ satisfied: false }), Math.max(0, sliceEnd - Date.now()));
+    } catch (e) {
+      resolve({ error: `wait_for probe failed: ${e instanceof Error ? e.message : String(e)}` });
+    }
+  });
+}
+
+// Validate a CSS selector without touching the page (a syntax error is a clear, immediate error).
+function bbValidateSelector(sel: string) {
+  try {
+    document.createDocumentFragment().querySelector(sel);
+    return { ok: true };
+  } catch (e) {
+    return { error: `Invalid CSS selector ${JSON.stringify(sel)}: ${e instanceof Error ? e.message : String(e)}` };
+  }
 }
 
 // Put an image on the REAL OS clipboard as image/png (converting via canvas if needed). Async; the
@@ -2408,10 +3124,15 @@ async function cdpInput(tabId: number, params: any): Promise<any> {
 
 // CDP deep snapshot: walks the pierced DOM tree (incl. CLOSED shadow roots and iframe docs),
 // stamps refs -> backendNodeId in the session so trusted interaction can act on them.
-async function cdpDeepSnapshot(tabId: number): Promise<any> {
+async function cdpDeepSnapshot(tabId: number, limit = SNAPSHOT_DEFAULT_LIMIT): Promise<any> {
   const s = await ensureAttached(tabId);
   const { root } = await cmd(tabId, "DOM.getDocument", { depth: -1, pierce: true });
-  const INTERACTIVE = new Set(["A", "BUTTON", "INPUT", "SELECT", "TEXTAREA"]);
+  const INTERACTIVE = new Set(["BUTTON", "SELECT", "TEXTAREA", "SUMMARY"]);
+  const ROLES = new Set([
+    "button", "link", "tab", "menuitem", "menuitemcheckbox", "menuitemradio", "option", "checkbox", "radio",
+    "switch", "combobox", "textbox", "searchbox", "treeitem", "slider", "spinbutton", "gridcell", "listbox",
+  ]);
+  let total = 0;
   const items: any[] = [];
   s.refNodes = new Map();
   s.deepGen++;
@@ -2432,15 +3153,20 @@ async function cdpDeepSnapshot(tabId: number): Promise<any> {
   };
   const isInteractive = (node: any, attrs: Record<string, string>): boolean => {
     if (INTERACTIVE.has(node.nodeName)) return true;
-    if (attrs.role && ["button", "link", "tab", "menuitem"].includes(attrs.role)) return true;
-    if (attrs.contenteditable === "true") return true;
+    if (node.nodeName === "A") return "href" in attrs || "onclick" in attrs || !!attrs.role;
+    if (node.nodeName === "INPUT") return (attrs.type || "").toLowerCase() !== "hidden";
+    if ((node.nodeName === "VIDEO" || node.nodeName === "AUDIO") && "controls" in attrs) return true;
+    if (attrs.role && ROLES.has(attrs.role.trim().split(/\s+/)[0])) return true;
+    if ("contenteditable" in attrs && attrs.contenteditable !== "false") return true;
+    if ("onclick" in attrs) return true;
+    if ("tabindex" in attrs && attrs.tabindex !== "-1") return true;
     return false;
   };
   const walk = (node: any) => {
-    if (!node || n >= 400) return;
+    if (!node) return;
     if (node.nodeType === 1) {
       const attrs = attrsOf(node);
-      if (isInteractive(node, attrs)) {
+      if (isInteractive(node, attrs) && ++total <= limit) {
         n++;
         const ref = genBase + n;
         const label = (textOf(node) || attrs["aria-label"] || attrs.placeholder || attrs.value || attrs.title || "")
@@ -2460,78 +3186,167 @@ async function cdpDeepSnapshot(tabId: number): Promise<any> {
     if (node.contentDocument) walk(node.contentDocument); // iframe subtree
   };
   walk(root);
-  return { url: root.documentURL, count: items.length, elements: items, deep: true };
+  const out: any = { url: root.documentURL, count: items.length, total, truncated: total > items.length, deep: true };
+  if (out.truncated) out.hint = `${total - items.length} more elements not listed; pass limit (max ${SNAPSHOT_MAX_LIMIT})`;
+  out.elements = items;
+  return out;
 }
 
-// Banner-free shallow snapshot across all frames, injected concurrently. Each frame's ref offset
-// is derived from its index (not its neighbor's actual element count) so every frame's injection
-// can fire in parallel instead of waiting on the previous frame to resolve first; bbSnapshot caps
-// at 400 elements per frame, so a 500-wide stride can never let two frames' ref ranges collide.
-async function shallowSnapshot(tab: chrome.tabs.Tab): Promise<any> {
-  assertScriptable(tab);
+// ---- snapshot / ax_snapshot orchestration (two-phase, budgeted, routed refs) ----
+// Every snapshot bumps an epoch. Phase 1 (bbSnapshot / bbAxSnapshot) runs in each frame concurrently
+// and parks its priority-ordered candidates; the SW then splits the ref budget fairly across frames
+// (snapshot-plan.ts), numbers each frame's refs as one dense, disjoint range, and phase 2
+// (bbCommitRefs) registers them. The per-tab route table remembers which frame owns which range, so a
+// ref is only ever resolved in the frame that issued it: a frame whose re-snapshot failed keeps its OLD
+// __bbRefs map, but no current ref routes there, so its stale entries can't collide with a new range.
+let snapEpoch = 0;
+const refRoutes = new Map<number, { epoch: number; routes: RefRoute[] }>();
+
+async function frameList(tab: chrome.tabs.Tab): Promise<number[]> {
   let frames: { frameId: number }[];
   try {
     frames = (await chrome.webNavigation.getAllFrames({ tabId: tab.id! })) ?? [{ frameId: 0 }];
   } catch {
     frames = [{ frameId: 0 }];
   }
-  const FRAME_REF_STRIDE = 500;
-  const results = await Promise.all(
-    frames.map(async (f, i) => {
-      try {
-        const res = await chrome.scripting.executeScript({
-          target: { tabId: tab.id!, frameIds: [f.frameId] },
-          func: bbSnapshot as any,
-          args: [i * FRAME_REF_STRIDE],
-        });
-        return { frameId: f.frameId, v: res?.[0]?.result as any };
-      } catch {
-        return null; // frame not injectable (about:blank, sandboxed, gone)
-      }
-    })
-  );
-  const all: any[] = [];
-  for (const r of results) {
-    if (!r || !r.v || !r.v.elements) continue;
-    for (const e of r.v.elements) all.push(r.frameId === 0 ? e : { ...e, frameId: r.frameId });
-  }
-  if (all.length > 400) all.length = 400;
-  return { url: tab.url, count: all.length, elements: all };
+  const ids = frames.map((f) => f.frameId);
+  ids.sort((a, b) => (a === 0 ? -1 : b === 0 ? 1 : 0)); // top frame first, rest in Chrome's order
+  if (!ids.includes(0)) ids.unshift(0);
+  return ids;
 }
 
-// Banner-free accessibility-tree snapshot, injected per-frame (same scheme as shallowSnapshot: each
-// frame gets a disjoint ref-offset stride, and each interactive node is registered in that frame's
-// window.__bbRefs so its ref works with click/fill/hover/type). The extension returns the structured
-// per-frame trees; the server renders the compact text (server/src/ax.ts).
-async function axSnapshot(tab: chrome.tabs.Tab): Promise<any> {
+interface PlannedFrame {
+  frameId: number;
+  v: any; // the frame's phase-1 result
+  offset: number;
+  keep: number; // refs registered (0 = none)
+}
+
+async function twoPhaseSnapshot(tab: chrome.tabs.Tab, func: (...a: any[]) => any, extraArgs: any[], limit: number, countOf: (v: any) => number): Promise<{ epoch: number; frames: PlannedFrame[] }> {
   assertScriptable(tab);
-  let frames: { frameId: number }[];
-  try {
-    frames = (await chrome.webNavigation.getAllFrames({ tabId: tab.id! })) ?? [{ frameId: 0 }];
-  } catch {
-    frames = [{ frameId: 0 }];
-  }
-  const FRAME_REF_STRIDE = 500;
+  const epoch = ++snapEpoch;
+  const ids = await frameList(tab);
   const results = await Promise.all(
-    frames.map(async (f, i) => {
+    ids.map(async (frameId) => {
       try {
         const res = await chrome.scripting.executeScript({
-          target: { tabId: tab.id!, frameIds: [f.frameId] },
-          func: bbAxSnapshot as any,
-          args: [i * FRAME_REF_STRIDE],
+          target: { tabId: tab.id!, frameIds: [frameId] },
+          func: func as any,
+          args: clean([epoch, ...extraArgs]),
         });
-        return { frameId: f.frameId, v: res?.[0]?.result as any };
-      } catch {
+        const v = res?.[0]?.result as any;
+        if (!v || typeof v !== "object") return null;
+        if (typeof v.error === "string") {
+          if (frameId === 0) throw new Error(v.error);
+          return null;
+        }
+        return { frameId, v };
+      } catch (e) {
+        if (frameId === 0 && e instanceof Error && !/Cannot access|No frame|was removed/i.test(e.message)) throw e;
         return null; // frame not injectable (about:blank, sandboxed, gone)
       }
     })
   );
+  const ok = results.filter((r): r is { frameId: number; v: any } => !!r);
+  const budgets = allocateFrameBudgets(ok.map((r) => countOf(r.v)), limit);
+  const offsets = frameOffsets(budgets);
+  const planned: PlannedFrame[] = ok.map((r, i) => ({ frameId: r.frameId, v: r.v, offset: offsets[i], keep: budgets[i] }));
+  await Promise.all(
+    planned.map(async (p) => {
+      try {
+        const res = await chrome.scripting.executeScript({
+          target: { tabId: tab.id!, frameIds: [p.frameId] },
+          func: bbCommitRefs as any,
+          args: [epoch, p.offset, p.keep],
+        });
+        const v = res?.[0]?.result as any;
+        if (!v || v.error) p.keep = 0;
+      } catch {
+        p.keep = 0; // frame went away between phases - its refs are not handed out
+      }
+    })
+  );
+  refRoutes.set(tab.id!, {
+    epoch,
+    routes: planned.filter((p) => p.keep > 0).map((p) => ({ frameId: p.frameId, lo: p.offset + 1, hi: p.offset + p.keep })),
+  });
+  return { epoch, frames: planned };
+}
+
+// Frame that owns `ref` in the latest snapshot of this tab. undefined = no route table (e.g. the
+// service worker restarted since the snapshot) so the caller falls back to asking every frame;
+// null = the table exists but the ref isn't in it (from an older snapshot) -> stale.
+function ownerFrameForRef(tabId: number, ref: number): number | null | undefined {
+  const t = refRoutes.get(tabId);
+  if (!t) return undefined;
+  return routeRef(t.routes, ref);
+}
+
+// Banner-free plain snapshot across all frames.
+async function shallowSnapshot(tab: chrome.tabs.Tab, params: any = {}): Promise<any> {
+  const limit = clampLimit(params.limit);
+  const opts = { limit, viewportOnly: !!params.viewportOnly, modalOnly: !!params.modalOnly, filter: params.filter ? String(params.filter) : null };
+  const { frames } = await twoPhaseSnapshot(tab, bbSnapshot, [opts], limit, (v) => (v.elements ? v.elements.length : 0));
+  const elements: any[] = [];
+  let total = 0;
+  let scanCapped = false;
+  let modal: string | undefined;
+  for (const f of frames) {
+    total += f.v.total ?? 0;
+    if (f.v.scanCapped) scanCapped = true;
+    if (f.v.modal && !modal) modal = f.frameId === 0 ? f.v.modal : `${f.v.modal} (frame ${f.frameId})`;
+    const els: any[] = f.v.elements ?? [];
+    for (let i = 0; i < f.keep && i < els.length; i++) {
+      const e = { ref: f.offset + i + 1, ...els[i] };
+      if (f.frameId !== 0) e.frameId = f.frameId;
+      elements.push(e);
+    }
+  }
+  const truncated = total > elements.length || scanCapped;
+  const out: any = { url: tab.url, count: elements.length, total, truncated };
+  if (truncated) {
+    out.hint =
+      `${Math.max(0, total - elements.length)}${scanCapped ? "+" : ""} more elements not listed (priority order: open dialogs/popovers, then in-viewport, then the rest); ` +
+      `pass limit (max ${SNAPSHOT_MAX_LIMIT}), or filter:"text", or viewportOnly:true`;
+  }
+  if (modal) {
+    out.modal = modal;
+    out.modalOnly = "a modal dialog is open: elements behind it are marked behindModal:true (likely not clickable); pass modalOnly:true to list only the dialog";
+  }
+  out.elements = elements;
+  return out;
+}
+
+// Banner-free accessibility-tree snapshot (same two-phase ref scheme). The extension returns the
+// structured per-frame trees; the server renders the compact text (server/src/ax.ts).
+async function axSnapshot(tab: chrome.tabs.Tab, params: any = {}): Promise<any> {
+  const limit = clampLimit(params.limit);
+  const { frames } = await twoPhaseSnapshot(tab, bbAxSnapshot, [], limit, (v) => v.total ?? 0);
   const outFrames: any[] = [];
-  for (const r of results) {
-    if (!r || !r.v) continue;
-    outFrames.push({ frameId: r.frameId, url: r.v.url, root: r.v.root ?? null, truncated: !!r.v.truncated });
+  for (const f of frames) {
+    const assigned = assignAxRefs(f.v.root, f.offset, f.keep);
+    const fr: any = { frameId: f.frameId, url: f.v.url, root: f.v.root ?? null, truncated: !!f.v.truncated };
+    if ((f.v.total ?? 0) > assigned) {
+      fr.refsTotal = f.v.total;
+      fr.refsAssigned = assigned;
+    }
+    if (f.v.modal) fr.modal = f.v.modal;
+    outFrames.push(fr);
   }
-  return { url: tab.url, frames: outFrames };
+  return { url: tab.url, limit, frames: outFrames };
+}
+
+// Give a framework a moment to render an action's result before withSnapshot captures it: wait for
+// the top frame's DOM to be mutation-quiet for 150ms (capped at 800ms). Best-effort.
+async function waitDomQuiet(tab: chrome.tabs.Tab, quietMs = 150, capMs = 800): Promise<void> {
+  try {
+    await Promise.race([
+      chrome.scripting.executeScript({ target: { tabId: tab.id!, frameIds: [0] }, func: bbDomQuiet as any, args: [quietMs, capMs] }),
+      sleep(capMs + 200),
+    ]);
+  } catch {
+    /* navigating / not injectable - snapshot anyway */
+  }
 }
 
 // Optionally attaches a fresh shallow snapshot to an interaction result (params.withSnapshot),
@@ -2540,6 +3355,7 @@ async function axSnapshot(tab: chrome.tabs.Tab): Promise<any> {
 async function withSnapshotIfRequested(tab: chrome.tabs.Tab, params: any, result: any): Promise<any> {
   if (!params?.withSnapshot || !result || typeof result !== "object") return result;
   try {
+    await waitDomQuiet(tab);
     result.snapshot = await shallowSnapshot(tab);
   } catch (e) {
     result.snapshot = { error: e instanceof Error ? e.message : String(e) };
@@ -2555,17 +3371,22 @@ async function withSnapshotIfRequested(tab: chrome.tabs.Tab, params: any, result
 async function interact(tab: chrome.tabs.Tab, action: string, ref: number | null, sel: string | null, value: string | null, params: any): Promise<any> {
   const timeoutMs = params.timeoutMs ?? 5000;
   const deadline = Date.now() + timeoutMs;
-  const args: any[] = [action, { ref, sel, value } satisfies BbActParams];
+  let args: any[] = [action, { ref, sel, value } satisfies BbActParams];
   let last: any = null;
   let ownerFrame: number | null = null; // once a frame owns the element, retry only there
+  let pickInfo: { matchCount?: number; note?: string } = {};
   for (;;) {
     if (ownerFrame == null) {
-      const r = await actAllFrames(tab, args);
+      const r = await actAllFrames(tab, [action, { ref, sel, value } satisfies BbActParams]);
       last = r.result;
       ownerFrame = r.frameId;
+      if (r.nth != null) args = [action, { ref, sel, value, nth: r.nth } satisfies BbActParams];
+      if (r.matchCount != null) pickInfo = { matchCount: r.matchCount, note: r.note };
     } else {
       last = await actInFrame(tab, ownerFrame, args);
       if (last?.notFound) ownerFrame = null; // the frame lost the element - re-search all frames
+      // A selector whose chosen match is (still) hidden: re-locate next tick, a visible match may have appeared.
+      else if (sel != null && ref == null && last?.notActionable && last.reason === "hidden") ownerFrame = null;
     }
     // A ref that no frame can resolve will NOT recover by waiting: window.__bbRefs is only
     // repopulated by a new snapshot, and a detached node never reattaches. Retrying it just burned
@@ -2579,7 +3400,7 @@ async function interact(tab: chrome.tabs.Tab, action: string, ref: number | null
         reason: stale ? "stale-ref" : "unknown-ref",
         detail: stale
           ? "the element this ref pointed at is gone from the DOM (re-render/navigation) - take a new snapshot"
-          : "this ref is not in the page's ref registry (it was reset by a navigation, or a newer snapshot replaced it) - take a new snapshot",
+          : "this ref is not from the latest snapshot (taking any snapshot - snapshot or ax_snapshot - invalidates earlier refs; a navigation clears them too) - take a new snapshot",
         ref,
       };
     }
@@ -2587,16 +3408,18 @@ async function interact(tab: chrome.tabs.Tab, action: string, ref: number | null
     if (!retryable || Date.now() >= deadline) break;
     await sleep(150);
   }
+  // Selector disambiguation info rides along when the selector matched more than one element.
+  const withPick = (r: any) => (r && typeof r === "object" && (pickInfo.matchCount ?? 0) > 1 ? { ...r, matchCount: pickInfo.matchCount, note: pickInfo.note } : r);
   if (action === "click" && last?.notActionable && last.reason === "covered" && params.autoTrusted !== false && !params.noEscalate) {
     try {
       const t = await trustedAction(tab.id!, "click", ref, sel);
-      return { ...t, via: "trusted", wasCovered: true, coveredBy: last.coveredBy };
+      return withPick({ ...t, via: "trusted", wasCovered: true, coveredBy: last.coveredBy });
     } catch {
-      return last; // trusted also failed - report the covered state
+      return withPick(last); // trusted also failed - report the covered state
     }
   }
   if (last?.notFound) return { notActionable: true, reason: `not-found-after-${timeoutMs}ms`, ref, selector: sel };
-  return last;
+  return withPick(last);
 }
 
 async function dispatch(method: string, params: any): Promise<any> {
@@ -2673,8 +3496,8 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "snapshot": {
       const tab = await targetTab(params.tabId);
-      if (params.deep) return cdpDeepSnapshot(tab.id!);
-      return shallowSnapshot(tab);
+      if (params.deep) return cdpDeepSnapshot(tab.id!, clampLimit(params.limit));
+      return shallowSnapshot(tab, params);
     }
 
     case "click": {
@@ -3057,20 +3880,43 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "scroll": {
       const tab = await targetTab(params.tabId);
-      const result = await inject(
-        tab,
-        (dy: number | undefined, sel: string | undefined) => {
-          if (sel) {
-            const el = document.querySelector(sel);
-            if (!el) return { error: `Element not found: ${sel}` };
-            el.scrollIntoView({ block: "center", behavior: "instant" as ScrollBehavior });
-            return { scrolledTo: sel };
-          }
-          window.scrollBy(0, dy ?? 600);
-          return { scrolledBy: dy ?? 600, scrollY: window.scrollY };
-        },
-        [params.dy, params.selector]
-      );
+      assertScriptable(tab);
+      // Resolve the frame that owns the target: a ref routes to its issuing frame; a selector is
+      // located across frames and one match is picked (same rules as click/fill); else the top frame.
+      let frameId = 0;
+      let nth: number | null = null;
+      let pickNote: string | undefined;
+      if (params.ref != null) {
+        const owner = ownerFrameForRef(tab.id!, params.ref);
+        if (owner === null) throw new Error(`ref ${params.ref} is not from the latest snapshot (taking any snapshot invalidates earlier refs) - take a fresh snapshot`);
+        if (owner !== undefined) frameId = owner;
+      } else if (params.selector) {
+        const pick = await locateOne(tab, params.selector);
+        if (!pick.chosen) throw new Error(`Element not found in any frame: ${params.selector}`);
+        frameId = pick.chosen.frameId;
+        nth = pick.chosen.index;
+        pickNote = pick.note;
+      }
+      const res = await chrome.scripting.executeScript({
+        target: { tabId: tab.id!, frameIds: [frameId] },
+        func: bbScroll as any,
+        args: clean([
+          {
+            ref: params.ref ?? null,
+            sel: params.ref != null ? null : params.selector ?? null,
+            nth,
+            dx: params.dx ?? null,
+            dy: params.dy ?? null,
+            direction: params.direction ?? null,
+            amount: params.amount ?? null,
+          },
+        ]),
+      });
+      const result: any = res?.[0]?.result;
+      if (!result || typeof result !== "object") throw new Error("scroll: no result from the page (frame navigating?)");
+      if (typeof result.error === "string") throw new Error(result.error);
+      if (frameId !== 0) result.frameId = frameId;
+      if (pickNote) result.note = pickNote;
       return withSnapshotIfRequested(tab, params, result);
     }
 
@@ -3197,33 +4043,74 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "wait_for": {
       const tab = await targetTab(params.tabId);
-      const timeoutMs = params.timeoutMs ?? (params.selector ? 10_000 : 1_000);
-      if (!params.selector) {
-        await sleep(timeoutMs);
-        return { slept: timeoutMs };
+      const hasTarget = !!(params.selector || params.text || params.role);
+      if (!hasTarget) {
+        // No target: a plain sleep of timeoutMs (default 1000ms).
+        const ms = params.timeoutMs ?? 1_000;
+        await sleep(ms);
+        return { slept: ms };
       }
-      const deadline = Date.now() + timeoutMs;
+      assertScriptable(tab);
+      const timeoutMs = params.timeoutMs ?? 10_000;
+      const state: string = params.state ?? "visible";
+      if (!["attached", "visible", "hidden", "detached"].includes(state)) throw new Error(`wait_for: unknown state "${state}" (attached|visible|hidden|detached)`);
+      if (params.selector) await inject(tab, bbValidateSelector, [params.selector]); // throws a clear syntax error
+      const spec = { sel: params.selector ?? null, text: params.text ?? null, role: params.role ?? null, name: params.name ?? null, state };
+      const what = [params.selector && `selector ${params.selector}`, params.role && `role=${params.role}${params.name ? ` name~"${params.name}"` : ""}`, params.text && `text "${params.text}"`]
+        .filter(Boolean)
+        .join(" + ");
+      const started = Date.now();
+      const deadline = started + timeoutMs;
+      const positive = state === "visible" || state === "attached";
       let lastErr: string | null = null;
+      // Each round probes every frame concurrently for a slice (<=1.5s, re-listing frames between
+      // slices so new iframes / navigations are picked up). In-page probes resolve the moment the
+      // condition holds. A probe that fails because the page is mid-navigation is just "not yet".
       while (Date.now() < deadline) {
-        // A poll that lands while the page is committing a navigation throws ("Frame with ID 0 was
-        // removed") - which is the single most common way to call wait_for: click a link, then wait
-        // for the next page's element. Treating that as a hard failure made the tool fail ~7 times
-        // in 12 under concurrent load, telling the agent its step broke when the page was merely
-        // still loading. A failed poll is just "not there yet"; only the deadline is fatal, and the
-        // last error rides along so a genuinely dead tab still reports why.
-        try {
-          const found = await inject(tab, (sel: string) => !!document.querySelector(sel), [params.selector]);
-          if (found) return { found: true, selector: params.selector };
-          lastErr = null;
-        } catch (e) {
-          lastErr = e instanceof Error ? e.message : String(e);
+        const sliceEnd = Math.min(deadline, Date.now() + 1_500);
+        const ids = await frameList(tab);
+        const probe = (frameId: number) =>
+          chrome.scripting
+            .executeScript({ target: { tabId: tab.id!, frameIds: [frameId] }, func: bbWaitProbe as any, args: clean([spec, sliceEnd]) })
+            .then((r) => ({ frameId, v: r?.[0]?.result as any }))
+            .catch((e) => {
+              if (frameId === 0) lastErr = e instanceof Error ? e.message : String(e);
+              return { frameId, v: null as any };
+            });
+        if (positive) {
+          // First frame that satisfies wins; otherwise wait for every probe's slice to end.
+          const hit = await new Promise<{ frameId: number; v: any } | null>((resolve) => {
+            let pending = ids.length;
+            if (!pending) resolve(null);
+            for (const id of ids) {
+              probe(id).then((r) => {
+                if (r.v && typeof r.v.error === "string") lastErr = r.v.error;
+                if (r.v?.satisfied) resolve(r);
+                if (--pending === 0) resolve(null);
+              });
+            }
+          });
+          if (hit) {
+            const out: any = { found: true, state, elapsedMs: Date.now() - started, matchCount: hit.v.count };
+            if (hit.frameId !== 0) out.frameId = hit.frameId;
+            if (hit.v.tag) out.tag = hit.v.tag;
+            if (hit.v.name) out.name = hit.v.name;
+            if (hit.v.ref != null) out.ref = hit.v.ref;
+            if (params.selector) out.selector = params.selector;
+            return out;
+          }
+        } else {
+          // hidden/detached must hold in EVERY frame that answered (and the top frame must answer).
+          const rs = await Promise.all(ids.map(probe));
+          const answered = rs.filter((r) => r.v && typeof r.v === "object" && typeof r.v.error !== "string");
+          for (const r of rs) if (r.v && typeof r.v.error === "string") lastErr = r.v.error;
+          if (answered.some((r) => r.frameId === 0) && answered.every((r) => r.v.satisfied)) {
+            return { found: true, state, elapsedMs: Date.now() - started };
+          }
         }
-        await sleep(100); // 250ms meant ~125ms of average overshoot past the element appearing
+        if (Date.now() < deadline) await sleep(50);
       }
-      throw new Error(
-        `Timed out after ${timeoutMs}ms waiting for selector: ${params.selector}` +
-          (lastErr ? ` (last poll failed: ${lastErr})` : "")
-      );
+      throw new Error(`Timed out after ${timeoutMs}ms waiting for ${what} to be ${state}` + (lastErr ? ` (last probe error: ${lastErr})` : ""));
     }
 
     case "download_resource": {
@@ -3656,7 +4543,7 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "ax_snapshot": {
       const tab = await targetTab(params.tabId);
-      return axSnapshot(tab);
+      return axSnapshot(tab, params);
     }
 
     // ---- environment emulation (CDP; shows the debugger banner). Thin: the server resolved presets
