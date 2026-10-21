@@ -231,8 +231,8 @@ export async function bbAct(op: string, p: BbActParams): Promise<any> {
       return found;
     };
 
-    // Ref fingerprint {tag, role, name}. KEEP IN SYNC with the inline copies in bbSnapshot
-    // (background.ts) and bbAxSnapshot (ax.ts), which write window.__bbRefMeta at snapshot time.
+    // Ref fingerprint {tag, role, name}. MUST STAY IDENTICAL to `fp` in the snapshot commit step
+    // (background.ts, "[ref fingerprint]"), which writes window.__bbRefMeta at snapshot time.
     const fpOf = (e: Element): RefFingerprint => {
       const t = e.tagName;
       const it = t === "INPUT" ? ((e as HTMLInputElement).type || "").toLowerCase() : "";
@@ -240,6 +240,9 @@ export async function bbAct(op: string, p: BbActParams): Promise<any> {
       if (t === "INPUT" && (it === "submit" || it === "button" || it === "reset")) s = (e as HTMLInputElement).value || e.getAttribute("aria-label") || "";
       else if (t === "INPUT" || t === "TEXTAREA" || t === "SELECT")
         s = e.getAttribute("aria-label") || e.getAttribute("placeholder") || e.getAttribute("name") || e.id || e.getAttribute("title") || "";
+      // Editable regions (ProseMirror/Lexical/Slate) change their own text when filled: never use innerText.
+      else if ((e as HTMLElement).isContentEditable)
+        s = e.getAttribute("aria-label") || e.getAttribute("aria-placeholder") || e.getAttribute("placeholder") || e.id || e.getAttribute("title") || "";
       else s = e.getAttribute("aria-label") || (e as HTMLElement).innerText || e.textContent || e.getAttribute("title") || "";
       return { tag: t.toLowerCase(), role: e.getAttribute("role") || "", name: s.replace(/\s+/g, " ").trim().slice(0, 80) };
     };

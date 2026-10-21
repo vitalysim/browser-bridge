@@ -102,7 +102,10 @@ function dialogHint(tabId: number | undefined): string {
     const msg = d.message.length > 120 ? d.message.slice(0, 120) + "…" : d.message;
     return `the page is showing a JavaScript ${d.type} dialog ("${msg}") - call handle_dialog (accept:true/false) to close it`;
   }
-  return "the page may be showing a JavaScript dialog (alert/confirm/prompt/beforeunload) - call handle_dialog - or the tab may be hung or still loading";
+  return (
+    "the page may be showing a JavaScript dialog (alert/confirm/prompt/beforeunload) - try handle_dialog, and if it reports " +
+    "none it must be closed by the user in Chrome (pass onDialog to click/press_key to avoid this) - or the tab may be hung or still loading"
+  );
 }
 
 /** The actionable message every bounded tab operation throws on timeout. */
@@ -840,7 +843,10 @@ async function injectAllAggregate(tab: chrome.tabs.Tab, func: (...args: any[]) =
 // frame and ONE match is chosen (visible > top frame > in viewport > document order), then bbAct runs
 // only in that frame on that match (p.nth) - so a selector can't also fill a lookalike field inside an
 // embedded widget iframe, and a hidden duplicate (mobile nav) doesn't shadow the visible one.
-async function actAllFrames(tab: chrome.tabs.Tab, args: any[]): Promise<{ result: any; frameId: number | null; nth?: number; matchCount?: number; note?: string }> {
+async function actAllFrames(
+  tab: chrome.tabs.Tab,
+  args: any[]
+): Promise<{ result: any; frameId: number | null; nth?: number; matchCount?: number; note?: string; skipped?: number }> {
   const p: BbActParams = args[1] ?? {};
   if (p.ref != null) {
     const owner = ownerFrameForRef(tab.id!, p.ref);
@@ -857,7 +863,7 @@ async function actAllFrames(tab: chrome.tabs.Tab, args: any[]): Promise<{ result
     }
   } else if (p.sel != null) {
     const pick = await locateOne(tab, p.sel);
-    if (!pick.chosen) return { result: { notFound: true }, frameId: null };
+    if (!pick.chosen) return { result: { notFound: true }, frameId: null, skipped: pick.skipped };
     const nthArgs = [args[0], { ...p, nth: pick.chosen.index }, ...args.slice(2)];
     const v = await actInFrame(tab, pick.chosen.frameId, nthArgs);
     return {
@@ -866,9 +872,11 @@ async function actAllFrames(tab: chrome.tabs.Tab, args: any[]): Promise<{ result
       nth: pick.chosen.index,
       matchCount: pick.count,
       note: pick.note,
+      skipped: pick.skipped,
     };
   }
   const results = await injectAllFrames(tab, bbAct, args);
+  const skipped = results.skippedFrames?.length ?? 0;
   let acted: any = null;
   let ownerFrame: number | null = null;
   let stale: any = null; // keep bbAct's {staleRef, was, now} detail for the error message
@@ -881,8 +889,8 @@ async function actAllFrames(tab: chrome.tabs.Tab, args: any[]): Promise<{ result
     acted = v;
     ownerFrame = r.frameId; // this frame owns the element (result may be notActionable)
   }
-  if (acted) return { result: acted, frameId: ownerFrame };
-  return { result: stale ?? { notFound: true }, frameId: null };
+  if (acted) return { result: acted, frameId: ownerFrame, skipped };
+  return { result: stale ?? { notFound: true }, frameId: null, skipped };
 }
 
 // Read-only locate of a selector in every frame, then pick ONE match (snapshot-plan.ts
@@ -896,7 +904,8 @@ async function locateOne(tab: chrome.tabs.Tab, sel: string) {
     if (typeof v.error === "string") throw new Error(v.error);
     for (const m of v.matches ?? []) matches.push({ frameId: r.frameId, index: m.index, visible: m.visible, inViewport: m.inViewport });
   }
-  return pickSelectorTarget(matches);
+  // Child frames that did not answer within INJECT_CHILD_MS were not searched: callers say so on a miss.
+  return { ...pickSelectorTarget(matches), skipped: located.skippedFrames?.length ?? 0 };
 }
 
 // A retry once the owning frame is known: run bbAct in just that one frame.
@@ -1240,6 +1249,38 @@ function bbSnapshot(epoch: number, o: { limit: number; viewportOnly: boolean; mo
         if (sr) walk(sr);
       }
     };
+    // Open overlays FIRST: a portal modal/popover is usually the last child of <body>, so on a page with
+    // more than SCAN_CAP candidates a DOM-order walk would never reach it (and modalOnly would then
+    // return nothing). `seen` de-duplicates when the full walk revisits them.
+    const walkSubtree = (root: Element) => {
+      if (scanCapped) return;
+      consider(root);
+      const sr = (root as HTMLElement).shadowRoot;
+      if (sr) walk(sr);
+      let els: NodeListOf<Element>;
+      try {
+        els = root.querySelectorAll("*");
+      } catch {
+        return;
+      }
+      for (let i = 0; i < els.length; i++) {
+        if (scanCapped) return;
+        consider(els[i]);
+        const s2 = (els[i] as HTMLElement).shadowRoot;
+        if (s2) walk(s2);
+      }
+    };
+    const overlays: Element[] = [];
+    if (modal) overlays.push(modal);
+    try {
+      document.querySelectorAll(OVERLAY).forEach((o) => {
+        if (overlays.includes(o) || overlays.some((x) => x.contains(o))) return;
+        if (o.hasAttribute("popover") && !safeMatches(o, ":popover-open")) return;
+        if (!shown(o, false)) return;
+        overlays.push(o);
+      });
+    } catch {}
+    for (const o of overlays.slice(0, 20)) walkSubtree(o);
     walk(document);
 
     // ---- modal handling + priority buckets ----
@@ -1316,6 +1357,9 @@ function bbCommitRefs(epoch: number, offset: number, keep: number) {
     if (t === "INPUT" && (it === "submit" || it === "button" || it === "reset")) s = (e as HTMLInputElement).value || e.getAttribute("aria-label") || "";
     else if (t === "INPUT" || t === "TEXTAREA" || t === "SELECT")
       s = e.getAttribute("aria-label") || e.getAttribute("placeholder") || e.getAttribute("name") || e.id || e.getAttribute("title") || "";
+    // Editable regions (ProseMirror/Lexical/Slate) change their own text when filled: never use innerText.
+    else if ((e as HTMLElement).isContentEditable)
+      s = e.getAttribute("aria-label") || e.getAttribute("aria-placeholder") || e.getAttribute("placeholder") || e.id || e.getAttribute("title") || "";
     else s = e.getAttribute("aria-label") || (e as HTMLElement).innerText || e.textContent || e.getAttribute("title") || "";
     return { tag: t.toLowerCase(), role: e.getAttribute("role") || "", name: s.replace(/\s+/g, " ").trim().slice(0, 80) };
   };
@@ -1776,7 +1820,7 @@ interface LoadWaitResult {
 
 function startLoadWait(
   tabId: number,
-  opts: { waitUntil?: WaitUntil; timeoutMs?: number; cancelKey?: object } = {}
+  opts: { waitUntil?: WaitUntil; timeoutMs?: number; cancelKey?: object; targetUrl?: string } = {}
 ): { wait(): Promise<LoadWaitResult>; dispose(): void } {
   const waitUntil: WaitUntil = opts.waitUntil ?? "load";
   const timeoutMs = opts.timeoutMs ?? 20_000;
@@ -1812,9 +1856,17 @@ function startLoadWait(
       poke();
     }
   };
-  // Same-document navigations never fire 'complete' - they are done the moment they happen.
-  const onSameDoc = (d: { tabId: number; frameId: number }) => {
-    if (mine(d.tabId) && d.frameId === 0) {
+  // Same-document navigations never fire 'complete' - they are done the moment they happen. When we know
+  // the target URL (navigate), only a same-document nav TO it counts: an SPA on the old page calling
+  // pushState/replaceState right after tabs.update must not end the wait before the real load commits.
+  let target: string | null = null;
+  try {
+    target = opts.targetUrl ? new URL(opts.targetUrl).href : null;
+  } catch {
+    target = null;
+  }
+  const onSameDoc = (d: { tabId: number; frameId: number; url?: string }) => {
+    if (mine(d.tabId) && d.frameId === 0 && (!target || d.url === target)) {
       reached = true;
       poke();
     }
@@ -2215,7 +2267,8 @@ async function ensureAttached(tabId: number): Promise<Session> {
     const run = (async () => {
       await attach(tabId);
       if (abandoned) {
-        await detachSession(tabId).catch(() => {});
+        // Only tear down if no newer session was created for this tab meanwhile.
+        if (!sessions.has(tabId)) await detachSession(tabId).catch(() => {});
         throw new Error("attach abandoned after timeout");
       }
       // If an enable fails AFTER a successful attach, detach so we don't strand an orphaned debugger
@@ -2224,7 +2277,7 @@ async function ensureAttached(tabId: number): Promise<Session> {
         await Promise.all([cmd(tabId, "DOM.enable", undefined, ATTACH_MS), cmd(tabId, "Page.enable", undefined, ATTACH_MS)]);
         if (abandoned) throw new Error("attach abandoned after timeout");
       } catch (e) {
-        await detachSession(tabId).catch(() => {});
+        if (!sessions.has(tabId)) await detachSession(tabId).catch(() => {});
         throw e;
       }
       const s: Session = {
@@ -3726,10 +3779,15 @@ async function twoPhaseSnapshot(
       }
     })
   );
-  refRoutes.set(tab.id!, {
-    epoch,
-    routes: planned.filter((p) => p.keep > 0).map((p) => ({ frameId: p.frameId, lo: p.offset + 1, hi: p.offset + p.keep })),
-  });
+  // Two snapshots racing on one tab (e.g. click{withSnapshot} + snapshot): the OLDER one finishing last
+  // must not overwrite the newer routing, or refs the agent was just handed would be rejected as stale.
+  const prevRoute = refRoutes.get(tab.id!);
+  if (!prevRoute || epoch >= prevRoute.epoch) {
+    refRoutes.set(tab.id!, {
+      epoch,
+      routes: planned.filter((p) => p.keep > 0).map((p) => ({ frameId: p.frameId, lo: p.offset + 1, hi: p.offset + p.keep })),
+    });
+  }
   return { epoch, frames: planned, skippedFrames: skipped };
 }
 
@@ -3925,71 +3983,130 @@ function startEffectWatch(tab: chrome.tabs.Tab) {
 // BEFORE the dialog opened (a late session gets "No dialog is showing" and Page.enable hangs behind the
 // blocked renderer - verified against bare Chromium). So when the agent opts in with onDialog, the action
 // briefly replaces window.alert/confirm/prompt in the page's MAIN world (every frame), answers as told,
-// and records what was shown on a DOM attribute the isolated world can read back. Restored after `ttlMs`.
+// and records what was shown on a DOM attribute named with a per-call random nonce (so a page cannot
+// pre-plant fake dialog reports into the agent's result). The guard is removed as soon as the action
+// finishes (collectGuardedDialogs, also on failure), on pagehide, or by a TTL backstop. Overlapping guards
+// on one page are tracked in a registry so removing one never strands another or the page's originals.
 // beforeunload is not covered (it is not a window method). Without onDialog nothing is installed.
-async function armDialogGuard(tab: chrome.tabs.Tab, mode: "accept" | "dismiss", promptText: string | null, ttlMs = 3_000): Promise<void> {
+function newGuardNonce(): string {
+  return Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function armDialogGuard(tab: chrome.tabs.Tab, nonce: string, mode: "accept" | "dismiss", promptText: string | null, ttlMs: number): Promise<void> {
   await injectAllFrames(
     tab,
-    (mode: string, promptText: string | null, ttl: number) => {
+    (nonce: string, mode: string, promptText: string | null, ttl: number) => {
       const w = window as any;
-      const prev = w.__bbDlgGuard;
-      if (prev) clearTimeout(prev.t);
-      const orig = prev?.orig ?? { alert: w.alert, confirm: w.confirm, prompt: w.prompt };
-      const accept = mode === "accept";
-      const rec = (type: string, msg: unknown, answer: unknown) => {
-        const list = JSON.parse(document.documentElement.getAttribute("data-bb-dialogs") || "[]");
-        list.push({ type, message: String(msg ?? "").slice(0, 500), accepted: accept, answer });
-        document.documentElement.setAttribute("data-bb-dialogs", JSON.stringify(list.slice(-10)));
-      };
-      w.alert = function (m?: unknown) { rec("alert", m, null); };
-      w.confirm = function (m?: unknown) { rec("confirm", m, accept); return accept; };
-      w.prompt = function (m?: unknown, d?: unknown) {
-        const v = accept ? (promptText ?? (d == null ? "" : String(d))) : null;
-        rec("prompt", m, v);
-        return v;
-      };
-      const restore = () => {
-        const g = w.__bbDlgGuard;
-        if (g) clearTimeout(g.t);
-        w.alert = orig.alert;
-        w.confirm = orig.confirm;
-        w.prompt = orig.prompt;
-        delete w.__bbDlgGuard;
-      };
-      // The timer is only a backstop: collectGuardedDialogs restores as soon as the action is done, so a
-      // guard never answers dialogs for a later action that didn't opt in, or for the user.
-      w.__bbDlgGuard = { orig, restore, t: setTimeout(restore, ttl) };
+      let reg = w.__bbDlgGuard;
+      if (!reg || !(reg.guards instanceof Map) || !reg.real) {
+        reg = { real: { alert: w.alert, confirm: w.confirm, prompt: w.prompt }, guards: new Map() };
+        Object.defineProperty(w, "__bbDlgGuard", { value: reg, configurable: true, writable: true, enumerable: false });
+        const active = () => {
+          let last: any = null;
+          for (const g of reg.guards.values()) last = g; // most recently armed wins
+          return last;
+        };
+        const rec = (g: any, type: string, msg: unknown, answer: unknown) => {
+          const attr = "data-bb-dlg-" + g.nonce;
+          let list: any[] = [];
+          try {
+            list = JSON.parse(document.documentElement.getAttribute(attr) || "[]");
+          } catch {}
+          list.push({ type, message: String(msg ?? "").slice(0, 500), accepted: g.accept, answer });
+          document.documentElement.setAttribute(attr, JSON.stringify(list.slice(-10)));
+        };
+        w.alert = function (m?: unknown) {
+          const g = active();
+          if (!g) return reg.real.alert.call(w, m);
+          rec(g, "alert", m, null);
+        };
+        w.confirm = function (m?: unknown) {
+          const g = active();
+          if (!g) return reg.real.confirm.call(w, m);
+          rec(g, "confirm", m, g.accept);
+          return g.accept;
+        };
+        w.prompt = function (m?: unknown, d?: unknown) {
+          const g = active();
+          if (!g) return reg.real.prompt.call(w, m, d);
+          const v = g.accept ? (g.promptText ?? (d == null ? "" : String(d))) : null;
+          rec(g, "prompt", m, v);
+          return v;
+        };
+        reg.removeAll = () => {
+          for (const g of reg.guards.values()) clearTimeout(g.t);
+          reg.guards.clear();
+          w.alert = reg.real.alert;
+          w.confirm = reg.real.confirm;
+          w.prompt = reg.real.prompt;
+          delete w.__bbDlgGuard;
+        };
+        reg.remove = (n: string) => {
+          const g = reg.guards.get(n);
+          if (g) clearTimeout(g.t);
+          reg.guards.delete(n);
+          if (!reg.guards.size) reg.removeAll();
+        };
+        // A navigation away (incl. into bfcache) must not keep answering dialogs when the user comes back.
+        w.addEventListener("pagehide", () => reg.removeAll?.(), { once: true });
+      }
+      reg.guards.set(nonce, { nonce, accept: mode === "accept", promptText, t: setTimeout(() => reg.remove(nonce), ttl) });
       return true;
     },
-    [mode, promptText, ttlMs],
+    [nonce, mode, promptText, ttlMs],
     "MAIN"
   );
 }
 
-async function collectGuardedDialogs(tab: chrome.tabs.Tab): Promise<any[]> {
+/** Remove this action's guard (every frame) and return the dialogs it answered. Never throws. */
+async function collectGuardedDialogs(tab: chrome.tabs.Tab, nonce: string): Promise<any[]> {
   await injectAllFrames(
     tab,
-    () => {
-      (window as any).__bbDlgGuard?.restore?.();
+    (n: string) => {
+      (window as any).__bbDlgGuard?.remove?.(n);
       return true;
     },
-    [],
+    [nonce],
     "MAIN"
   ).catch(() => {});
   try {
-    const res = await injectAllFrames(tab, () => {
-      const raw = document.documentElement.getAttribute("data-bb-dialogs");
-      document.documentElement.removeAttribute("data-bb-dialogs");
-      try {
-        return raw ? JSON.parse(raw) : [];
-      } catch {
-        return [];
-      }
-    });
+    const res = await injectAllFrames(
+      tab,
+      (n: string) => {
+        const attr = "data-bb-dlg-" + n;
+        const raw = document.documentElement.getAttribute(attr);
+        document.documentElement.removeAttribute(attr);
+        try {
+          const v = raw ? JSON.parse(raw) : [];
+          return Array.isArray(v) ? v.slice(0, 10) : [];
+        } catch {
+          return [];
+        }
+      },
+      [nonce]
+    );
     return res.flatMap((r: any) => (Array.isArray(r?.result) ? r.result : []));
   } catch {
     return [];
   }
+}
+
+/** Run one action under an optional dialog guard; the guard is always removed, even if the action throws. */
+async function withDialogGuard(tab: chrome.tabs.Tab, params: any, ttlMs: number, run: () => Promise<any>): Promise<any> {
+  const mode = params.onDialog === "accept" || params.onDialog === "dismiss" ? (params.onDialog as "accept" | "dismiss") : null;
+  if (!mode) return run();
+  const nonce = newGuardNonce();
+  await armDialogGuard(tab, nonce, mode, typeof params.promptText === "string" ? params.promptText : null, ttlMs);
+  let result: any;
+  try {
+    result = await run();
+  } catch (e) {
+    await collectGuardedDialogs(tab, nonce);
+    throw e;
+  }
+  const dialogs = await collectGuardedDialogs(tab, nonce);
+  if (dialogs.length && result && typeof result === "object") result = { ...result, dialogs };
+  return result;
 }
 
 async function withEffects(watch: ReturnType<typeof startEffectWatch>, result: any, succeeded: boolean): Promise<any> {
@@ -4076,11 +4193,13 @@ async function interact(tab: chrome.tabs.Tab, action: string, ref: number | null
   let last: any = null;
   let ownerFrame: number | null = null; // once a frame owns the element, retry only there
   let pickInfo: { matchCount?: number; note?: string } = {};
+  let skippedFrames = 0; // child frames that did not answer (not searched) on the latest all-frames pass
   for (;;) {
     if (ownerFrame == null) {
       const r = await actAllFrames(tab, [action, { ref, sel, value } satisfies BbActParams]);
       last = r.result;
       ownerFrame = r.frameId;
+      skippedFrames = r.skipped ?? 0;
       if (r.nth != null) args = [action, { ref, sel, value, nth: r.nth } satisfies BbActParams];
       if (r.matchCount != null) pickInfo = { matchCount: r.matchCount, note: r.note };
     } else {
@@ -4107,7 +4226,7 @@ async function interact(tab: chrome.tabs.Tab, action: string, ref: number | null
       };
     }
     const retryable = last && (last.notFound || (last.notActionable && last.reason !== "covered"));
-    if (!retryable || Date.now() >= deadline) break;
+    if (!retryable || Date.now() >= deadline || isCancelled(params)) break; // server gave up: stop acting
     await sleep(150);
   }
   // Selector disambiguation info rides along when the selector matched more than one element.
@@ -4121,7 +4240,14 @@ async function interact(tab: chrome.tabs.Tab, action: string, ref: number | null
       return withPick({ ...last, escalationError: e instanceof Error ? e.message : String(e) });
     }
   }
-  if (last?.notFound) return { notActionable: true, reason: `not-found-after-${timeoutMs}ms`, ref, selector: sel };
+  if (last?.notFound) {
+    const out: any = { notActionable: true, reason: `not-found-after-${timeoutMs}ms`, ref, selector: sel };
+    if (skippedFrames) {
+      out.skippedFrames = skippedFrames;
+      out.detail = `${skippedFrames} child frame(s) did not respond within ${INJECT_CHILD_MS / 1000}s and were not searched - the target may be inside one of them (still loading?)`;
+    }
+    return out;
+  }
   return withPick(last);
 }
 
@@ -4192,7 +4318,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       const tab = await targetTab(params.tabId);
       const before = tab.url;
       // Listen BEFORE issuing the navigation so a fast load can't complete unseen.
-      const load = startLoadWait(tab.id!, { waitUntil: parseWaitUntil(params.waitUntil), cancelKey: params });
+      const load = startLoadWait(tab.id!, { waitUntil: parseWaitUntil(params.waitUntil), cancelKey: params, targetUrl: params.url });
       try {
         await chrome.tabs.update(tab.id!, { url: params.url });
       } catch (e) {
@@ -4232,7 +4358,10 @@ async function dispatch(method: string, params: any): Promise<any> {
         if (r.frameId === 0) combined += v.text;
         else combined += `\n\n--- frame: ${v.url} ---\n${v.text}`;
       }
-      return { title: top?.title ?? tab.title, url: top?.url ?? tab.url, text: combined };
+      const out: any = { title: top?.title ?? tab.title, url: top?.url ?? tab.url, text: combined };
+      // Child frames that did not answer within INJECT_CHILD_MS: their text is missing from `text`.
+      if (results.skippedFrames?.length) out.skippedFrames = results.skippedFrames.map((f) => ({ frameId: f.frameId, url: f.url }));
+      return out;
     }
 
     case "snapshot": {
@@ -4243,23 +4372,20 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "click": {
       const tab = await targetTab(params.tabId);
-      const guard = params.onDialog === "accept" || params.onDialog === "dismiss";
-      if (guard) await armDialogGuard(tab, params.onDialog, params.promptText ?? null);
-      const watch = startEffectWatch(tab);
-      let result: any;
-      try {
-        result = params.trusted
-          ? { ...(await trustedAction(tab, "click", params.ref ?? null, params.selector ?? null)), via: "trusted" }
-          : await interact(tab, "click", params.ref, params.selector, null, params);
-      } catch (e) {
-        watch.stop();
-        throw e;
-      }
-      result = await withEffects(watch, result, !!result?.clicked);
-      if (guard && result && typeof result === "object") {
-        const dialogs = await collectGuardedDialogs(tab);
-        if (dialogs.length) result = { ...result, dialogs };
-      }
+      // Guard TTL covers the auto-wait (timeoutMs) plus a possible trusted escalation (attach ~12s).
+      const result = await withDialogGuard(tab, params, (params.timeoutMs ?? 5_000) + 15_000, async () => {
+        const watch = startEffectWatch(tab);
+        let r: any;
+        try {
+          r = params.trusted
+            ? { ...(await trustedAction(tab, "click", params.ref ?? null, params.selector ?? null)), via: "trusted" }
+            : await interact(tab, "click", params.ref, params.selector, null, params);
+        } catch (e) {
+          watch.stop();
+          throw e;
+        }
+        return withEffects(watch, r, !!r?.clicked);
+      });
       return withSnapshotIfRequested(tab, params, result);
     }
 
@@ -4668,23 +4794,19 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "press_key": {
       const tab = await targetTab(params.tabId);
-      const guard = params.onDialog === "accept" || params.onDialog === "dismiss";
-      if (guard) await armDialogGuard(tab, params.onDialog, params.promptText ?? null);
-      const watch = startEffectWatch(tab);
-      let result: any;
-      try {
-        // synthetic: dispatched (deferred) in the frame holding focus; Enter submits only when not
-        // preventDefault()ed, Tab moves focus. trusted: real CDP key events.
-        result = params.trusted ? await pressKeyTrusted(tab, String(params.key ?? "")) : await pressKeySynthetic(tab, String(params.key ?? ""));
-      } catch (e) {
-        watch.stop();
-        throw e;
-      }
-      result = await withEffects(watch, result, true);
-      if (guard && result && typeof result === "object") {
-        const dialogs = await collectGuardedDialogs(tab);
-        if (dialogs.length) result = { ...result, dialogs };
-      }
+      const result = await withDialogGuard(tab, params, 15_000, async () => {
+        const watch = startEffectWatch(tab);
+        let r: any;
+        try {
+          // synthetic: dispatched (deferred) in the frame holding focus; Enter submits only when not
+          // preventDefault()ed, Tab moves focus. trusted: real CDP key events.
+          r = params.trusted ? await pressKeyTrusted(tab, String(params.key ?? "")) : await pressKeySynthetic(tab, String(params.key ?? ""));
+        } catch (e) {
+          watch.stop();
+          throw e;
+        }
+        return withEffects(watch, r, true);
+      });
       return withSnapshotIfRequested(tab, params, result);
     }
 
@@ -4702,26 +4824,35 @@ async function dispatch(method: string, params: any): Promise<any> {
         if (owner !== undefined) frameId = owner;
       } else if (params.selector) {
         const pick = await locateOne(tab, params.selector);
-        if (!pick.chosen) throw new Error(`Element not found in any frame: ${params.selector}`);
+        if (!pick.chosen)
+          throw new Error(
+            `Element not found in any frame: ${params.selector}` +
+              (pick.skipped ? ` (${pick.skipped} child frame(s) did not respond within ${INJECT_CHILD_MS / 1000}s and were not searched)` : "")
+          );
         frameId = pick.chosen.frameId;
         nth = pick.chosen.index;
         pickNote = pick.note;
       }
-      const res = await chrome.scripting.executeScript({
-        target: { tabId: tab.id!, frameIds: [frameId] },
-        func: bbScroll as any,
-        args: clean([
-          {
-            ref: params.ref ?? null,
-            sel: params.ref != null ? null : params.selector ?? null,
-            nth,
-            dx: params.dx ?? null,
-            dy: params.dy ?? null,
-            direction: params.direction ?? null,
-            amount: params.amount ?? null,
-          },
-        ]),
-      });
+      const scrollMs = frameId === 0 ? INJECT_TOP_MS : INJECT_CHILD_MS + 2_000;
+      const res = await withTimeout(
+        chrome.scripting.executeScript({
+          target: { tabId: tab.id!, frameIds: [frameId] },
+          func: bbScroll as any,
+          args: clean([
+            {
+              ref: params.ref ?? null,
+              sel: params.ref != null ? null : params.selector ?? null,
+              nth,
+              dx: params.dx ?? null,
+              dy: params.dy ?? null,
+              direction: params.direction ?? null,
+              amount: params.amount ?? null,
+            },
+          ]),
+        }),
+        scrollMs,
+        () => tabTimeoutMsg(tab.id, scrollMs, frameId === 0 ? "scroll" : `scroll (frame ${frameId})`)
+      );
       const result: any = res?.[0]?.result;
       if (!result || typeof result !== "object") throw new Error("scroll: no result from the page (frame navigating?)");
       if (typeof result.error === "string") throw new Error(result.error);
@@ -4876,35 +5007,52 @@ async function dispatch(method: string, params: any): Promise<any> {
       const deadline = started + timeoutMs;
       const positive = state === "visible" || state === "attached";
       let lastErr: string | null = null;
+      const skippedFrames = new Set<number>();
       // Each round probes every frame concurrently for a slice (<=1.5s, re-listing frames between
       // slices so new iframes / navigations are picked up). In-page probes resolve the moment the
       // condition holds. A probe that fails because the page is mid-navigation is just "not yet".
+      // Every probe is bounded: a frame that never reaches document_idle (a wedged ad/embed) or a tab
+      // behind a JS dialog would otherwise never answer and stall the loop until the hub timeout.
       while (Date.now() < deadline) {
         const sliceEnd = Math.min(deadline, Date.now() + 1_500);
         const ids = await frameList(tab);
         const probe = (frameId: number) =>
-          chrome.scripting
-            .executeScript({ target: { tabId: tab.id!, frameIds: [frameId] }, func: bbWaitProbe as any, args: clean([spec, sliceEnd]) })
+          withTimeout(
+            chrome.scripting.executeScript({
+              target: { tabId: tab.id!, frameIds: [frameId] },
+              func: bbWaitProbe as any,
+              args: clean([spec, sliceEnd]),
+            }),
+            frameId === 0 ? Math.max(INJECT_TOP_MS, sliceEnd - Date.now() + 1_000) : sliceEnd - Date.now() + 1_000,
+            () => tabTimeoutMsg(tab.id, INJECT_TOP_MS, "wait_for")
+          )
             .then((r) => ({ frameId, v: r?.[0]?.result as any }))
             .catch((e) => {
-              if (frameId === 0) lastErr = e instanceof Error ? e.message : String(e);
+              if (frameId === 0) {
+                if (isTimeout(e)) throw e; // the top frame not answering at all is a hung tab, not "not yet"
+                lastErr = e instanceof Error ? e.message : String(e);
+              } else if (isTimeout(e)) skippedFrames.add(frameId);
               return { frameId, v: null as any };
             });
         if (positive) {
           // First frame that satisfies wins; otherwise wait for every probe's slice to end.
-          const hit = await new Promise<{ frameId: number; v: any } | null>((resolve) => {
+          const hit = await new Promise<{ frameId: number; v: any } | null>((resolve, reject) => {
             let pending = ids.length;
             if (!pending) resolve(null);
             for (const id of ids) {
-              probe(id).then((r) => {
-                if (r.v && typeof r.v.error === "string") lastErr = r.v.error;
-                if (r.v?.satisfied) resolve(r);
-                if (--pending === 0) resolve(null);
-              });
+              probe(id).then(
+                (r) => {
+                  if (r.v && typeof r.v.error === "string") lastErr = r.v.error;
+                  if (r.v?.satisfied) resolve(r);
+                  if (--pending === 0) resolve(null);
+                },
+                reject // top frame timed out: surface the actionable hung-tab error
+              );
             }
           });
           if (hit) {
             const out: any = { found: true, state, elapsedMs: Date.now() - started, matchCount: hit.v.count };
+            if (skippedFrames.size) out.skippedFrames = [...skippedFrames];
             if (hit.frameId !== 0) out.frameId = hit.frameId;
             if (hit.v.tag) out.tag = hit.v.tag;
             if (hit.v.name) out.name = hit.v.name;
@@ -4918,12 +5066,15 @@ async function dispatch(method: string, params: any): Promise<any> {
           const answered = rs.filter((r) => r.v && typeof r.v === "object" && typeof r.v.error !== "string");
           for (const r of rs) if (r.v && typeof r.v.error === "string") lastErr = r.v.error;
           if (answered.some((r) => r.frameId === 0) && answered.every((r) => r.v.satisfied)) {
-            return { found: true, state, elapsedMs: Date.now() - started };
+            const out: any = { found: true, state, elapsedMs: Date.now() - started };
+            if (skippedFrames.size) out.skippedFrames = [...skippedFrames];
+            return out;
           }
         }
         if (Date.now() < deadline) await sleep(50);
       }
-      throw new Error(`Timed out after ${timeoutMs}ms waiting for ${what} to be ${state}` + (lastErr ? ` (last probe error: ${lastErr})` : ""));
+      const skippedNote = skippedFrames.size ? `; ${skippedFrames.size} child frame(s) did not respond and were not checked` : "";
+      throw new Error(`Timed out after ${timeoutMs}ms waiting for ${what} to be ${state}` + (lastErr ? ` (last probe error: ${lastErr})` : "") + skippedNote);
     }
 
     case "download_resource": {

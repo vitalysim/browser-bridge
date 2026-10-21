@@ -208,7 +208,8 @@ export const NOT_CONNECTED_MESSAGE =
 export function explainTimeout(method: string, timeoutMs: number): string {
   return (
     `Extension call '${method}' timed out after ${timeoutMs}ms. Likely causes: the tab may be showing a ` +
-    "JavaScript dialog (call handle_dialog), still loading, or hung; try screenshot or tabs_list to see its state, " +
+    "JavaScript dialog (try handle_dialog; if it reports none, the user must close it in Chrome - pass onDialog to " +
+    "click/press_key to avoid this), still loading, or hung; try screenshot or tabs_list to see its state, " +
     "then retry or pass an explicit tabId."
   );
 }

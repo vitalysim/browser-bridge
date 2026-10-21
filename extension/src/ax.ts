@@ -244,7 +244,9 @@ export function bbAxSnapshot(epoch: number): { url: string; root: AxWalkNode[]; 
 
   // ---- the walk: returns this element's contribution (itself, or its children when it's a wrapper) ----
   const GENERIC = new Set(["generic", "none", "presentation", ""]);
+  let walkedFirst: Element | null = null; // the open modal, walked before the page (see below)
   const walk = (el: Element): AxWalkNode[] => {
+    if (el === walkedFirst) return []; // already emitted at the top
     if (nodeCount >= NODE_CAP) {
       truncated = true;
       return [];
@@ -293,8 +295,15 @@ export function bbAxSnapshot(epoch: number): { url: string; root: AxWalkNode[]; 
 
   let root: AxWalkNode[] = [];
   try {
+    // An open modal is walked FIRST: a portal modal is usually the last child of <body>, so on a big
+    // page the node cap would otherwise be spent before the walk ever reaches it.
+    let first: AxWalkNode[] = [];
+    if (modal && modal !== document.body) {
+      first = walk(modal);
+      walkedFirst = modal;
+    }
     const body = document.body;
-    root = body ? walk(body) : [];
+    root = first.concat(body ? walk(body) : []);
   } catch {
     /* return whatever was built */
   }
