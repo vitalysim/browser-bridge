@@ -326,6 +326,16 @@ const onDialogParam = z
   );
 const promptTextParam = z.string().optional().describe("Text to answer a prompt() with when onDialog is 'accept'");
 
+const keepAliveParam = z
+  .boolean()
+  .optional()
+  .describe(
+    "Hidden tab (window covered/minimized/other desktop, or another tab in front) renders no frames, so rAF-driven UIs " +
+      "(React-Aria, Radix…) may not update. When the target tab is hidden the action keeps it rendering via the debugger " +
+      "for the action's duration - automatically if a debugger session already exists or the action is trusted; " +
+      "true = also attach the debugger for it (banner); false = never. Results report tabHidden/keptAlive/warning."
+  );
+
 const waitUntilParam = z
   .enum(["load", "domcontentloaded", "none"])
   .optional()
@@ -530,14 +540,15 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       promptText: promptTextParam,
       timeoutMs: timeoutMsParam,
       withSnapshot: withSnapshotParam,
+      keepAlive: keepAliveParam,
       tabId: tabIdParam,
     },
-    async ({ ref, selector, trusted, autoTrusted, noEscalate, onDialog, promptText, timeoutMs, withSnapshot, tabId }) => {
+    async ({ ref, selector, trusted, autoTrusted, noEscalate, onDialog, promptText, timeoutMs, withSnapshot, keepAlive, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
       return textResult(
         await hub.call(
           "click",
-          { ref, selector, trusted, autoTrusted, noEscalate, onDialog, promptText, timeoutMs, withSnapshot, tabId },
+          { ref, selector, trusted, autoTrusted, noEscalate, onDialog, promptText, timeoutMs, withSnapshot, keepAlive, tabId },
           actionHubTimeout(timeoutMs)
         )
       );
@@ -556,11 +567,12 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       selector: z.string().optional().describe("CSS selector (alternative to ref)"),
       timeoutMs: timeoutMsParam,
       withSnapshot: withSnapshotParam,
+      keepAlive: keepAliveParam,
       tabId: tabIdParam,
     },
-    async ({ value, ref, selector, timeoutMs, withSnapshot, tabId }) => {
+    async ({ value, ref, selector, timeoutMs, withSnapshot, keepAlive, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
-      return textResult(await hub.call("fill", { value, ref, selector, timeoutMs, withSnapshot, tabId }, actionHubTimeout(timeoutMs)));
+      return textResult(await hub.call("fill", { value, ref, selector, timeoutMs, withSnapshot, keepAlive, tabId }, actionHubTimeout(timeoutMs)));
     }
   );
 
@@ -575,11 +587,12 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       trusted: z.boolean().optional().describe("Use a real trusted mouse move via chrome.debugger (fires CSS :hover; shows banner)"),
       timeoutMs: timeoutMsParam,
       withSnapshot: withSnapshotParam,
+      keepAlive: keepAliveParam,
       tabId: tabIdParam,
     },
-    async ({ ref, selector, trusted, timeoutMs, withSnapshot, tabId }) => {
+    async ({ ref, selector, trusted, timeoutMs, withSnapshot, keepAlive, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
-      return textResult(await hub.call("hover", { ref, selector, trusted, timeoutMs, withSnapshot, tabId }, actionHubTimeout(timeoutMs)));
+      return textResult(await hub.call("hover", { ref, selector, trusted, timeoutMs, withSnapshot, keepAlive, tabId }, actionHubTimeout(timeoutMs)));
     }
   );
 
@@ -596,11 +609,12 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       trusted: z.boolean().optional().describe("Use real trusted keystrokes via chrome.debugger (shows banner)"),
       timeoutMs: timeoutMsParam,
       withSnapshot: withSnapshotParam,
+      keepAlive: keepAliveParam,
       tabId: tabIdParam,
     },
-    async ({ text, ref, selector, trusted, timeoutMs, withSnapshot, tabId }) => {
+    async ({ text, ref, selector, trusted, timeoutMs, withSnapshot, keepAlive, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
-      return textResult(await hub.call("type", { text, ref, selector, trusted, timeoutMs, withSnapshot, tabId }, actionHubTimeout(timeoutMs)));
+      return textResult(await hub.call("type", { text, ref, selector, trusted, timeoutMs, withSnapshot, keepAlive, tabId }, actionHubTimeout(timeoutMs)));
     }
   );
 
@@ -616,10 +630,11 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       onDialog: onDialogParam,
       promptText: promptTextParam,
       withSnapshot: withSnapshotParam,
+      keepAlive: keepAliveParam,
       tabId: tabIdParam,
     },
-    async ({ key, trusted, onDialog, promptText, withSnapshot, tabId }) =>
-      textResult(await hub.call("press_key", { key, trusted, onDialog, promptText, withSnapshot, tabId }))
+    async ({ key, trusted, onDialog, promptText, withSnapshot, keepAlive, tabId }) =>
+      textResult(await hub.call("press_key", { key, trusted, onDialog, promptText, withSnapshot, keepAlive, tabId }))
   );
 
   tool(
@@ -631,8 +646,9 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       "banner. Actions: mouse_move · left_click/right_click/middle_click · double_click · left_mouse_down/left_mouse_up " +
       "(held drags) · left_click_drag (x,y → x2,y2) · scroll (dx/dy at x,y) · type (per-char keystrokes to the FOCUSED " +
       "element - click the field/canvas first) · key (a key or combo like 'Enter', 'Escape', 'ctrl+c', 'ctrl+shift+k'). " +
-      "NOTE: input is delivered even when the tab is backgrounded, but its frame is throttled then so you can't OBSERVE " +
-      "the result - use activate:true (or tab_activate) to foreground it. For ordinary DOM, prefer click/fill/type.",
+      "NOTE: on a hidden/backgrounded tab the tab is kept rendering for the duration of the input (debugger focus " +
+      "emulation; result has tabHidden/keptAlive), but it stops rendering again afterwards - use activate:true (or " +
+      "tab_activate) to watch later updates. For ordinary DOM, prefer click/fill/type.",
     {
       action: z
         .enum(["mouse_move", "left_click", "right_click", "middle_click", "double_click", "left_mouse_down", "left_mouse_up", "left_click_drag", "scroll", "type", "key"])

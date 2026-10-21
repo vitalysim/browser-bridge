@@ -29,6 +29,12 @@ export interface BbActParams {
   // root, then onward (the same order background.ts bbLocateAll indexes). Set by actAllFrames after
   // it picked one match across frames.
   nth?: number | null;
+  // With sel and no nth: locate + pick + act in ONE injection (the single-frame / top-frame fast
+  // path). Matches are ranked exactly like snapshot-plan.ts pickSelectorTarget ranks one frame's
+  // matches (visible > in viewport > document order, visibility as bbLocateAll computes it). When the
+  // best match is not visible nothing is done and {pickHidden} is returned so the caller can fall
+  // back to the all-frames locate. The match list rides back on `_pick` (the caller strips it).
+  pick?: boolean | null;
 }
 
 export interface RefFingerprint {
@@ -184,6 +190,16 @@ export async function bbAct(op: string, p: BbActParams): Promise<any> {
       if (cur < 0) return back ? len - 1 : 0;
       return (cur + (back ? -1 : 1) + len) % len;
     },
+    // Index (into `matches`) of the match to act on within ONE frame: visible > in viewport > document
+    // order. Must agree with snapshot-plan.ts pickSelectorTarget for a single frame (unit-tested).
+    pickBest(matches: { visible: boolean; inViewport: boolean }[]): number {
+      let best = matches.length ? 0 : -1;
+      for (let i = 1; i < matches.length; i++) {
+        const a = matches[i], b = matches[best];
+        if (a.visible !== b.visible ? a.visible : a.inViewport !== b.inViewport ? a.inViewport : false) best = i;
+      }
+      return best;
+    },
     // input types where Enter performs implicit form submission
     implicitSubmitType(t: string): boolean {
       return ["text", "search", "email", "url", "tel", "password", "number", "date", "month", "week", "time", "datetime-local"].includes(t);
@@ -286,6 +302,22 @@ export async function bbAct(op: string, p: BbActParams): Promise<any> {
       return false;
     };
 
+    // Run fn in a fresh macrotask. A MessageChannel task, not setTimeout(0): Chrome throttles timers in
+    // a hidden tab (to ~1s, and far longer after a few minutes hidden), which delayed every deferred
+    // click/key by up to a second - the action "succeeded" but the page saw it much later.
+    const defer = (fn: () => void) => {
+      try {
+        const ch = new MessageChannel();
+        ch.port1.onmessage = () => {
+          ch.port1.close();
+          fn();
+        };
+        ch.port2.postMessage(0);
+      } catch {
+        setTimeout(fn, 0);
+      }
+    };
+    const pageHidden = () => document.visibilityState === "hidden";
     const nextFrame = () =>
       new Promise<void>((res) => {
         let done = false;
@@ -314,6 +346,9 @@ export async function bbAct(op: string, p: BbActParams): Promise<any> {
           e.scrollIntoView({ block: "center", inline: "center" });
         }
       }
+      // A hidden tab renders no frames and throttles timers: nothing can animate, so the rect is as
+      // stable as it will get - waiting here only cost ~1s per action.
+      if (pageHidden()) return e.getBoundingClientRect();
       const same = (a: DOMRect, b: DOMRect) => a.left === b.left && a.top === b.top && a.width === b.width && a.height === b.height;
       const t0 = Date.now();
       let prev = e.getBoundingClientRect();
@@ -398,7 +433,7 @@ export async function bbAct(op: string, p: BbActParams): Promise<any> {
       };
       // Deferred: the injected function returns BEFORE page key handlers run, so a handler that opens
       // alert()/confirm() (or a submit that navigates) can't wedge executeScript.
-      setTimeout(() => {
+      defer(() => {
         try {
           const down = target.dispatchEvent(new KeyboardEvent("keydown", init));
           const printable = k.key.length === 1 && !k.ctrl && !k.meta;
@@ -429,7 +464,7 @@ export async function bbAct(op: string, p: BbActParams): Promise<any> {
             if (t instanceof HTMLButtonElement || (t instanceof HTMLInputElement && /^(checkbox|radio|submit|button|reset)$/.test(t.type))) t.click();
           }
         } catch {}
-      }, 0);
+      });
       return { pressed: k.key, target: tag, dispatched: "deferred" };
     }
 
@@ -441,6 +476,7 @@ export async function bbAct(op: string, p: BbActParams): Promise<any> {
     // FIRST and only falls back to the shadow-piercing walk on a miss.
     let el: HTMLElement | null = null;
     let reResolved = false;
+    let pickInfo: { count: number; matches: { index: number; visible: boolean; inViewport: boolean }[]; index: number } | null = null;
     if (p.ref != null) {
       const reg = (window as any).__bbRefs as Map<number, Element> | undefined;
       const meta = (window as any).__bbRefMeta as Map<number, RefFingerprint> | undefined;
@@ -503,6 +539,55 @@ export async function bbAct(op: string, p: BbActParams): Promise<any> {
       };
       el = walkNth(document);
       if (!el) return { notFound: true };
+    } else if (p.sel != null && p.pick) {
+      try {
+        document.createDocumentFragment().querySelector(p.sel);
+      } catch (e) {
+        return { error: `Invalid CSS selector ${JSON.stringify(p.sel)}: ${e instanceof Error ? e.message : String(e)}` };
+      }
+      // Same walk + visibility test as background.ts bbLocateAll, so indexes and ranking agree.
+      const vw = window.innerWidth || 0, vh = window.innerHeight || 0;
+      const matches: { index: number; visible: boolean; inViewport: boolean }[] = [];
+      const els: Element[] = [];
+      let count = 0;
+      const walk = (root: Document | ShadowRoot) => {
+        let all: NodeListOf<Element>;
+        try {
+          all = root.querySelectorAll("*");
+        } catch {
+          return;
+        }
+        for (let i = 0; i < all.length; i++) {
+          const e = all[i];
+          let m = false;
+          try {
+            m = e.matches(p.sel!);
+          } catch {}
+          if (m) {
+            if (matches.length < 100) {
+              const r = e.getBoundingClientRect();
+              let vis = r.width > 0 && r.height > 0;
+              const cv = (e as any).checkVisibility;
+              if (vis && typeof cv === "function") {
+                try {
+                  vis = cv.call(e, { visibilityProperty: true, checkVisibilityCSS: true });
+                } catch {}
+              }
+              matches.push({ index: count, visible: vis, inViewport: vis && r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw });
+              els.push(e);
+            }
+            count++;
+          }
+          const sr = (e as HTMLElement).shadowRoot;
+          if (sr) walk(sr);
+        }
+      };
+      walk(document);
+      if (!matches.length) return { notFound: true, _pick: { count, matches } };
+      const best = L.pickBest(matches);
+      if (!matches[best].visible) return { pickHidden: true, _pick: { count, matches } };
+      el = els[best] as HTMLElement;
+      pickInfo = { count, matches, index: matches[best].index };
     } else if (p.sel != null) {
       try {
         el = document.querySelector(p.sel) as HTMLElement | null;
@@ -525,6 +610,7 @@ export async function bbAct(op: string, p: BbActParams): Promise<any> {
     const target: HTMLElement = el;
     const tag = target.tagName.toLowerCase();
     const extra: any = reResolved ? { reResolved: true } : {};
+    if (pickInfo) extra._pick = pickInfo;
 
     // ---- locate: scroll into view, return viewport-center coords (for the trusted CDP paths) ----
     // ox/oy = this frame's offset in the top-level viewport when every ancestor frame is same-origin;
@@ -735,7 +821,7 @@ export async function bbAct(op: string, p: BbActParams): Promise<any> {
       const label = (target.innerText || (target as HTMLInputElement).value || "").trim().slice(0, 80);
       // Deferred to a macrotask so this injected function RETURNS before any page handler runs: a
       // handler that calls alert()/confirm() would otherwise block executeScript indefinitely.
-      setTimeout(() => {
+      defer(() => {
         try {
           let pdPrevented = false, mdPrevented = false;
           for (const step of L.mouseSequence(false)) {
@@ -753,7 +839,7 @@ export async function bbAct(op: string, p: BbActParams): Promise<any> {
             if (step.type === "mousedown" && !ok) mdPrevented = true;
           }
         } catch {}
-      }, 0);
+      });
       return { clicked: true, via: "synthetic", dispatched: "deferred", tag, label, ...extra };
     }
 
@@ -766,7 +852,7 @@ export async function bbAct(op: string, p: BbActParams): Promise<any> {
         t.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
         t.dispatchEvent(new Event("change", { bubbles: true }));
       };
-      const tick = () => new Promise((r) => setTimeout(r, 0)); // let controlled components re-render
+      const tick = () => new Promise<void>((r) => defer(r)); // let controlled components re-render
 
       // ---- <select>: match by value, then exact text, then case-insensitive text; multi supported ----
       if (target instanceof HTMLSelectElement) {

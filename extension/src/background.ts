@@ -700,6 +700,7 @@ const clean = (args: any[]) => args.map((a) => (a === undefined ? null : a));
 interface InjectOpts {
   timeoutMs?: number;
   immediate?: boolean;
+  skipTop?: boolean; // injectAllFrames: child frames only
 }
 
 async function inject<T>(
@@ -755,6 +756,11 @@ async function injectAllFrames(
     frames = (await withTimeout(chrome.webNavigation.getAllFrames({ tabId }), 3_000, "getAllFrames")) ?? null;
   } catch {
     frames = null;
+  }
+  if (opts.skipTop) {
+    if (!frames) return [] as FrameResults; // no frame list: no known child frames
+    frames = frames.filter((f) => f.frameId !== 0);
+    if (!frames.length) return [] as FrameResults;
   }
   if (!frames || !frames.length) {
     // No frame list - fall back to one allFrames call, still bounded.
@@ -861,6 +867,33 @@ async function actAllFrames(
       }
       return { result: v, frameId: v?.notFound || v?.staleRef ? null : owner };
     }
+  } else if (p.sel != null && p.nth == null) {
+    // Fast path: locate + pick + act in the TOP frame in one injection, while the child frames are
+    // located in parallel (for matchCount/note, and as the fallback). A visible top-frame match always
+    // wins pickSelectorTarget's ranking, so acting on it before the children answer picks the same
+    // element the two-step locate-then-act did - one executeScript round trip fewer.
+    const [top, kids] = await Promise.all([
+      actInFrame(tab, 0, [args[0], { ...p, pick: true }, ...args.slice(2)]),
+      injectAllFrames(tab, bbLocateAll, [p.sel], "ISOLATED", { skipTop: true }),
+    ]);
+    const pickData = top?._pick as { count: number; matches: { index: number; visible: boolean; inViewport: boolean }[]; index?: number } | undefined;
+    if (top && typeof top === "object") delete top._pick;
+    const matches: LocateMatch[] = (pickData?.matches ?? []).map((m) => ({ frameId: 0, ...m }));
+    for (const r of kids) {
+      const v: any = r?.result;
+      if (!v || typeof v !== "object") continue;
+      if (typeof v.error === "string") throw new Error(v.error);
+      for (const m of v.matches ?? []) matches.push({ frameId: r.frameId, index: m.index, visible: m.visible, inViewport: m.inViewport });
+    }
+    const skipped = kids.skippedFrames?.length ?? 0;
+    const pick = pickSelectorTarget(matches);
+    if (top && !top.notFound && !top.pickHidden && pickData?.index != null) {
+      return { result: top, frameId: 0, nth: pickData.index, matchCount: pick.count, note: pick.note, skipped };
+    }
+    if (!pick.chosen) return { result: { notFound: true }, frameId: null, skipped };
+    const nthArgs = [args[0], { ...p, nth: pick.chosen.index }, ...args.slice(2)];
+    const v = await actInFrame(tab, pick.chosen.frameId, nthArgs);
+    return { result: v, frameId: v?.notFound ? null : pick.chosen.frameId, nth: pick.chosen.index, matchCount: pick.count, note: pick.note, skipped };
   } else if (p.sel != null) {
     const pick = await locateOne(tab, p.sel);
     if (!pick.chosen) return { result: { notFound: true }, frameId: null, skipped: pick.skipped };
@@ -2324,12 +2357,183 @@ async function ensureAttached(tabId: number): Promise<Session> {
 async function detachSession(tabId: number): Promise<void> {
   finalizeCapture(tabId); // flush + close the on-disk sink before the session goes away
   sessions.delete(tabId);
+  keepAlives.delete(tabId); // detaching drops the debugger's focus emulation with it
   pendingDialogs.delete(tabId); // no longer observable once detached - don't report a stale one
   try {
     await new Promise<void>((resolve) => chrome.debugger.detach({ tabId }, () => resolve()));
   } catch {
     /* already gone */
   }
+}
+
+// ---------- hidden tabs: detection + keep-alive ----------
+// A tab whose window is covered/minimized/on another Space - or that sits behind another tab - has
+// document.visibilityState 'hidden': Chrome renders NO frames for it, so requestAnimationFrame never
+// fires and timers are throttled. React-Aria and many UI libraries commit state inside rAF, so an
+// action "succeeds" but the app updates seconds later or never. Worse, CDP Input.dispatchMouseEvent
+// (mouseMoved) waits for a frame that never comes: every trusted click/hover took ~5-6s there.
+//
+// Measured in the e2e harness (raw Chromium, background tab, rAF within 1s):
+//   nothing / debugger attached ........ never        Page.setWebLifecycleState active ... never
+//   Page.startScreencast ............... never        Page.captureScreenshot ............ never
+//   Emulation.setFocusEmulationEnabled . yes (visibilityState flips to 'visible', ~60fps)
+// Focus emulation makes the browser treat the tab as captured, so it renders while enabled. So
+// while an action runs on a hidden tab and a debugger session exists (or the caller passed
+// keepAlive:true, or the action is trusted anyway), focus emulation is switched on for the action
+// plus a short frame settle, then off again. Ref-counted per tab for overlapping actions.
+const HIDDEN_TAB_WARNING =
+  "tab is hidden (window covered/minimized/on another desktop, or another tab is in front): the page may not update until it is visible; " +
+  "call tab_activate or ask the user to bring the window forward (or pass keepAlive:true to keep it rendering during the action via the debugger)";
+const KEPT_ALIVE_NOTE =
+  "tab is hidden; it was kept rendering for this action (debugger focus emulation) but stops again now - later async updates may not render until it is visible";
+const STALLED_WARNING = "the page rendered no frame within 250ms (requestAnimationFrame did not fire): it may be throttled or busy, so updates can lag";
+
+const keepAlives = new Map<number, { refs: number; ready: Promise<boolean> }>();
+
+// Top-frame visibility, bounded short: a page stuck behind a JS dialog can't answer, and that must not
+// add more than a moment to the action. null = unknown.
+async function tabVisibility(tab: chrome.tabs.Tab, rafCapMs = 0): Promise<{ hidden: boolean; raf: boolean | null } | null> {
+  if (!tab.id || !tab.url || RESTRICTED.test(tab.url)) return null;
+  try {
+    const res = await withTimeout(
+      chrome.scripting.executeScript({
+        target: { tabId: tab.id, frameIds: [0] },
+        world: "ISOLATED",
+        injectImmediately: true,
+        func: (cap: number) => {
+          const hidden = document.visibilityState === "hidden";
+          if (hidden || !cap) return { hidden, raf: hidden ? false : null };
+          return new Promise((res) => {
+            let done = false;
+            const fin = (v: boolean) => {
+              if (!done) {
+                done = true;
+                res({ hidden: document.visibilityState === "hidden", raf: v });
+              }
+            };
+            requestAnimationFrame(() => fin(true));
+            setTimeout(() => fin(false), cap);
+          });
+        },
+        args: [rafCapMs],
+      }),
+      rafCapMs + 400,
+      "visibility probe"
+    );
+    const v: any = res?.[0]?.result;
+    return v && typeof v === "object" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+// Wait for n rendered frames in the top frame (bounded) - lets rAF-scheduled commits land.
+async function settleFrames(tabId: number, n: number, capMs: number): Promise<boolean> {
+  try {
+    const res = await withTimeout(
+      chrome.scripting.executeScript({
+        target: { tabId, frameIds: [0] },
+        world: "ISOLATED",
+        injectImmediately: true,
+        func: (n: number, cap: number) =>
+          new Promise<boolean>((res) => {
+            let left = n;
+            const t = setTimeout(() => res(false), cap);
+            const f = () => {
+              if (--left <= 0) {
+                clearTimeout(t);
+                res(true);
+              } else requestAnimationFrame(f);
+            };
+            requestAnimationFrame(f);
+          }),
+        args: [n, capMs],
+      }),
+      capMs + 300,
+      "frame settle"
+    );
+    return res?.[0]?.result === true;
+  } catch {
+    return false;
+  }
+}
+
+async function acquireKeepAlive(tabId: number): Promise<boolean> {
+  const cur = keepAlives.get(tabId);
+  if (cur) {
+    cur.refs++;
+    return cur.ready;
+  }
+  const entry = { refs: 1, ready: cmd(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true }, 3_000).then(() => true, () => false) };
+  keepAlives.set(tabId, entry);
+  return entry.ready;
+}
+
+async function releaseKeepAlive(tabId: number): Promise<void> {
+  const cur = keepAlives.get(tabId);
+  if (!cur || --cur.refs > 0) return;
+  keepAlives.delete(tabId);
+  if ((await cur.ready) && sessions.has(tabId)) {
+    await cmd(tabId, "Emulation.setFocusEmulationEnabled", { enabled: false }, 3_000).catch(() => {});
+  }
+}
+
+/**
+ * Run an action with hidden-tab handling: probe visibility first; on a hidden tab keep it rendering
+ * (see above) when allowed, settle a couple of frames after the action so rAF commits land, and
+ * report tabHidden + keptAlive/warning on the result. params.keepAlive: true = attach the debugger
+ * if needed; false = never; unset = only when a debugger session already exists (or `trusted`).
+ */
+async function withLiveTab(tab: chrome.tabs.Tab, params: any, trusted: boolean, run: () => Promise<any>): Promise<any> {
+  const tabId = tab.id!;
+  const mode: boolean | undefined = typeof params?.keepAlive === "boolean" ? params.keepAlive : undefined;
+  const vis = await tabVisibility(tab);
+  let kept = false;
+  let keepError: string | undefined;
+  let rafProbe: Promise<{ hidden: boolean; raf: boolean | null } | null> | null = null;
+  if (vis?.hidden && mode !== false && (mode === true || trusted || sessions.has(tabId)) && !isCancelled(params)) {
+    try {
+      await ensureAttached(tabId);
+      kept = await acquireKeepAlive(tabId);
+      if (!kept) await releaseKeepAlive(tabId);
+    } catch (e) {
+      keepError = e instanceof Error ? e.message : String(e);
+    }
+  } else if (vis && !vis.hidden) {
+    // Visible - but is it actually rendering? Checked alongside the action, so it costs nothing extra.
+    rafProbe = tabVisibility(tab, 250);
+  }
+  let result: any;
+  try {
+    result = await run();
+    // Let rAF-scheduled commits (React-Aria & co) land while frames are still being produced.
+    if (kept && !isCancelled(params)) await settleFrames(tabId, 2, 300);
+  } finally {
+    if (kept) await releaseKeepAlive(tabId);
+  }
+  if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+  const addWarning = (w: string) => {
+    result.warning = result.warning ? `${result.warning}; ${w}` : w;
+  };
+  if (vis?.hidden) {
+    result = { ...result, tabHidden: true };
+    if (kept) {
+      result.keptAlive = true;
+      result.note = result.note ? `${result.note}; ${KEPT_ALIVE_NOTE}` : KEPT_ALIVE_NOTE;
+    } else {
+      addWarning(HIDDEN_TAB_WARNING + (keepError ? ` (keepAlive failed: ${keepError})` : ""));
+    }
+  } else if (rafProbe) {
+    const r = await rafProbe;
+    if (r?.hidden) {
+      result = { ...result, tabHidden: true };
+      addWarning(HIDDEN_TAB_WARNING);
+    } else if (r && r.raf === false) {
+      result = { ...result, renderingStalled: true };
+      addWarning(STALLED_WARNING);
+    }
+  }
+  return result;
 }
 
 // After an SW eviction the in-memory `sessions` map is empty, but a debugger attach the dead worker
@@ -3887,9 +4091,12 @@ async function withSnapshotIfRequested(tab: chrome.tabs.Tab, params: any, result
 // After-action effect summary for click / press_key: {url, title, urlChanged, newTabId?}, so the
 // agent doesn't need 2-3 follow-up calls to learn what its action did. Start the watch BEFORE the
 // action (so a new tab opened by it isn't missed), then finish() after: it waits up to maxMs for the
-// first of a URL change on this tab, a new tab opened from it (openerTabId), or the DOM going quiet
-// for 150ms. Cheap and best-effort - it never throws, and an in-page probe that can't run (page
+// first of a URL change on this tab, a new tab opened from it (openerTabId), or the DOM settling
+// (EFFECT_IDLE_MS / EFFECT_QUIET_MS). Cheap and best-effort - it never throws, and an in-page probe that can't run (page
 // navigating, a dialog open) is simply bounded by the timer.
+const EFFECT_IDLE_MS = 50; // no mutation at all within this -> the action had no (sync-ish) DOM effect
+const EFFECT_QUIET_MS = 75; // after a mutation: this long without another one = the render settled
+
 function startEffectWatch(tab: chrome.tabs.Tab) {
   const tabId = tab.id!;
   const beforeUrl = tab.url ?? "";
@@ -3929,8 +4136,15 @@ function startEffectWatch(tab: chrome.tabs.Tab) {
               .executeScript({
                 target: { tabId, frameIds: [0] },
                 world: "ISOLATED",
-                func: (quietMs: number, capMs: number) =>
+                // Cheap settle: resolve after idleMs if the page shows no mutation at all (most
+                // clicks), else once the DOM has been quiet for quietMs after the last mutation (a
+                // framework commit), capped. Was a flat 150ms quiet window - the bulk of a click.
+                func: (idleMs: number, quietMs: number, capMs: number) =>
                   new Promise<boolean>((res) => {
+                    // A hidden tab (not kept alive) renders nothing and throttles these timers to ~1s:
+                    // waiting would only burn the whole cap. URL/new-tab effects are still caught by
+                    // the tab listeners.
+                    if (document.visibilityState === "hidden") return res(true);
                     let t: any;
                     let cap: any;
                     const obs = new MutationObserver(() => {
@@ -3944,10 +4158,10 @@ function startEffectWatch(tab: chrome.tabs.Tab) {
                       res(v);
                     };
                     obs.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
-                    t = setTimeout(() => done(true), quietMs);
+                    t = setTimeout(() => done(true), idleMs);
                     cap = setTimeout(() => done(false), capMs);
                   }),
-                args: [150, Math.max(50, maxMs - 50)],
+                args: [EFFECT_IDLE_MS, EFFECT_QUIET_MS, Math.max(50, maxMs - 50)],
               })
               .then((r) => {
                 if (r?.[0]?.result === true) wake?.();
@@ -4233,7 +4447,9 @@ async function interact(tab: chrome.tabs.Tab, action: string, ref: number | null
   const withPick = (r: any) => (r && typeof r === "object" && (pickInfo.matchCount ?? 0) > 1 ? { ...r, matchCount: pickInfo.matchCount, note: pickInfo.note } : r);
   if (action === "click" && last?.notActionable && last.reason === "covered" && params.autoTrusted !== false && !params.noEscalate) {
     try {
-      const t = await trustedAction(tab, "click", ref, sel);
+      // Escalation attaches the debugger: keep a hidden tab rendering for it (ref-counted, so nesting
+      // inside the click's own withLiveTab is fine) - CDP mouse input otherwise waits ~5s per event.
+      const t = await withLiveTab(tab, params, true, () => trustedAction(tab, "click", ref, sel));
       return withPick({ ...t, via: "trusted", wasCovered: true, coveredBy: last.coveredBy });
     } catch (e) {
       // trusted also failed - report the covered state, and why escalation didn't help
@@ -4366,54 +4582,65 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "snapshot": {
       const tab = await targetTab(params.tabId);
-      if (params.deep) return cdpDeepSnapshot(tab.id!, clampLimit(params.limit));
-      return shallowSnapshot(tab, params);
+      // Visibility is probed alongside the snapshot (no added latency) and reported on it.
+      const vis = tabVisibility(tab);
+      const snap = params.deep ? await cdpDeepSnapshot(tab.id!, clampLimit(params.limit)) : await shallowSnapshot(tab, params);
+      const v = await vis;
+      if (v?.hidden && snap && typeof snap === "object") return { tabHidden: true, warning: HIDDEN_TAB_WARNING, ...snap };
+      return snap;
     }
 
     case "click": {
       const tab = await targetTab(params.tabId);
       // Guard TTL covers the auto-wait (timeoutMs) plus a possible trusted escalation (attach ~12s).
-      const result = await withDialogGuard(tab, params, (params.timeoutMs ?? 5_000) + 15_000, async () => {
-        const watch = startEffectWatch(tab);
-        let r: any;
-        try {
-          r = params.trusted
-            ? { ...(await trustedAction(tab, "click", params.ref ?? null, params.selector ?? null)), via: "trusted" }
-            : await interact(tab, "click", params.ref, params.selector, null, params);
-        } catch (e) {
-          watch.stop();
-          throw e;
-        }
-        return withEffects(watch, r, !!r?.clicked);
-      });
+      const result = await withDialogGuard(tab, params, (params.timeoutMs ?? 5_000) + 15_000, () =>
+        withLiveTab(tab, params, !!params.trusted, async () => {
+          const watch = startEffectWatch(tab);
+          let r: any;
+          try {
+            r = params.trusted
+              ? { ...(await trustedAction(tab, "click", params.ref ?? null, params.selector ?? null)), via: "trusted" }
+              : await interact(tab, "click", params.ref, params.selector, null, params);
+          } catch (e) {
+            watch.stop();
+            throw e;
+          }
+          return withEffects(watch, r, !!r?.clicked);
+        })
+      );
       return withSnapshotIfRequested(tab, params, result);
     }
 
     case "fill": {
       const tab = await targetTab(params.tabId);
-      const result = await interact(tab, "fill", params.ref, params.selector, params.value ?? null, params);
+      const result = await withLiveTab(tab, params, false, () => interact(tab, "fill", params.ref, params.selector, params.value ?? null, params));
       return withSnapshotIfRequested(tab, params, result);
     }
 
     case "hover": {
       const tab = await targetTab(params.tabId);
-      const result = params.trusted
-        ? await trustedAction(tab, "hover", params.ref ?? null, params.selector ?? null)
-        : await interact(tab, "hover", params.ref, params.selector, null, params);
+      const result = await withLiveTab(tab, params, !!params.trusted, () =>
+        params.trusted
+          ? trustedAction(tab, "hover", params.ref ?? null, params.selector ?? null)
+          : interact(tab, "hover", params.ref, params.selector, null, params)
+      );
       return withSnapshotIfRequested(tab, params, result);
     }
 
     case "type": {
       const tab = await targetTab(params.tabId);
-      const result = params.trusted
-        ? await trustedAction(tab, "type", params.ref ?? null, params.selector ?? null, params.text)
-        : await interact(tab, "type", params.ref, params.selector, params.text ?? null, params);
+      const result = await withLiveTab(tab, params, !!params.trusted, () =>
+        params.trusted
+          ? trustedAction(tab, "type", params.ref ?? null, params.selector ?? null, params.text)
+          : interact(tab, "type", params.ref, params.selector, params.text ?? null, params)
+      );
       return withSnapshotIfRequested(tab, params, result);
     }
 
     case "input": {
       const tab = await targetTab(params.tabId);
-      return cdpInput(tab.id!, params);
+      // Always trusted (CDP Input): keep a hidden tab rendering, or every mouse move waits ~5s for a frame.
+      return withLiveTab(tab, params, true, () => cdpInput(tab.id!, params));
     }
 
     case "file_upload": {
@@ -4794,19 +5021,21 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "press_key": {
       const tab = await targetTab(params.tabId);
-      const result = await withDialogGuard(tab, params, 15_000, async () => {
-        const watch = startEffectWatch(tab);
-        let r: any;
-        try {
-          // synthetic: dispatched (deferred) in the frame holding focus; Enter submits only when not
-          // preventDefault()ed, Tab moves focus. trusted: real CDP key events.
-          r = params.trusted ? await pressKeyTrusted(tab, String(params.key ?? "")) : await pressKeySynthetic(tab, String(params.key ?? ""));
-        } catch (e) {
-          watch.stop();
-          throw e;
-        }
-        return withEffects(watch, r, true);
-      });
+      const result = await withDialogGuard(tab, params, 15_000, () =>
+        withLiveTab(tab, params, !!params.trusted, async () => {
+          const watch = startEffectWatch(tab);
+          let r: any;
+          try {
+            // synthetic: dispatched (deferred) in the frame holding focus; Enter submits only when not
+            // preventDefault()ed, Tab moves focus. trusted: real CDP key events.
+            r = params.trusted ? await pressKeyTrusted(tab, String(params.key ?? "")) : await pressKeySynthetic(tab, String(params.key ?? ""));
+          } catch (e) {
+            watch.stop();
+            throw e;
+          }
+          return withEffects(watch, r, true);
+        })
+      );
       return withSnapshotIfRequested(tab, params, result);
     }
 
@@ -4945,13 +5174,34 @@ async function dispatch(method: string, params: any): Promise<any> {
       const tab = await targetTab(params.tabId);
       // Force the CDP path (Runtime.evaluate) - bypasses CSP unsafe-eval; shows the debugger banner.
       if (params.cdp) return cdpEvaluate(tab.id!, params.code, params.awaitPromise ?? true);
+      // The in-page path awaits a returned thenable too (like the CDP path's awaitPromise), bounded a
+      // little inside the server's own timeout so a never-settling promise reports instead of hanging.
+      const awaitP = params.awaitPromise !== false;
+      const budget = Math.max(1_000, (typeof params.timeoutMs === "number" ? params.timeoutMs : 30_000) - 1_500);
       try {
         return await inject(
         tab,
-        (code: string) => {
+        async (code: string, awaitP: boolean, ms: number) => {
           try {
             // eslint-disable-next-line no-eval
-            const value = (0, eval)(code);
+            let value = (0, eval)(code);
+            if (awaitP && value != null && typeof value.then === "function") {
+              const TIMEOUT = {};
+              let timer: any;
+              try {
+                value = await Promise.race([
+                  Promise.resolve(value),
+                  new Promise((res) => {
+                    timer = setTimeout(() => res(TIMEOUT), ms);
+                  }),
+                ]);
+              } catch (e) {
+                return { error: `Promise rejected: ${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}` };
+              } finally {
+                clearTimeout(timer);
+              }
+              if (value === TIMEOUT) return { error: `eval_js: the returned Promise did not settle within ${ms}ms (raise timeoutMs, or pass awaitPromise:false)` };
+            }
             let out: string;
             try {
               out = typeof value === "object" && value !== null ? JSON.stringify(value) : String(value);
@@ -4963,8 +5213,9 @@ async function dispatch(method: string, params: any): Promise<any> {
             return { error: String(e) };
           }
         },
-        [params.code],
-        "MAIN"
+        [params.code, awaitP, budget],
+        "MAIN",
+        { timeoutMs: Math.max(INJECT_TOP_MS, budget + 1_000) }
       );
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
