@@ -6,7 +6,7 @@ import { createServer, type Server } from "http";
 import type { AddressInfo } from "net";
 import { createHmac, randomBytes } from "crypto";
 import { WebSocket } from "ws";
-import { ExtensionHub, WS_AUTH_FAILED_CLOSE_CODE } from "../src/hub.js";
+import { ExtensionHub, WS_AUTH_FAILED_CLOSE_CODE, WS_AUTH_TIMEOUT_CLOSE_CODE } from "../src/hub.js";
 import { extMac, srvMac, safeEqual, verifyAuthReply } from "../src/ws-auth.js";
 
 const TOKEN = "0123456789abcdef0123456789abcdef";
@@ -138,4 +138,22 @@ test("safeEqual is exact", () => {
   assert.equal(safeEqual("Bearer abc", "Bearer abd"), false);
   assert.equal(safeEqual("Bearer ab", "Bearer abc"), false);
   assert.equal(safeEqual("", "Bearer abc"), false);
+});
+
+test("handshake: no reply in time -> closed with the distinct timeout code (not a token rejection)", async () => {
+  const server = createServer();
+  new ExtensionHub(server, TOKEN, "0.0.0", { reconnectGraceMs: 200, authTimeoutMs: 150 });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const ws = new WebSocket(`ws://127.0.0.1:${(server.address() as AddressInfo).port}/ws`, { origin: "chrome-extension://test" });
+  try {
+    const code = await new Promise<number>((resolve, reject) => {
+      ws.once("close", (c) => resolve(c));
+      ws.once("error", reject);
+      // Receive the challenge, never answer it (a worker suspended mid-handshake).
+    });
+    assert.equal(code, WS_AUTH_TIMEOUT_CLOSE_CODE);
+    assert.notEqual(code, WS_AUTH_FAILED_CLOSE_CODE);
+  } finally {
+    await stop(server, ws);
+  }
 });

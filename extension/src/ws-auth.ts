@@ -8,6 +8,8 @@
 
 export const WS_AUTH_VERSION = 2;
 export const WS_AUTH_FAILED_CLOSE_CODE = 4001;
+/** The server gave up waiting for our reply (e.g. this worker was suspended mid-handshake): retry normally. */
+export const WS_AUTH_TIMEOUT_CLOSE_CODE = 4002;
 const NONCE_RE = /^[0-9a-f]{32,128}$/;
 const MAC_RE = /^[0-9a-f]{64}$/;
 
