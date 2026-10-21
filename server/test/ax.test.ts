@@ -3,7 +3,7 @@
 // pruning, depth/among-siblings caps, multi-frame stitching - gets pinned down. No browser, no I/O.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { renderAxTree, renderAxSnapshot, type AxNode, type AxSnapshot } from "../src/ax.js";
+import { renderAxTree, renderAxSnapshot, refLimitNote, type AxNode, type AxSnapshot } from "../src/ax.js";
 
 test("a leaf renders role, name and ref", () => {
   const out = renderAxTree([{ role: "button", name: "Save", ref: 3 }]);
@@ -98,6 +98,33 @@ test("renderAxSnapshot notes truncation and handles an empty page", () => {
 
   const empty: AxSnapshot = { url: "http://x", frames: [{ frameId: 0, url: "http://x", root: [] }] };
   assert.equal(renderAxSnapshot(empty), "(no accessible content)");
+});
+
+test("renderAxSnapshot notes interactive nodes left without a ref by the ref limit", () => {
+  const snap: AxSnapshot = {
+    url: "http://x",
+    limit: 1,
+    frames: [
+      { frameId: 0, url: "http://x", root: [{ role: "button", name: "A", ref: 1 }, { role: "button", name: "B" }], refsTotal: 2, refsAssigned: 1 },
+      { frameId: 3, url: "http://y", root: [{ role: "link", name: "C" }], refsTotal: 1, refsAssigned: 0 },
+    ],
+  };
+  const text = renderAxSnapshot(snap);
+  assert.match(text, /^- button "A" \[ref=1\]\n- button "B"\n- … \(1 of 2 interactive nodes have no ref: ref limit 1 reached/);
+  assert.match(text, /\n  - … \(1 of 1 interactive nodes have no ref/);
+  assert.equal(refLimitNote({ frameId: 0, url: "", root: [] }), null);
+  assert.equal(refLimitNote({ frameId: 0, url: "", root: [], refsTotal: 3, refsAssigned: 3 }), null);
+});
+
+test("renderAxSnapshot announces an open modal dialog", () => {
+  const snap: AxSnapshot = {
+    url: "http://x",
+    frames: [{ frameId: 0, url: "http://x", root: [{ role: "dialog", name: "Sign in", children: [{ role: "button", name: "Go", ref: 1 }] }], modal: "Sign in" }],
+  };
+  assert.equal(
+    renderAxSnapshot(snap),
+    '- note: modal dialog "Sign in" is open; content behind it is not operable\n- dialog "Sign in":\n  - button "Go" [ref=1]'
+  );
 });
 
 // small helper so the assertions above read as tree -> text
