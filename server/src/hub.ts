@@ -3,6 +3,8 @@ import type { Server as HttpServer, IncomingMessage } from "http";
 import { randomUUID } from "crypto";
 import { CaptureSink } from "./capture-sink.js";
 import { versionSkewWarning } from "./version.js";
+import { log } from "./log.js";
+import { NOT_CONNECTED_MESSAGE, explainTimeout } from "./result.js";
 
 export const CALL_TIMEOUT_MS = 30_000;
 
@@ -79,12 +81,12 @@ export class ExtensionHub {
       }
       const origin = req.headers.origin ?? "";
       if (!origin.startsWith("chrome-extension://")) {
-        console.error(`[hub] rejected WS: bad origin ${origin}`);
+        log(`[hub] rejected WS: bad origin ${origin}`);
         socket.destroy();
         return;
       }
       if (url.searchParams.get("token") !== token) {
-        console.error("[hub] rejected WS: bad token");
+        log("[hub] rejected WS: bad token");
         socket.destroy();
         return;
       }
@@ -94,11 +96,11 @@ export class ExtensionHub {
 
   private attach(ws: WebSocket, req: IncomingMessage) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      console.error("[hub] replacing existing extension connection");
+      log("[hub] replacing existing extension connection");
       this.ws.close(4000, "replaced by new connection");
     }
     this.ws = ws;
-    console.error(`[hub] extension connected (${req.headers.origin})`);
+    log(`[hub] extension connected (${req.headers.origin})`);
     this.notifyConn(true);
 
     ws.on("message", (data) => {
@@ -114,13 +116,13 @@ export class ExtensionHub {
       }
       if (msg.type === "hello") {
         this.lastHello = { version: msg.version, build: msg.build, at: Date.now() };
-        console.error(`[hub] extension hello: v${msg.version} (build ${msg.build ?? "unknown"})`);
+        log(`[hub] extension hello: v${msg.version} (build ${msg.build ?? "unknown"})`);
         // Surface a version skew loudly, once per distinct mismatch - it silently breaks tools that
         // exist on only one side.
         const skew = versionSkewWarning(this.version, msg.version);
         if (skew && skew !== this.lastSkewWarned) {
           this.lastSkewWarned = skew;
-          console.error(`[hub] version skew: ${skew}`);
+          log(`[hub] version skew: ${skew}`);
         } else if (!skew) {
           this.lastSkewWarned = null;
         }
@@ -168,7 +170,7 @@ export class ExtensionHub {
         if (p.socket !== ws) continue;
         this.pending.delete(id);
         clearTimeout(p.timer);
-        p.reject(new Error("Browser extension disconnected before responding"));
+        p.reject(new Error("Browser extension disconnected before responding; it usually reconnects within seconds - retry in 2-3 seconds"));
       }
       // Only tear down capture/session sinks when the CURRENT (live) socket closes. If a stale
       // socket is closing because it was just REPLACED (SW respawn / reconnect), this.ws already
@@ -176,7 +178,7 @@ export class ExtensionHub {
       // every subsequent capture batch would be silently dropped (truncated JSONL / events file).
       if (this.ws === ws) {
         this.ws = null;
-        console.error("[hub] extension disconnected");
+        log("[hub] extension disconnected");
         this.notifyConn(false);
         for (const sink of this.captureSinks.values()) sink.close();
         this.captureSinks.clear();
@@ -194,7 +196,7 @@ export class ExtensionHub {
         this.sessionDoneWaiters.clear();
       }
     });
-    ws.on("error", (err) => console.error(`[hub] ws error: ${err.message}`));
+    ws.on("error", (err) => log(`[hub] ws error: ${err.message}`));
   }
 
   get connected(): boolean {
@@ -389,10 +391,7 @@ export class ExtensionHub {
   // instead of throwing synchronously - honoring the Promise<any> contract for every .then/.catch caller.
   async call(method: string, params: Record<string, unknown> = {}, timeoutMs = CALL_TIMEOUT_MS): Promise<any> {
     if (!this.connected) {
-      throw new Error(
-        "Browser extension is not connected. Make sure Chrome is running, the Browser Bridge " +
-          "extension is loaded, and the token in the extension options matches the server token."
-      );
+      throw new Error(NOT_CONNECTED_MESSAGE);
     }
     const id = randomUUID();
     const socket = this.ws!;
@@ -401,7 +400,7 @@ export class ExtensionHub {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`Extension call '${method}' timed out after ${timeoutMs}ms`));
+        reject(new Error(explainTimeout(method, timeoutMs)));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer, socket });
     });
