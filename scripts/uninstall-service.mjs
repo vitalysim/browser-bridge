@@ -4,9 +4,9 @@ import { existsSync, rmSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { execFileSync } from "child_process";
+import { LABEL, LEGACY_LABELS } from "./lib/service.mjs";
 
 const platform = (process.argv.find((a) => a.startsWith("--platform=")) || "").split("=")[1] || process.platform;
-const LABEL = "browser-bridge";
 
 function run(cmd, args) {
   try {
@@ -26,7 +26,7 @@ if (platform === "linux") {
   run("systemctl", ["--user", "daemon-reload"]);
 } else if (platform === "darwin") {
   const uid = process.getuid ? process.getuid() : 0;
-  for (const label of ["com.vitaly.browser-bridge", LABEL]) {
+  for (const label of [...LEGACY_LABELS, LABEL]) {
     run("launchctl", ["bootout", `gui/${uid}/${label}`]);
     const path = join(homedir(), "Library", "LaunchAgents", `${label}.plist`);
     if (existsSync(path)) {
@@ -37,4 +37,4 @@ if (platform === "linux") {
 } else {
   console.log(`Nothing to uninstall for '${platform}'.`);
 }
-console.log("Done. (The extension and ~/.browser-bridge/token are left in place.)");
+console.log("Done. (The extension and ~/.browser-bridge - token, logs, recordings - are left in place.)");
