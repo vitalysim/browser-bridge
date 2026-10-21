@@ -6,6 +6,7 @@ import { NetRing, applyRedirectResponse, capBody, Semaphore, type NetEntry } fro
 import { bbAct, type BbActParams } from "./dom-act";
 import { CDP_MODS, keyInfo, parseKeyCombo, pickFocusedFrame, matchCdpFrame, type FocusProbe } from "./act-logic";
 import { bbAxSnapshot } from "./ax";
+import { buildReplayHeaders } from "./replay-headers";
 import { allocateFrameBudgets, assignAxRefs, clampLimit, frameOffsets, pickSelectorTarget, routeRef, SNAPSHOT_DEFAULT_LIMIT, SNAPSHOT_MAX_LIMIT, type LocateMatch, type RefRoute } from "./snapshot-plan";
 import { emulateDevice, emulateNetwork, emulateCpu, emulateLocale, emulateGeolocation, emulateReset } from "./emulate.js";
 
@@ -2830,32 +2831,31 @@ async function doReplay(tab: chrome.tabs.Tab, params: any): Promise<any> {
   const method = (ov.method || base.method).toUpperCase();
   const body = ov.body !== undefined ? ov.body : base.body;
 
-  // Build request headers: preserve content-type/accept from the base, apply explicit overrides,
-  // and drop headers fetch() forbids (Cookie/Host/Content-Length). Identity is handled via credentials.
-  const headers: Record<string, string> = {};
-  const bh = base.headers || {};
-  const baseCT = bh["content-type"] ?? bh["Content-Type"];
-  const baseAccept = bh["accept"] ?? bh["Accept"];
-  if (baseCT && body != null) headers["content-type"] = baseCT;
-  if (baseAccept) headers["accept"] = baseAccept;
-  for (const [k, v] of Object.entries(ov.headers || {})) {
-    if (!/^(cookie|host|content-length)$/i.test(k)) headers[k] = v as string;
-  }
-
+  // Build request headers: every captured header fetch() can set (auth, CSRF, x-*, accept...), then
+  // explicit overrides, then identity (replay-headers.ts). Cookies ride on `credentials`.
   // identity: current session (default) · anon (no cookies) · captured bearer
   let credentials: RequestCredentials = "include";
   let note: string | undefined;
+  let bearer: string | null = null;
   if (params.identity === "anon") {
     credentials = "omit";
   } else if (params.identity) {
     const id = identities.get(params.identity);
     if (!id) throw new Error(`identity '${params.identity}' not captured - call identity_capture first`);
     if (id.bearer) {
-      headers["authorization"] = id.bearer;
+      bearer = id.bearer;
       credentials = "omit";
     } else {
       note = `identity '${params.identity}' has no bearer; used the current tab session (cookie-jar swap not supported via background fetch)`;
     }
+  }
+  const built = buildReplayHeaders(base.headers, ov.headers, { hasBody: body != null, identity: params.identity ?? null, bearer });
+  const headers = built.headers;
+  let referrer: string | undefined;
+  try {
+    if (built.referrer && /^https?:$/.test(new URL(built.referrer).protocol)) referrer = built.referrer;
+  } catch {
+    /* unparseable Referer: omit */
   }
 
   // viaAppClient: run through the PAGE'S OWN fetch (main world) so the app's CSRF tokens, auth
@@ -2865,9 +2865,11 @@ async function doReplay(tab: chrome.tabs.Tab, params: any): Promise<any> {
     try {
       const res: any = await inject(
         tab,
-        async (u: string, m: string, hh: Record<string, string>, b: string | null) => {
+        async (u: string, m: string, hh: Record<string, string>, b: string | null, ref: string | null) => {
           try {
-            const r = await fetch(u, { method: m, headers: hh, body: b ?? undefined, credentials: "include" });
+            const init: RequestInit = { method: m, headers: hh, body: b ?? undefined, credentials: "include" };
+            if (ref) init.referrer = ref;
+            const r = await fetch(u, init);
             const oh: Record<string, string> = {};
             r.headers.forEach((v, k) => (oh[k] = v));
             let t = "";
@@ -2881,7 +2883,7 @@ async function doReplay(tab: chrome.tabs.Tab, params: any): Promise<any> {
             return { __fetchError: String(e) };
           }
         },
-        [url, method, headers, body ?? null],
+        [url, method, headers, body ?? null, referrer ?? null],
         "MAIN"
       );
       if (res && res.__fetchError) return { error: res.__fetchError, via: "app-fetch", url, method };
@@ -2895,7 +2897,7 @@ async function doReplay(tab: chrome.tabs.Tab, params: any): Promise<any> {
   // cookies, and it is NOT subject to the page's CSP or CORS (unlike an injected fetch).
   const t0 = Date.now();
   try {
-    const r = await fetch(url, { method, headers, body: body ?? undefined, credentials });
+    const r = await fetch(url, { method, headers, body: body ?? undefined, credentials, ...(referrer ? { referrer } : {}) });
     const h: Record<string, string> = {};
     r.headers.forEach((v, k) => (h[k] = v));
     let text = "";

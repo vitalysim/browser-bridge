@@ -1060,6 +1060,8 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     "replay_request",
     "Re-issue a request from the tab's live session (an in-session Repeater). Give a requestId (from " +
       "net_get_requests) or an ad-hoc {url,method,headers,body}; optional overrides {url,method,headers,body}. " +
+      "A captured request is replayed with ALL its headers fetch() can set (Authorization, CSRF, x-*, Accept...; " +
+      "not Cookie/Host/Origin/sec-*/hop-by-hop); an override header set to \"\" removes it. " +
       "Set identity to send as a captured identity or 'anon' (strips cookies/bearer) - this uses the CDP Fetch " +
       "path to override forbidden headers like Cookie. Returns {status,headers,body}. Shows the banner when identity/forbidden headers are used.",
     {
