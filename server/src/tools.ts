@@ -576,10 +576,17 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
 
   tool(
     "press_key",
-    "Send a keyboard key (e.g. 'Enter', 'Escape', 'Tab', 'ArrowDown') to the focused element. " +
-      "Note: events are synthetic; some sites ignore them.",
-    { key: z.string().describe("Key value, e.g. 'Enter'"), withSnapshot: withSnapshotParam, tabId: tabIdParam },
-    async ({ key, withSnapshot, tabId }) => textResult(await hub.call("press_key", { key, withSnapshot, tabId }))
+    "Send a keyboard key or combo (e.g. 'Enter', 'Escape', 'Tab', 'Shift+Tab', 'ArrowDown', 'Control+a') to the " +
+      "focused element, in whichever frame holds focus. Synthetic by default: Enter submits the field's form only " +
+      "if the page didn't preventDefault() the keydown; Tab/Shift+Tab move focus. Set trusted:true for real " +
+      "(isTrusted) key events via the debugger (shows banner). Returns {pressed, target, url, title, urlChanged, newTabId?}.",
+    {
+      key: z.string().describe("Key value or combo, e.g. 'Enter', 'Shift+Tab'"),
+      trusted: z.boolean().optional().describe("Use a real trusted key press via chrome.debugger (shows banner)"),
+      withSnapshot: withSnapshotParam,
+      tabId: tabIdParam,
+    },
+    async ({ key, trusted, withSnapshot, tabId }) => textResult(await hub.call("press_key", { key, trusted, withSnapshot, tabId }))
   );
 
   tool(

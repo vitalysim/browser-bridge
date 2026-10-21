@@ -27,6 +27,19 @@ export function bbAxSnapshot(refOffset: number): { url: string; root: AxWalkNode
   // Fresh ref registry each snapshot (never merged), matching bbSnapshot's invariant: refs from a
   // prior snapshot must not leak, and every ref locator injects in this same ISOLATED world.
   const bbRefs: Map<number, Element> = ((window as any).__bbRefs = new Map());
+  // [ref fingerprint] Stale-ref detection: bbAct (dom-act.ts) re-checks {tag, role, name} before
+  // acting on a ref. KEEP IN SYNC with fpOf in dom-act.ts (injected code can't share helpers).
+  const bbRefMeta: Map<number, { tag: string; role: string; name: string }> = ((window as any).__bbRefMeta = new Map());
+  const bbFp = (e: Element) => {
+    const t = e.tagName;
+    const it = t === "INPUT" ? ((e as HTMLInputElement).type || "").toLowerCase() : "";
+    let s: string;
+    if (t === "INPUT" && (it === "submit" || it === "button" || it === "reset")) s = (e as HTMLInputElement).value || e.getAttribute("aria-label") || "";
+    else if (t === "INPUT" || t === "TEXTAREA" || t === "SELECT")
+      s = e.getAttribute("aria-label") || e.getAttribute("placeholder") || e.getAttribute("name") || e.id || e.getAttribute("title") || "";
+    else s = e.getAttribute("aria-label") || (e as HTMLElement).innerText || e.textContent || e.getAttribute("title") || "";
+    return { tag: t.toLowerCase(), role: e.getAttribute("role") || "", name: s.replace(/\s+/g, " ").trim().slice(0, 80) };
+  };
   let refCount = 0; // interactive refs assigned; capped below STRIDE so frames' ranges can't collide
   let nodeCount = 0; // total emitted nodes (payload cap)
   let truncated = false;
@@ -247,6 +260,7 @@ export function bbAxSnapshot(refOffset: number): { url: string; root: AxWalkNode
       refCount++;
       const ref = refOffset + refCount;
       bbRefs.set(ref, el);
+      try { bbRefMeta.set(ref, bbFp(el)); } catch {} // [ref fingerprint]
       node.ref = ref;
     }
     if (childNodes.length) node.children = childNodes;

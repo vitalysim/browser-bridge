@@ -4,6 +4,7 @@ import { NetRing, applyRedirectResponse, capBody, Semaphore, type NetEntry } fro
 // Self-contained injected page helpers, kept in their own files so the two hot files stay small:
 // bbAct is the ONE find-and-act helper the interaction tools share; bbAxSnapshot is the ARIA walker.
 import { bbAct, type BbActParams } from "./dom-act";
+import { CDP_MODS, keyInfo, parseKeyCombo, pickFocusedFrame, matchCdpFrame, type FocusProbe } from "./act-logic";
 import { bbAxSnapshot } from "./ax";
 import { emulateDevice, emulateNetwork, emulateCpu, emulateLocale, emulateGeolocation, emulateReset } from "./emulate.js";
 
@@ -825,18 +826,18 @@ async function actAllFrames(tab: chrome.tabs.Tab, args: any[]): Promise<{ result
   const results = await injectAllFrames(tab, bbAct, args);
   let acted: any = null;
   let ownerFrame: number | null = null;
-  let stale = false;
+  let stale: any = null; // keep bbAct's {staleRef, was, now} detail for the error message
   for (const r of results) {
     const v: any = r?.result;
     if (!v || typeof v !== "object") continue;
     if (typeof v.error === "string") throw new Error(v.error);
-    if (v.staleRef) { stale = true; continue; }
+    if (v.staleRef) { stale = v; continue; }
     if (v.notFound) continue;
     acted = v;
     ownerFrame = r.frameId; // this frame owns the element (result may be notActionable)
   }
   if (acted) return { result: acted, frameId: ownerFrame };
-  return { result: stale ? { staleRef: true } : { notFound: true }, frameId: null };
+  return { result: stale ?? { notFound: true }, frameId: null };
 }
 
 // A retry once the owning frame is known: run bbAct in just that one frame.
@@ -930,6 +931,19 @@ function bbSnapshot(refOffset: number) {
   // INVARIANT: every ref locator must inject in the ISOLATED world - a MAIN-world locator sees a
   // different `window` and would miss this registry.
   const bbRefs: Map<number, Element> = ((window as any).__bbRefs = new Map());
+  // [ref fingerprint] Stale-ref detection: bbAct (dom-act.ts) re-checks {tag, role, name} before
+  // acting on a ref. KEEP IN SYNC with fpOf in dom-act.ts (injected code can't share helpers).
+  const bbRefMeta: Map<number, { tag: string; role: string; name: string }> = ((window as any).__bbRefMeta = new Map());
+  const bbFp = (e: Element) => {
+    const t = e.tagName;
+    const it = t === "INPUT" ? ((e as HTMLInputElement).type || "").toLowerCase() : "";
+    let s: string;
+    if (t === "INPUT" && (it === "submit" || it === "button" || it === "reset")) s = (e as HTMLInputElement).value || e.getAttribute("aria-label") || "";
+    else if (t === "INPUT" || t === "TEXTAREA" || t === "SELECT")
+      s = e.getAttribute("aria-label") || e.getAttribute("placeholder") || e.getAttribute("name") || e.id || e.getAttribute("title") || "";
+    else s = e.getAttribute("aria-label") || (e as HTMLElement).innerText || e.textContent || e.getAttribute("title") || "";
+    return { tag: t.toLowerCase(), role: e.getAttribute("role") || "", name: s.replace(/\s+/g, " ").trim().slice(0, 80) };
+  };
   let n = 0;
   // Single fused pass: match-and-emit during the walk instead of materializing EVERY element in the
   // document into an array and re-looping it. Emission order is identical - the old walk pushed a
@@ -962,6 +976,7 @@ function bbSnapshot(refOffset: number) {
     n++;
     const ref = refOffset + n;
     bbRefs.set(ref, h);
+    try { bbRefMeta.set(ref, bbFp(h)); } catch {} // [ref fingerprint]
     const label = ((h.innerText ||
       (h as HTMLInputElement).value ||
       (h as HTMLInputElement).placeholder ||
@@ -2527,9 +2542,12 @@ async function cdpScreenshot(tab: chrome.tabs.Tab, params: any): Promise<any> {
     const q: number[] = model.border; // [x1,y1,x2,y2,x3,y3,x4,y4]
     const xs = [q[0], q[2], q[4], q[6]];
     const ys = [q[1], q[3], q[5], q[7]];
+    // DOM.getBoxModel quads are relative to the main frame's VIEWPORT, but Page.captureScreenshot's
+    // clip (with captureBeyondViewport) is in DOCUMENT coordinates - add the scroll offset, exactly
+    // like the viewport branch below (and Puppeteer's ElementHandle.screenshot) does.
     const x = Math.min(...xs);
     const y = Math.min(...ys);
-    clip = { x, y, width: Math.max(...xs) - x, height: Math.max(...ys) - y, scale: clipScale };
+    clip = { x: x + (pd.sx || 0), y: y + (pd.sy || 0), width: Math.max(...xs) - x, height: Math.max(...ys) - y, scale: clipScale };
   } else if (params.fullPage) {
     if (pd.sw * scale > SHOT_MAX_PX || pd.sh * scale > SHOT_MAX_PX) {
       throw new Error(`Page too large for a single capture (${pd.sw}x${pd.sh} @${scale}x, limit ${SHOT_MAX_PX}px). Use a selector, a smaller scale, or capture regions.`);
@@ -2586,8 +2604,10 @@ async function trustedPasteImage(tab: chrome.tabs.Tab, params: any): Promise<any
   }
 
   // find the target element's on-screen center (CSP-safe function injection; handles plain refs + shadow)
-  const loc = await inject(tab, bbAct, ["locate", { sel: params.selector ?? null, ref: params.ref ?? null }]);
-  if (!loc || loc.notFound || loc.staleRef) throw new Error("Target not found (or since re-rendered) for trusted paste - take a fresh snapshot or check the selector.");
+  // (frame-aware: coordinates are mapped to the top-level viewport)
+  const loc = await locateForTrusted(tab, params.ref ?? null, params.selector ?? null).catch((e) => {
+    throw new Error(`Target not found for trusted paste (${e instanceof Error ? e.message : e}) - take a fresh snapshot or check the selector.`);
+  });
   await sleep(150);
 
   // trusted click → focuses the field + grants user activation for the clipboard write
@@ -2616,25 +2636,99 @@ async function trustedPasteImage(tab: chrome.tabs.Tab, params: any): Promise<any
   return { pasted: true, trusted: true, method: "clipboard+trusted-paste", size: w.size };
 }
 
-async function trustedAction(tabId: number, action: string, ref: number | null, selector: string | null, text?: string): Promise<any> {
+// Offset of an extension frame's viewport inside the top-level viewport, via CDP: map the frame to
+// its CDP frame id (by URL in Page.getFrameTree), then take the content box of its owner <iframe>
+// (DOM.getBoxModel is relative to the main frame's viewport). Used when a same-origin
+// window.frameElement walk can't reach the top (cross-origin ancestors).
+async function cdpFrameOffset(tabId: number, frameId: number): Promise<{ x: number; y: number }> {
+  const f = await chrome.webNavigation.getFrame({ tabId, frameId });
+  if (!f?.url) throw new Error(`frame ${frameId} is gone`);
+  const { frameTree } = await cmd(tabId, "Page.getFrameTree");
+  const cdpFrameId = matchCdpFrame(frameTree, f.url);
+  if (!cdpFrameId) throw new Error(`can't map frame ${frameId} (${f.url}) to a CDP frame (no unique URL match)`);
+  const { backendNodeId } = await cmd(tabId, "DOM.getFrameOwner", { frameId: cdpFrameId });
+  try {
+    await cmd(tabId, "DOM.scrollIntoViewIfNeeded", { backendNodeId });
+  } catch {
+    /* best effort */
+  }
+  const { model } = await cmd(tabId, "DOM.getBoxModel", { backendNodeId });
+  const q: number[] = model.content; // [x1,y1,...] - top-left first
+  return { x: Math.min(q[0], q[2], q[4], q[6]), y: Math.min(q[1], q[3], q[5], q[7]) };
+}
+
+// Top-level viewport coordinates of a PLAIN snapshot ref (or a selector) for CDP Input: run bbAct
+// "locate" in the owning frame (scrolls it into view, focuses it, returns its frame-local centre),
+// then add the frame's offset in the page - from the same-origin frameElement chain the locate
+// itself computes, or CDP for cross-origin frames.
+async function locateForTrusted(tab: chrome.tabs.Tab, ref: number | null, selector: string | null): Promise<{ x: number; y: number; frameId: number; reResolved?: boolean }> {
+  const { result: loc, frameId } = await actAllFrames(tab, ["locate", { ref, sel: selector, value: null } satisfies BbActParams]);
+  if (!loc || loc.notFound || frameId == null) {
+    throw new Error(ref != null ? `ref ${ref} is not in the page's ref registry - take a new snapshot` : `Element not found for selector: ${selector}`);
+  }
+  if (loc.staleRef) throw new Error(staleRefMessage(ref, loc));
+  let x = loc.x, y = loc.y;
+  if (frameId !== 0 && !loc.isTop) {
+    if (!loc.crossOrigin) {
+      x += loc.ox;
+      y += loc.oy;
+    } else {
+      const off = await cdpFrameOffset(tab.id!, frameId);
+      x += off.x;
+      y += off.y;
+    }
+  }
+  return { x, y, frameId, ...(loc.reResolved ? { reResolved: true } : {}) };
+}
+
+function staleRefMessage(ref: number | null, v: any): string {
+  if (v?.was) {
+    return `stale-ref: element ${ref} changed since the snapshot (was ${v.was}, now ${v.now})${v.ambiguous ? " and several elements now match it" : ""}; take a new snapshot`;
+  }
+  return `stale-ref: the element ref ${ref} pointed at is gone from the DOM (re-render/navigation) - take a new snapshot`;
+}
+
+// Trusted (isTrusted, CDP Input) click/hover/type. Deep-snapshot refs (>= DEEP_REF_BASE) resolve to
+// CDP nodes; plain snapshot refs and selectors are located in-page (frame- and shadow-aware) and
+// mapped to top-level viewport coordinates. A selector the in-page locate can't find falls back to
+// CDP DOM.querySelector.
+async function trustedAction(tab: chrome.tabs.Tab, action: string, ref: number | null, selector: string | null, text?: string): Promise<any> {
+  const tabId = tab.id!;
   await ensureAttached(tabId);
-  const nodeId = await cdpResolve(tabId, ref, selector);
+  let x: number, y: number;
+  let extra: any = {};
+  let nodeId: number | null = null;
+  if (ref != null && ref >= DEEP_REF_BASE) nodeId = await cdpResolveByRef(tabId, ref);
+  else {
+    try {
+      const loc = await locateForTrusted(tab, ref, selector);
+      x = loc.x;
+      y = loc.y;
+      if (loc.reResolved) extra.reResolved = true;
+    } catch (e) {
+      if (ref != null || !selector) throw e;
+      nodeId = await cdpResolveBySelector(tabId, selector);
+    }
+  }
   if (action === "type") {
-    await cmd(tabId, "DOM.focus", { nodeId });
+    // the in-page locate already focused the element; a CDP-resolved node is focused via DOM.focus
+    if (nodeId != null) await cmd(tabId, "DOM.focus", { nodeId });
     for (const ch of Array.from(text ?? "")) {
       await cmd(tabId, "Input.dispatchKeyEvent", { type: "keyDown", text: ch, unmodifiedText: ch, key: ch });
       await cmd(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: ch });
       await sleep(15); // real inter-keystroke timing
     }
-    return { typed: (text ?? "").length, trusted: true };
+    return { typed: (text ?? "").length, trusted: true, ...extra };
   }
-  const { x, y } = await cdpCenter(tabId, nodeId);
+  if (nodeId != null) ({ x, y } = await cdpCenter(tabId, nodeId));
+  x = x!;
+  y = y!;
   await cmd(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, buttons: 0 });
-  if (action === "hover") return { hovered: true, trusted: true, x, y };
+  if (action === "hover") return { hovered: true, trusted: true, x, y, ...extra };
   if (action === "click") {
     await cmd(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
     await cmd(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
-    return { clicked: true, trusted: true, x, y };
+    return { clicked: true, trusted: true, x, y, ...extra };
   }
   throw new Error(`Unknown trusted action: ${action}`);
 }
@@ -2642,37 +2736,7 @@ async function trustedAction(tabId: number, action: string, ref: number | null, 
 // ---- coordinate-level trusted input (CDP Input) — for canvas / remote-desktop / game targets ----
 // Coords are CSS VIEWPORT pixels (top-left origin). Screenshots are device pixels, so map with the
 // dpr the screenshot tool returns: inputCoord = screenshotPixel / dpr.
-const CDP_MODS: Record<string, number> = { alt: 1, option: 1, ctrl: 2, control: 2, meta: 4, cmd: 4, command: 4, super: 4, win: 4, shift: 8 };
-
-// Resolve a key name ("Enter", "ArrowUp", "c", "F5") → { key, code, vk } for CDP Input.dispatchKeyEvent.
-function keyInfo(name: string): { key: string; code: string; vk: number } {
-  const named: Record<string, [string, string, number]> = {
-    enter: ["Enter", "Enter", 13], return: ["Enter", "Enter", 13],
-    tab: ["Tab", "Tab", 9], escape: ["Escape", "Escape", 27], esc: ["Escape", "Escape", 27],
-    backspace: ["Backspace", "Backspace", 8], delete: ["Delete", "Delete", 46], del: ["Delete", "Delete", 46],
-    space: [" ", "Space", 32], spacebar: [" ", "Space", 32],
-    up: ["ArrowUp", "ArrowUp", 38], arrowup: ["ArrowUp", "ArrowUp", 38],
-    down: ["ArrowDown", "ArrowDown", 40], arrowdown: ["ArrowDown", "ArrowDown", 40],
-    left: ["ArrowLeft", "ArrowLeft", 37], arrowleft: ["ArrowLeft", "ArrowLeft", 37],
-    right: ["ArrowRight", "ArrowRight", 39], arrowright: ["ArrowRight", "ArrowRight", 39],
-    home: ["Home", "Home", 36], end: ["End", "End", 35],
-    pageup: ["PageUp", "PageUp", 33], pagedown: ["PageDown", "PageDown", 34],
-    insert: ["Insert", "Insert", 45], ins: ["Insert", "Insert", 45],
-  };
-  const lk = name.toLowerCase();
-  if (named[lk]) return { key: named[lk][0], code: named[lk][1], vk: named[lk][2] };
-  const fm = /^f([1-9]|1[0-2])$/i.exec(name);
-  if (fm) { const n = Number(fm[1]); return { key: "F" + n, code: "F" + n, vk: 111 + n }; }
-  if (name.length === 1) {
-    const ch = name;
-    const up = ch.toUpperCase();
-    if (/[a-z]/i.test(ch)) return { key: ch, code: "Key" + up, vk: up.charCodeAt(0) };
-    if (/[0-9]/.test(ch)) return { key: ch, code: "Digit" + ch, vk: ch.charCodeAt(0) };
-    return { key: ch, code: "", vk: up.charCodeAt(0) };
-  }
-  return { key: name, code: "", vk: 0 };
-}
-
+// (CDP_MODS / keyInfo live in act-logic.ts - pure and unit-tested.)
 async function cdpInput(tabId: number, params: any): Promise<any> {
   const action: string = params.action;
   if (params.activate) {
@@ -2921,6 +2985,159 @@ async function withSnapshotIfRequested(tab: chrome.tabs.Tab, params: any, result
   return result;
 }
 
+// After-action effect summary for click / press_key: {url, title, urlChanged, newTabId?}, so the
+// agent doesn't need 2-3 follow-up calls to learn what its action did. Start the watch BEFORE the
+// action (so a new tab opened by it isn't missed), then finish() after: it waits up to maxMs for the
+// first of a URL change on this tab, a new tab opened from it (openerTabId), or the DOM going quiet
+// for 150ms. Cheap and best-effort - it never throws, and an in-page probe that can't run (page
+// navigating, a dialog open) is simply bounded by the timer.
+function startEffectWatch(tab: chrome.tabs.Tab) {
+  const tabId = tab.id!;
+  const beforeUrl = tab.url ?? "";
+  let newTabId: number | undefined;
+  let urlChanged = false;
+  let wake: (() => void) | null = null;
+  const onCreated = (t: chrome.tabs.Tab) => {
+    if (t.openerTabId === tabId && t.id != null && newTabId == null) {
+      newTabId = t.id;
+      wake?.();
+    }
+  };
+  const onUpdated = (id: number, info: chrome.tabs.TabChangeInfo) => {
+    if (id === tabId && info.url && info.url !== beforeUrl) {
+      urlChanged = true;
+      wake?.();
+    }
+  };
+  chrome.tabs.onCreated.addListener(onCreated);
+  chrome.tabs.onUpdated.addListener(onUpdated);
+  const stop = () => {
+    chrome.tabs.onCreated.removeListener(onCreated);
+    chrome.tabs.onUpdated.removeListener(onUpdated);
+  };
+  return {
+    stop,
+    async finish(maxMs = 500): Promise<{ url: string; title: string; urlChanged: boolean; newTabId?: number }> {
+      try {
+        if (!urlChanged && newTabId == null) {
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, maxMs);
+            wake = () => {
+              clearTimeout(timer);
+              resolve();
+            };
+            chrome.scripting
+              .executeScript({
+                target: { tabId, frameIds: [0] },
+                world: "ISOLATED",
+                func: (quietMs: number, capMs: number) =>
+                  new Promise<boolean>((res) => {
+                    let t: any;
+                    let cap: any;
+                    const obs = new MutationObserver(() => {
+                      clearTimeout(t);
+                      t = setTimeout(() => done(true), quietMs);
+                    });
+                    const done = (v: boolean) => {
+                      obs.disconnect();
+                      clearTimeout(t);
+                      clearTimeout(cap);
+                      res(v);
+                    };
+                    obs.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+                    t = setTimeout(() => done(true), quietMs);
+                    cap = setTimeout(() => done(false), capMs);
+                  }),
+                args: [150, Math.max(50, maxMs - 50)],
+              })
+              .then((r) => {
+                if (r?.[0]?.result === true) wake?.();
+              })
+              .catch(() => {});
+          });
+        }
+      } catch {
+        /* never fail the action */
+      } finally {
+        wake = null;
+        stop();
+      }
+      let fresh: chrome.tabs.Tab | null = null;
+      try {
+        fresh = await chrome.tabs.get(tabId);
+      } catch {}
+      const url = fresh?.pendingUrl || fresh?.url || beforeUrl;
+      const out: { url: string; title: string; urlChanged: boolean; newTabId?: number } = {
+        url,
+        title: fresh?.title ?? "",
+        urlChanged: urlChanged || url !== beforeUrl,
+      };
+      if (newTabId != null) out.newTabId = newTabId;
+      return out;
+    },
+  };
+}
+
+// Attach the effect summary to a successful action result; never lets it fail the action.
+async function withEffects(watch: ReturnType<typeof startEffectWatch>, result: any, succeeded: boolean): Promise<any> {
+  if (!succeeded || !result || typeof result !== "object") {
+    watch.stop();
+    return result;
+  }
+  try {
+    return { ...result, ...(await watch.finish()) };
+  } catch {
+    return result;
+  }
+}
+
+// Synthetic press_key in the frame that holds focus (all-frames probe of document.hasFocus()).
+async function pressKeySynthetic(tab: chrome.tabs.Tab, combo: string): Promise<any> {
+  const k = parseKeyCombo(combo);
+  if (!k.key) throw new Error(`press_key: can't parse key ${JSON.stringify(combo)}`);
+  let frameId = 0;
+  try {
+    const probes = await injectAllFrames(tab, () => {
+      let a: Element | null = document.activeElement;
+      while (a && (a as HTMLElement).shadowRoot && (a as HTMLElement).shadowRoot!.activeElement) a = (a as HTMLElement).shadowRoot!.activeElement;
+      return {
+        hasFocus: document.hasFocus(),
+        activeIsFrame: !!a && (a.tagName === "IFRAME" || a.tagName === "FRAME"),
+        activeIsBody: !a || a === document.body || a === document.documentElement,
+      };
+    });
+    const list: FocusProbe[] = [];
+    for (const r of probes) if (r?.result && typeof r.result === "object") list.push({ frameId: r.frameId, ...(r.result as any) });
+    frameId = pickFocusedFrame(list);
+  } catch {
+    frameId = 0;
+  }
+  const keyInit = { key: k.key, code: k.code, vk: k.vk, shift: k.shift, ctrl: k.ctrl, alt: k.alt, meta: k.meta };
+  const v = await actInFrame(tab, frameId, ["key", { keyInit } satisfies BbActParams]);
+  if (!v || v.notFound) throw new Error("press_key: the focused frame could not be scripted");
+  return { ...v, pressed: combo, ...(frameId !== 0 ? { frameId } : {}) };
+}
+
+// Trusted press_key via CDP Input.dispatchKeyEvent (isTrusted; Enter carries "\r" so it submits /
+// activates like a real key). Goes to whatever the page has focused.
+async function pressKeyTrusted(tab: chrome.tabs.Tab, combo: string): Promise<any> {
+  const tabId = tab.id!;
+  await ensureAttached(tabId);
+  const k = parseKeyCombo(combo);
+  if (!k.key) throw new Error(`press_key: can't parse key ${JSON.stringify(combo)}`);
+  const printable = k.key.length === 1 && !k.ctrl && !k.meta && !k.alt;
+  const text = k.key === "Enter" ? "\r" : printable ? (k.shift ? k.key.toUpperCase() : k.key) : undefined;
+  const common: any = { key: k.key, code: k.code, windowsVirtualKeyCode: k.vk, nativeVirtualKeyCode: k.vk, modifiers: k.modifiers };
+  const down: any = { ...common, type: text ? "keyDown" : "rawKeyDown" };
+  if (text) {
+    down.text = text;
+    down.unmodifiedText = k.key === "Enter" ? "\r" : k.key;
+  }
+  await cmd(tabId, "Input.dispatchKeyEvent", down);
+  await cmd(tabId, "Input.dispatchKeyEvent", { ...common, type: "keyUp" });
+  return { pressed: combo, trusted: true };
+}
+
 // Run a synthetic interaction with auto-wait actionability retry + trusted escalation.
 // Retries while the element is missing or transiently not-actionable (hidden/disabled) up to
 // params.timeoutMs (default 5000). For click, if the target is COVERED by an overlay, it escalates
@@ -2929,6 +3146,19 @@ async function withSnapshotIfRequested(tab: chrome.tabs.Tab, params: any, result
 async function interact(tab: chrome.tabs.Tab, action: string, ref: number | null, sel: string | null, value: string | null, params: any): Promise<any> {
   const timeoutMs = params.timeoutMs ?? 5000;
   const deadline = Date.now() + timeoutMs;
+  // Deep-snapshot refs are CDP node handles, not entries in the page's ref registry - the synthetic
+  // path can never resolve them, so say exactly what to do instead of "unknown ref".
+  if (ref != null && ref >= DEEP_REF_BASE) {
+    return {
+      notActionable: true,
+      reason: "deep-ref-needs-trusted",
+      detail:
+        action === "fill"
+          ? `ref ${ref} is from snapshot({deep:true}); deep refs only work with trusted actions. Take a plain snapshot() and fill by its ref, or use type with trusted:true.`
+          : `ref ${ref} is from snapshot({deep:true}); deep refs only work with trusted actions - pass trusted:true.`,
+      ref,
+    };
+  }
   const args: any[] = [action, { ref, sel, value } satisfies BbActParams];
   let last: any = null;
   let ownerFrame: number | null = null; // once a frame owns the element, retry only there
@@ -2952,9 +3182,10 @@ async function interact(tab: chrome.tabs.Tab, action: string, ref: number | null
         notActionable: true,
         reason: stale ? "stale-ref" : "unknown-ref",
         detail: stale
-          ? "the element this ref pointed at is gone from the DOM (re-render/navigation) - take a new snapshot"
+          ? staleRefMessage(ref, last)
           : "this ref is not in the page's ref registry (it was reset by a navigation, or a newer snapshot replaced it) - take a new snapshot",
         ref,
+        ...(stale && last.was ? { was: last.was, now: last.now } : {}),
       };
     }
     const retryable = last && (last.notFound || (last.notActionable && last.reason !== "covered"));
@@ -2963,10 +3194,11 @@ async function interact(tab: chrome.tabs.Tab, action: string, ref: number | null
   }
   if (action === "click" && last?.notActionable && last.reason === "covered" && params.autoTrusted !== false && !params.noEscalate) {
     try {
-      const t = await trustedAction(tab.id!, "click", ref, sel);
+      const t = await trustedAction(tab, "click", ref, sel);
       return { ...t, via: "trusted", wasCovered: true, coveredBy: last.coveredBy };
-    } catch {
-      return last; // trusted also failed - report the covered state
+    } catch (e) {
+      // trusted also failed - report the covered state, and why escalation didn't help
+      return { ...last, escalationError: e instanceof Error ? e.message : String(e) };
     }
   }
   if (last?.notFound) return { notActionable: true, reason: `not-found-after-${timeoutMs}ms`, ref, selector: sel };
@@ -3091,9 +3323,17 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "click": {
       const tab = await targetTab(params.tabId);
-      const result = params.trusted
-        ? { ...(await trustedAction(tab.id!, "click", params.ref, params.selector)), via: "trusted" }
-        : await interact(tab, "click", params.ref, params.selector, null, params);
+      const watch = startEffectWatch(tab);
+      let result: any;
+      try {
+        result = params.trusted
+          ? { ...(await trustedAction(tab, "click", params.ref ?? null, params.selector ?? null)), via: "trusted" }
+          : await interact(tab, "click", params.ref, params.selector, null, params);
+      } catch (e) {
+        watch.stop();
+        throw e;
+      }
+      result = await withEffects(watch, result, !!result?.clicked);
       return withSnapshotIfRequested(tab, params, result);
     }
 
@@ -3106,7 +3346,7 @@ async function dispatch(method: string, params: any): Promise<any> {
     case "hover": {
       const tab = await targetTab(params.tabId);
       const result = params.trusted
-        ? await trustedAction(tab.id!, "hover", params.ref, params.selector)
+        ? await trustedAction(tab, "hover", params.ref ?? null, params.selector ?? null)
         : await interact(tab, "hover", params.ref, params.selector, null, params);
       return withSnapshotIfRequested(tab, params, result);
     }
@@ -3114,7 +3354,7 @@ async function dispatch(method: string, params: any): Promise<any> {
     case "type": {
       const tab = await targetTab(params.tabId);
       const result = params.trusted
-        ? await trustedAction(tab.id!, "type", params.ref, params.selector, params.text)
+        ? await trustedAction(tab, "type", params.ref ?? null, params.selector ?? null, params.text)
         : await interact(tab, "type", params.ref, params.selector, params.text ?? null, params);
       return withSnapshotIfRequested(tab, params, result);
     }
@@ -3472,21 +3712,17 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "press_key": {
       const tab = await targetTab(params.tabId);
-      const result = await inject(
-        tab,
-        (key: string) => {
-          const el = (document.activeElement as HTMLElement) ?? document.body;
-          const opts = { key, bubbles: true, cancelable: true };
-          el.dispatchEvent(new KeyboardEvent("keydown", opts));
-          el.dispatchEvent(new KeyboardEvent("keyup", opts));
-          if (key === "Enter") {
-            const form = (el as HTMLInputElement).form;
-            if (form) form.requestSubmit();
-          }
-          return { pressed: key, target: el.tagName.toLowerCase() };
-        },
-        [params.key]
-      );
+      const watch = startEffectWatch(tab);
+      let result: any;
+      try {
+        // synthetic: dispatched (deferred) in the frame holding focus; Enter submits only when not
+        // preventDefault()ed, Tab moves focus. trusted: real CDP key events.
+        result = params.trusted ? await pressKeyTrusted(tab, String(params.key ?? "")) : await pressKeySynthetic(tab, String(params.key ?? ""));
+      } catch (e) {
+        watch.stop();
+        throw e;
+      }
+      result = await withEffects(watch, result, true);
       return withSnapshotIfRequested(tab, params, result);
     }
 
