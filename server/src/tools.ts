@@ -317,6 +317,15 @@ const timeoutMsParam = z
 // `+5_000` slack. Math.max so the budget can only ever GROW: the default stays exactly CALL_TIMEOUT_MS.
 const actionHubTimeout = (t?: number) => Math.max(CALL_TIMEOUT_MS, (t ?? 5_000) + 5_000);
 
+const onDialogParam = z
+  .enum(["accept", "dismiss"])
+  .optional()
+  .describe(
+    "Answer any alert/confirm/prompt this action opens (within ~3s) instead of leaving it open: 'accept' = OK, " +
+      "'dismiss' = Cancel. What was shown is returned in dialogs[]. Omit to leave dialogs for the user."
+  );
+const promptTextParam = z.string().optional().describe("Text to answer a prompt() with when onDialog is 'accept'");
+
 const waitUntilParam = z
   .enum(["load", "domcontentloaded", "none"])
   .optional()
@@ -508,21 +517,29 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       "actionable (found + visible + enabled, default 5s). If the element is covered by an overlay it " +
       "auto-escalates to a real trusted CDP click (via:'trusted', shows the banner) unless autoTrusted:false / " +
       "noEscalate:true. Set trusted:true to force the trusted path (also required for deep-snapshot refs). " +
-      "Result reports via:'synthetic'|'trusted', or {notActionable, reason} on failure.",
+      "Result reports via:'synthetic'|'trusted' plus {url, title, urlChanged, newTabId?}, or {notActionable, reason} on failure. " +
+      "If the click may open an alert/confirm/prompt, pass onDialog so the click answers it itself (reported in dialogs[]); " +
+      "otherwise the dialog stays open for the user and later calls on that tab fail until it is closed.",
     {
       ref: z.number().optional().describe("Element ref from a prior snapshot call"),
       selector: z.string().optional().describe("CSS selector (alternative to ref)"),
       trusted: z.boolean().optional().describe("Force a real trusted click via chrome.debugger (shows banner)"),
       autoTrusted: z.boolean().optional().describe("Escalate to a trusted click when the target is covered (default true)"),
       noEscalate: z.boolean().optional().describe("Never auto-escalate to trusted; report {notActionable} instead"),
+      onDialog: onDialogParam,
+      promptText: promptTextParam,
       timeoutMs: timeoutMsParam,
       withSnapshot: withSnapshotParam,
       tabId: tabIdParam,
     },
-    async ({ ref, selector, trusted, autoTrusted, noEscalate, timeoutMs, withSnapshot, tabId }) => {
+    async ({ ref, selector, trusted, autoTrusted, noEscalate, onDialog, promptText, timeoutMs, withSnapshot, tabId }) => {
       if (ref === undefined && !selector) throw new Error("Provide either ref or selector");
       return textResult(
-        await hub.call("click", { ref, selector, trusted, autoTrusted, noEscalate, timeoutMs, withSnapshot, tabId }, actionHubTimeout(timeoutMs))
+        await hub.call(
+          "click",
+          { ref, selector, trusted, autoTrusted, noEscalate, onDialog, promptText, timeoutMs, withSnapshot, tabId },
+          actionHubTimeout(timeoutMs)
+        )
       );
     }
   );
@@ -596,10 +613,13 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     {
       key: z.string().describe("Key value or combo, e.g. 'Enter', 'Shift+Tab'"),
       trusted: z.boolean().optional().describe("Use a real trusted key press via chrome.debugger (shows banner)"),
+      onDialog: onDialogParam,
+      promptText: promptTextParam,
       withSnapshot: withSnapshotParam,
       tabId: tabIdParam,
     },
-    async ({ key, trusted, withSnapshot, tabId }) => textResult(await hub.call("press_key", { key, trusted, withSnapshot, tabId }))
+    async ({ key, trusted, onDialog, promptText, withSnapshot, tabId }) =>
+      textResult(await hub.call("press_key", { key, trusted, onDialog, promptText, withSnapshot, tabId }))
   );
 
   tool(

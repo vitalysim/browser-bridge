@@ -1634,11 +1634,23 @@ function bbWaitProbe(spec: { sel: string | null; text: string | null; role: stri
               hits++;
             }
           }
-          if (!hits && norm(start.textContent).includes(text)) {
+          // Rendered text only: textContent includes <script>/<style> source, so a page whose inline JS or
+          // JSON data mentions the text would "match" before the text is ever shown.
+          const shownText = (node: Node): string => {
+            let s = "";
+            const w = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+            for (let t = w.nextNode(); t; t = w.nextNode()) {
+              const p = t.parentElement;
+              if (p && /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(p.tagName)) continue;
+              s += t.nodeValue + " ";
+            }
+            return s;
+          };
+          if (!hits && norm(shownText(start)).includes(text)) {
             let el: Element | null = start instanceof Element ? start : null;
             let kids: Element[] = Array.from((start as ParentNode).children);
             for (;;) {
-              const next: Element | undefined = kids.find((k) => !/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(k.tagName) && norm(k.textContent).includes(text));
+              const next: Element | undefined = kids.find((k) => !/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(k.tagName) && norm(shownText(k)).includes(text));
               if (!next) break;
               el = next;
               kids = Array.from(next.children);
@@ -3908,6 +3920,78 @@ function startEffectWatch(tab: chrome.tabs.Tab) {
 }
 
 // Attach the effect summary to a successful action result; never lets it fail the action.
+// ---- per-action dialog guard ----
+// Chrome cannot answer an alert/confirm/prompt through chrome.debugger unless the debugger was attached
+// BEFORE the dialog opened (a late session gets "No dialog is showing" and Page.enable hangs behind the
+// blocked renderer - verified against bare Chromium). So when the agent opts in with onDialog, the action
+// briefly replaces window.alert/confirm/prompt in the page's MAIN world (every frame), answers as told,
+// and records what was shown on a DOM attribute the isolated world can read back. Restored after `ttlMs`.
+// beforeunload is not covered (it is not a window method). Without onDialog nothing is installed.
+async function armDialogGuard(tab: chrome.tabs.Tab, mode: "accept" | "dismiss", promptText: string | null, ttlMs = 3_000): Promise<void> {
+  await injectAllFrames(
+    tab,
+    (mode: string, promptText: string | null, ttl: number) => {
+      const w = window as any;
+      const prev = w.__bbDlgGuard;
+      if (prev) clearTimeout(prev.t);
+      const orig = prev?.orig ?? { alert: w.alert, confirm: w.confirm, prompt: w.prompt };
+      const accept = mode === "accept";
+      const rec = (type: string, msg: unknown, answer: unknown) => {
+        const list = JSON.parse(document.documentElement.getAttribute("data-bb-dialogs") || "[]");
+        list.push({ type, message: String(msg ?? "").slice(0, 500), accepted: accept, answer });
+        document.documentElement.setAttribute("data-bb-dialogs", JSON.stringify(list.slice(-10)));
+      };
+      w.alert = function (m?: unknown) { rec("alert", m, null); };
+      w.confirm = function (m?: unknown) { rec("confirm", m, accept); return accept; };
+      w.prompt = function (m?: unknown, d?: unknown) {
+        const v = accept ? (promptText ?? (d == null ? "" : String(d))) : null;
+        rec("prompt", m, v);
+        return v;
+      };
+      const restore = () => {
+        const g = w.__bbDlgGuard;
+        if (g) clearTimeout(g.t);
+        w.alert = orig.alert;
+        w.confirm = orig.confirm;
+        w.prompt = orig.prompt;
+        delete w.__bbDlgGuard;
+      };
+      // The timer is only a backstop: collectGuardedDialogs restores as soon as the action is done, so a
+      // guard never answers dialogs for a later action that didn't opt in, or for the user.
+      w.__bbDlgGuard = { orig, restore, t: setTimeout(restore, ttl) };
+      return true;
+    },
+    [mode, promptText, ttlMs],
+    "MAIN"
+  );
+}
+
+async function collectGuardedDialogs(tab: chrome.tabs.Tab): Promise<any[]> {
+  await injectAllFrames(
+    tab,
+    () => {
+      (window as any).__bbDlgGuard?.restore?.();
+      return true;
+    },
+    [],
+    "MAIN"
+  ).catch(() => {});
+  try {
+    const res = await injectAllFrames(tab, () => {
+      const raw = document.documentElement.getAttribute("data-bb-dialogs");
+      document.documentElement.removeAttribute("data-bb-dialogs");
+      try {
+        return raw ? JSON.parse(raw) : [];
+      } catch {
+        return [];
+      }
+    });
+    return res.flatMap((r: any) => (Array.isArray(r?.result) ? r.result : []));
+  } catch {
+    return [];
+  }
+}
+
 async function withEffects(watch: ReturnType<typeof startEffectWatch>, result: any, succeeded: boolean): Promise<any> {
   if (!succeeded || !result || typeof result !== "object") {
     watch.stop();
@@ -4159,6 +4243,8 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "click": {
       const tab = await targetTab(params.tabId);
+      const guard = params.onDialog === "accept" || params.onDialog === "dismiss";
+      if (guard) await armDialogGuard(tab, params.onDialog, params.promptText ?? null);
       const watch = startEffectWatch(tab);
       let result: any;
       try {
@@ -4170,6 +4256,10 @@ async function dispatch(method: string, params: any): Promise<any> {
         throw e;
       }
       result = await withEffects(watch, result, !!result?.clicked);
+      if (guard && result && typeof result === "object") {
+        const dialogs = await collectGuardedDialogs(tab);
+        if (dialogs.length) result = { ...result, dialogs };
+      }
       return withSnapshotIfRequested(tab, params, result);
     }
 
@@ -4261,21 +4351,51 @@ async function dispatch(method: string, params: any): Promise<any> {
     case "handle_dialog": {
       const tab = await targetTab(params.tabId);
       const tabId = tab.id!;
-      await ensureAttached(tabId);
       const known = pendingDialogs.get(tabId);
       const accept = params.accept !== false;
+      // Do NOT use ensureAttached here: its DOM.enable needs the renderer's main thread, which an open
+      // alert/confirm/prompt is blocking, so it hangs until the attach timeout - exactly when this tool is
+      // needed. Answering a dialog is handled in the browser process, so a bare attach is enough. Page.enable
+      // is attempted briefly (it also re-announces an already-open dialog) but its failure is not fatal.
+      let tempAttach = false;
+      if (!sessions.get(tabId)) {
+        if (attaching.has(tabId)) await attaching.get(tabId)!.catch(() => {});
+        if (!sessions.get(tabId)) {
+          try {
+            await withTimeout(attach(tabId), 5_000, "debugger attach for handle_dialog");
+            tempAttach = true;
+          } catch (e) {
+            const m = e instanceof Error ? e.message : String(e);
+            if (!/already attached/i.test(m)) throw e; // a stale attach of ours is fine: just send the command
+          }
+          await cmd(tabId, "Page.enable", undefined, 2_000).catch(() => {});
+        }
+      }
       try {
-        await cmd(tabId, "Page.handleJavaScriptDialog", {
-          accept,
-          ...(typeof params.promptText === "string" ? { promptText: params.promptText } : {}),
-        });
+        await cmd(
+          tabId,
+          "Page.handleJavaScriptDialog",
+          { accept, ...(typeof params.promptText === "string" ? { promptText: params.promptText } : {}) },
+          5_000
+        );
       } catch (e) {
         const m = e instanceof Error ? e.message : String(e);
         if (/no dialog/i.test(m)) {
           pendingDialogs.delete(tabId);
-          return { handled: false, tabId, message: `no JavaScript dialog is showing on tab ${tabId}` };
+          return {
+            handled: false,
+            tabId,
+            message:
+              `Chrome reports no dialog it can answer on tab ${tabId}. Either none is open, or it opened before ` +
+              `the debugger was attached - Chrome only lets a debugger answer dialogs that open while it is ` +
+              `attached. If the tab is stuck behind a dialog, the user has to click it in Chrome. To avoid this, ` +
+              `pass onDialog:"accept"|"dismiss" to click/press_key so the action answers its own dialogs.`,
+          };
         }
         throw e;
+      } finally {
+        // A temporary bare attach must not linger: no session tracks it (banner + reconcile would detach it later anyway).
+        if (tempAttach) await new Promise<void>((r) => chrome.debugger.detach({ tabId }, () => { void chrome.runtime.lastError; r(); }));
       }
       pendingDialogs.delete(tabId);
       return { handled: true, tabId, accepted: accept, type: known?.type, message: known?.message, url: known?.url };
@@ -4548,6 +4668,8 @@ async function dispatch(method: string, params: any): Promise<any> {
 
     case "press_key": {
       const tab = await targetTab(params.tabId);
+      const guard = params.onDialog === "accept" || params.onDialog === "dismiss";
+      if (guard) await armDialogGuard(tab, params.onDialog, params.promptText ?? null);
       const watch = startEffectWatch(tab);
       let result: any;
       try {
@@ -4559,6 +4681,10 @@ async function dispatch(method: string, params: any): Promise<any> {
         throw e;
       }
       result = await withEffects(watch, result, true);
+      if (guard && result && typeof result === "object") {
+        const dialogs = await collectGuardedDialogs(tab);
+        if (dialogs.length) result = { ...result, dialogs };
+      }
       return withSnapshotIfRequested(tab, params, result);
     }
 

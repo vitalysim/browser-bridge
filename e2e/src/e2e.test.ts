@@ -66,24 +66,38 @@ scenario(
     const { elements } = await c.snapshot(tabId);
     const btn = findEl(elements, byLabel(/Delete account/));
     if (!btn) throw new Error("button not in snapshot");
+    // (a) The agent opts in: the click answers its own confirm() and reports it; nothing is left open.
+    if (c.h.hasParam("click", "onDialog")) {
+      const guarded = await c.call("click", { ref: btn.ref, tabId, onDialog: "accept" }, { timeoutMs: 15_000, allowTimeout: true });
+      const shown = (guarded.json?.dialogs ?? []) as any[];
+      c.note(`guarded click returned in ${guarded.ms}ms; dialogs=${JSON.stringify(shown)}`);
+      c.expect(!guarded.timedOut && !guarded.isError, `guarded click failed: ${trim(guarded.text, 160)}`);
+      c.expect(shown.some((d) => d.type === "confirm" && /Really delete/i.test(d.message ?? "")), "guarded click did not report the confirm() it answered");
+      c.expect((await c.evalJs(tabId, "window.__answer", { timeoutMs: 10_000 })) === true, "page did not continue after onDialog:'accept'");
+      c.expect(!c.h.seenDialogs.some((d) => d.type === "confirm"), "a real dialog still opened despite onDialog");
+      await c.evalJs(tabId, "window.__answer = undefined");
+    } else {
+      c.expect(false, "click has no onDialog param");
+    }
+
+    // (b) No opt-in: the dialog stays for the user, but nothing hangs - the click returns and the next
+    // call fails fast with an actionable message instead of wedging until the hub timeout.
     const click = await c.call("click", { ref: btn.ref, tabId }, { timeoutMs: 15_000, allowTimeout: true });
     const dialogOpen = c.h.seenDialogs.some((d) => d.type === "confirm");
     const text = await c.call("get_page_text", { tabId }, { timeoutMs: 15_000, allowTimeout: true });
-    c.note(`dialog opened=${dialogOpen}; click ${click.timedOut ? "HUNG" : "returned"} in ${click.ms}ms; get_page_text ${text.timedOut ? "HUNG" : "returned"} in ${text.ms}ms`);
-
+    c.note(`dialog opened=${dialogOpen}; click ${click.timedOut ? "HUNG" : "returned"} in ${click.ms}ms; get_page_text ${text.timedOut ? "HUNG" : "returned"} in ${text.ms}ms: ${trim(text.text, 120)}`);
+    c.expect(!click.timedOut && click.ms < 3_000, `click hung ${click.ms}ms behind the confirm() dialog`);
+    c.expect(!text.timedOut, `get_page_text hung ${text.ms}ms behind the confirm() dialog`);
+    c.expect(!!text.isError && /dialog/i.test(text.text), `get_page_text behind a dialog should fail with a dialog hint, got: ${trim(text.text, 160)}`);
     const dialogTool = [...c.h.toolSchemas.keys()].find((n) => /dialog/i.test(n));
     if (dialogTool) {
       const r = await c.call(dialogTool, { tabId, accept: true }, { timeoutMs: 10_000, allowTimeout: true });
-      c.expect(!r.isError && !r.timedOut, `${dialogTool} failed: ${trim(r.text, 160)}`);
-    } else {
-      c.note("no dialog-handling tool exposed; dialog answered out-of-band by the harness");
-      await c.h.dismissPendingDialogs(true);
+      c.note(`${dialogTool} -> ${trim(r.text, 160)}`);
+      c.expect(!r.timedOut, `${dialogTool} hung ${r.ms}ms`);
     }
+    await c.h.dismissPendingDialogs(true); // stands in for the user clicking OK
     const answer = await c.evalJs(tabId, "window.__answer", { timeoutMs: 10_000 });
     c.expect(answer === true, `page did not continue after the dialog was accepted (__answer=${answer})`);
-    c.expect(!click.timedOut, `click hung ${click.ms}ms behind the confirm() dialog`);
-    c.expect(!text.timedOut, `get_page_text hung ${text.ms}ms behind the confirm() dialog`);
-    c.expect(!!dialogTool, "no tool to observe/answer JS dialogs (handle_dialog or similar)");
   },
   { timeout: 120_000 }
 );
