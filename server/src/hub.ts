@@ -5,8 +5,14 @@ import { CaptureSink } from "./capture-sink.js";
 import { versionSkewWarning } from "./version.js";
 import { log } from "./log.js";
 import { NOT_CONNECTED_MESSAGE, explainTimeout } from "./result.js";
+import { WS_AUTH_VERSION, newNonce, safeEqual, srvMac, verifyAuthReply } from "./ws-auth.js";
 
 export const CALL_TIMEOUT_MS = 30_000;
+
+/** An unauthenticated socket must finish the challenge-response within this long. */
+export const WS_AUTH_TIMEOUT_MS = 10_000;
+/** Close code for a failed handshake; the extension shows it as a token mismatch. */
+export const WS_AUTH_FAILED_CLOSE_CODE = 4001;
 
 // How long hub.call waits for the extension to (re)connect before failing with NO_EXTENSION. The MV3
 // service worker restarts often (dozens of times in one server run) and almost always reconnects within
@@ -98,13 +104,72 @@ export class ExtensionHub {
         socket.destroy();
         return;
       }
-      if (url.searchParams.get("token") !== token) {
-        log("[hub] rejected WS: bad token");
-        socket.destroy();
+      const legacyToken = url.searchParams.get("token");
+      if (legacyToken !== null) {
+        // DEPRECATED (one release): extensions older than the v2 handshake send the token in the URL.
+        // Still accepted so a server upgrade doesn't strand an older extension, but logged - that
+        // extension leaks its token to anything squatting the port while the server is down.
+        if (!safeEqual(legacyToken, token)) {
+          log("[hub] rejected WS: bad token");
+          socket.destroy();
+          return;
+        }
+        log("[hub] extension used the deprecated ?token= handshake - update the extension (it must match the server version)");
+        wss.handleUpgrade(req, socket, head, (ws) => this.attach(ws, req));
         return;
       }
-      wss.handleUpgrade(req, socket, head, (ws) => this.attach(ws, req));
+      wss.handleUpgrade(req, socket, head, (ws) => this.authenticate(ws, req, token));
     });
+  }
+
+  /**
+   * v2 challenge-response (see ws-auth.ts). The socket is NOT attached - it cannot replace the live
+   * connection, receive calls, or feed taps - until the extension proves it holds the token. We then
+   * prove the same to it, so the extension never talks to an impostor on the port.
+   */
+  private authenticate(ws: WebSocket, req: IncomingMessage, token: string) {
+    const sNonce = newNonce();
+    let done = false;
+    const finish = () => {
+      done = true;
+      clearTimeout(timer);
+      ws.removeListener("message", onMessage);
+    };
+    const fail = (reason: string) => {
+      if (done) return;
+      finish();
+      log(`[hub] rejected WS: authentication failed (${reason})`);
+      try {
+        ws.close(WS_AUTH_FAILED_CLOSE_CODE, "authentication failed");
+      } catch {
+        ws.terminate();
+      }
+    };
+    const timer = setTimeout(() => fail(`no auth reply within ${WS_AUTH_TIMEOUT_MS}ms`), WS_AUTH_TIMEOUT_MS);
+    const onMessage = (data: any, isBinary?: boolean) => {
+      if (done) return;
+      // A handshake frame is ~250 bytes; anything big or binary from an unauthenticated peer is not one.
+      const raw = isBinary ? "" : data.toString();
+      if (!raw || raw.length > 4096) return fail("oversized or binary handshake frame");
+      let msg: any;
+      try {
+        msg = JSON.parse(raw);
+      } catch {
+        return fail("unparseable handshake frame");
+      }
+      const v = verifyAuthReply(token, sNonce, msg);
+      if (!v.ok) return fail(v.reason);
+      finish();
+      ws.send(JSON.stringify({ type: "auth-ok", v: WS_AUTH_VERSION, mac: srvMac(token, v.cNonce, sNonce) }));
+      this.attach(ws, req);
+    };
+    ws.on("message", onMessage);
+    ws.once("close", () => {
+      done = true;
+      clearTimeout(timer);
+    });
+    ws.on("error", () => undefined);
+    ws.send(JSON.stringify({ type: "challenge", v: WS_AUTH_VERSION, nonce: sNonce }));
   }
 
   private attach(ws: WebSocket, req: IncomingMessage) {

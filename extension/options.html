@@ -12,7 +12,7 @@
     button:hover { background: #eee; }
     #status { margin-top: 12px; padding: 8px 10px; border-radius: 6px; background: #f0f0f0; }
     #status.connected { background: #e2f5e5; color: #1a6b2a; }
-    #status.disconnected, #status.no-token { background: #fdeaea; color: #8f2020; }
+    #status.disconnected, #status.no-token, #status.auth-failed, #status.token-rejected, #status.version-skew { background: #fdeaea; color: #8f2020; }
     #status.connecting { background: #fdf6e2; color: #7a5b12; }
     .hint { color: #666; font-size: 12px; margin-top: 8px; }
     code { background: #f0f0f0; padding: 1px 4px; border-radius: 4px; }
@@ -26,7 +26,7 @@
   <label for="port">Server port</label>
   <input id="port" type="number" value="8765">
   <button id="save">Save &amp; connect</button>
-  <p class="hint">The token is printed when the bridge server starts, and stored in <code>~/.browser-bridge/token</code>.</p>
+  <p class="hint">The token is stored in <code>~/.browser-bridge/token</code> (it is never printed to the log). It is never sent to the server: both sides prove they know it with an HMAC challenge-response.</p>
   <script src="options.js"></script>
 </body>
 </html>

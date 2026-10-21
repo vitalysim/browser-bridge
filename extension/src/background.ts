@@ -8,6 +8,7 @@ import { CDP_MODS, keyInfo, parseKeyCombo, pickFocusedFrame, matchCdpFrame, type
 import { bbAxSnapshot } from "./ax";
 import { allocateFrameBudgets, assignAxRefs, clampLimit, frameOffsets, pickSelectorTarget, routeRef, SNAPSHOT_DEFAULT_LIMIT, SNAPSHOT_MAX_LIMIT, type LocateMatch, type RefRoute } from "./snapshot-plan";
 import { emulateDevice, emulateNetwork, emulateCpu, emulateLocale, emulateGeolocation, emulateReset } from "./emulate.js";
+import { WsAuthClient, WS_AUTH_FAILED_CLOSE_CODE } from "./ws-auth";
 
 // Injected at build time by build.mjs (esbuild define) from extension/package.json - single
 // source of truth shared with manifest.json, so the version can't drift.
@@ -140,15 +141,36 @@ function isCancelled(paramsOrId: object | string | null | undefined): boolean {
 // A token/port change or an explicit reconnect request clears it.
 let replacedUntil = 0;
 
+// A socket that is open (or opening) but has NOT finished the mutual challenge-response yet. Kept out
+// of `ws` on purpose: everything that sends (shipOrQueue, pumpOutbox, replies) goes through `ws`, so
+// nothing - no hello, no capture batch, no reply - can reach an unverified peer.
+let pendingWs: WebSocket | null = null;
+// How long the server has to complete the handshake, and how long to hold off after a failed one.
+const AUTH_TIMEOUT_MS = 10_000;
+const AUTH_FAILED_RETRY_MS = 15_000;
+
 async function connect() {
   if (connecting) return;
   if (Date.now() < replacedUntil) return;
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  if (pendingWs && (pendingWs.readyState === WebSocket.OPEN || pendingWs.readyState === WebSocket.CONNECTING)) return;
   connecting = true;
   try {
     await connectNow();
   } finally {
     connecting = false;
+  }
+}
+
+/** True when something answers the bridge's /health on the port - used to tell "server down" from
+ *  "a server is up but refused the WebSocket" (an older server that requires ?token=, i.e. version skew). */
+async function healthAnswers(port: number): Promise<boolean> {
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1_500) });
+    const j: any = await r.json();
+    return j?.ok === true;
+  } catch {
+    return false;
   }
 }
 
@@ -159,10 +181,47 @@ async function connectNow() {
     return;
   }
   setStatus("connecting");
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`);
-  ws = socket;
+  // No token in the URL: the server must first prove it knows it (see ws-auth.ts).
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+  pendingWs = socket;
+  const auth = new WsAuthClient(String(token));
+  let authed = false;
+  let opened = false;
+  let authError: string | null = null;
+  // Pre-auth frames are processed strictly in order (HMAC is async): a call the server sends right
+  // after auth-ok must not be judged while auth-ok is still being verified.
+  let preAuth: Promise<void> = Promise.resolve();
+  const authTimer = setTimeout(() => {
+    if (authed) return;
+    authError = "the server did not complete authentication in time";
+    socket.close();
+  }, AUTH_TIMEOUT_MS);
 
-  socket.onopen = async () => {
+  const handshakeStep = async (event: MessageEvent) => {
+    if (authed || authError || pendingWs !== socket) return;
+    try {
+      const out = await auth.step(JSON.parse(String(event.data)));
+      if (out !== "ok") {
+        if (socket.readyState === WebSocket.OPEN) socket.send(out);
+        return;
+      }
+      authed = true;
+      clearTimeout(authTimer);
+      pendingWs = null;
+      ws = socket;
+      await onAuthenticated();
+    } catch (e) {
+      authError = e instanceof Error ? e.message : String(e);
+      console.warn(`[bb] closing connection: ${authError}`);
+      socket.close();
+    }
+  };
+
+  socket.onopen = () => {
+    opened = true; // wait for the server's challenge; send nothing until it has proven itself
+  };
+
+  const onAuthenticated = async () => {
     if (ws !== socket) return; // superseded by a newer connect() before we opened; don't touch globals
     reconnectDelay = 1_000;
     setStatus("connected");
@@ -194,7 +253,18 @@ async function connectNow() {
     }, PING_INTERVAL_MS);
   };
 
-  socket.onmessage = async (event) => {
+  socket.onmessage = (event) => {
+    if (!authed) {
+      // Handshake frames - and anything that races in right behind auth-ok - go through one ordered
+      // chain. Nothing reaches dispatch until the server has proven it holds the token.
+      preAuth = preAuth.then(() => (authed ? onCommand(event) : handshakeStep(event)));
+      return;
+    }
+    void onCommand(event);
+  };
+
+  const onCommand = async (event: MessageEvent) => {
+    if (ws !== socket) return; // never act on frames from a socket that isn't the authenticated live one
     let msg: any;
     try {
       msg = JSON.parse(event.data);
@@ -235,6 +305,13 @@ async function connectNow() {
   };
 
   socket.onclose = (ev) => {
+    clearTimeout(authTimer);
+    if (pendingWs === socket) {
+      // Closed before mutual authentication completed. Nothing was sent to this peer but our proof.
+      pendingWs = null;
+      void onPreAuthClose(ev);
+      return;
+    }
     if (ws !== socket) return; // a superseded/replaced socket closing must not disturb the live one
     if (pingTimer) {
       clearInterval(pingTimer);
@@ -259,6 +336,46 @@ async function connectNow() {
 
   socket.onerror = () => {
     // onclose fires next; nothing to do here (and a superseded socket must never touch globals)
+  };
+
+  const holdOff = () => {
+    // Don't hammer a peer that failed (or failed us) authentication; the keepalive alarm must not
+    // undercut the hold. A token/port change or an explicit reconnect clears it.
+    replacedUntil = Date.now() + AUTH_FAILED_RETRY_MS - 1_000;
+    reconnectDelay = AUTH_FAILED_RETRY_MS;
+  };
+
+  const onPreAuthClose = async (ev: CloseEvent) => {
+    if (ws || pendingWs) return; // a newer connect() already took over
+    if (authError) {
+      setStatus(
+        "auth-failed",
+        `Server failed authentication (${authError}). Whatever answered on 127.0.0.1:${port} could not prove it ` +
+          `knows the token, so nothing was sent to it. Check the bridge server is running, is the same version as ` +
+          `this extension (v${VERSION}), and that no other program holds the port. Retrying in ${AUTH_FAILED_RETRY_MS / 1000}s.`
+      );
+      holdOff();
+    } else if (ev.code === WS_AUTH_FAILED_CLOSE_CODE) {
+      setStatus(
+        "token-rejected",
+        `The server rejected this extension's token. Paste the current token from ~/.browser-bridge/token into ` +
+          `the options. Retrying in ${AUTH_FAILED_RETRY_MS / 1000}s.`
+      );
+      holdOff();
+    } else if (!opened && (await healthAnswers(Number(port)))) {
+      // /health answers but the WebSocket upgrade was refused without a challenge: a pre-v2 server that
+      // still requires ?token=. We will not send the token in the clear, so the versions must match.
+      setStatus(
+        "version-skew",
+        `A bridge server is running on port ${port} but refused the connection - it is probably older than this ` +
+          `extension (v${VERSION}) and doesn't support the token challenge-response. Update/rebuild the server ` +
+          `(cd server && npm run build) and restart it; extension and server versions must match.`
+      );
+      holdOff();
+    } else {
+      setStatus("disconnected", "Will retry automatically.");
+    }
+    scheduleReconnect();
   };
 }
 
@@ -5717,6 +5834,7 @@ chrome.downloads.onDeterminingFilename.addListener((_item, suggest) => {
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && (changes.token || changes.port)) {
     ws?.close();
+    pendingWs?.close();
     reconnectDelay = 1_000;
     replacedUntil = 0;
     connect();
@@ -5725,6 +5843,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.cmd === "reconnect") {
     ws?.close();
+    pendingWs?.close();
     reconnectDelay = 1_000;
     replacedUntil = 0;
     connect();
