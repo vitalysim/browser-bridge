@@ -494,6 +494,8 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       "cursor:pointer clickables, and visually-hidden checkboxes/radios via their label - including iframes and " +
       "open shadow DOM. RECOMMENDED DEFAULT for finding something to act on. Each element: {ref, tag, role, name, " +
       "type, value, checked/selected/expanded/disabled, inViewport, frameId (child frames)}; empty fields omitted. " +
+      "A NAMELESS element (icon-only button, sidebar item) gets `hint` instead: its tooltip/title, data-testid=..., " +
+      "data-key=..., id=..., or icon:<name> (e.g. icon:play) - use it to pick or build a selector. " +
       "Ordered by priority: open dialogs/popovers first, then in-viewport, then the rest. Result has count/total/" +
       "truncated (+hint) - when truncated, pass a higher limit, filter, or viewportOnly. When a modal is open, " +
       "elements behind it are marked behindModal:true (modalOnly:true drops them). Refs work with click/fill/hover/" +
@@ -503,7 +505,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       tabId: tabIdParam,
       deep: z.boolean().optional().describe("Pierce closed shadow roots via chrome.debugger (shows banner)"),
       limit: z.number().int().min(1).max(2000).optional().describe("Max elements/refs across all frames (default 400, max 2000)"),
-      filter: z.string().optional().describe("Only elements whose tag/role/type/name/value/href contains this text (case-insensitive)"),
+      filter: z.string().optional().describe("Only elements whose tag/role/type/name/hint/value/href contains this text (case-insensitive)"),
       viewportOnly: z.boolean().optional().describe("Only elements currently in the viewport"),
       modalOnly: z.boolean().optional().describe("When a modal dialog is open, list only elements inside it"),
     },
@@ -1007,7 +1009,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
 
   tool(
     "debugger_status",
-    "Report debugger sessions: whether a tab is attached/capturing, buffered request count, idle time. " +
+    "Report debugger sessions: whether a tab is attached/capturing, buffered request count, idle time, live emulate_* overrides (emulating). " +
       "Omit tabId to list all sessions.",
     { tabId: z.number().optional().describe("Tab id; omit to list all sessions") },
     async ({ tabId }) => textResult(await hub.call("debugger_status", { tabId })),
@@ -1058,6 +1060,8 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
     "replay_request",
     "Re-issue a request from the tab's live session (an in-session Repeater). Give a requestId (from " +
       "net_get_requests) or an ad-hoc {url,method,headers,body}; optional overrides {url,method,headers,body}. " +
+      "A captured request is replayed with ALL its headers fetch() can set (Authorization, CSRF, x-*, Accept...; " +
+      "not Cookie/Host/Origin/sec-*/hop-by-hop); an override header set to \"\" removes it. " +
       "Set identity to send as a captured identity or 'anon' (strips cookies/bearer) - this uses the CDP Fetch " +
       "path to override forbidden headers like Cookie. Returns {status,headers,body}. Shows the banner when identity/forbidden headers are used.",
     {
@@ -1587,7 +1591,20 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       tabId: tabIdParam,
     },
     async (args) => {
-      const r = await hub.call("session_record_stop", { tabId: args.tabId }, 30_000);
+      // The events file is the server's: if the extension can't stop the recorder (socket still down
+      // after a drop, or its SW lost the recording), still assemble what reached disk rather than
+      // stranding the recording.
+      let r: any;
+      let stopError: string | undefined;
+      try {
+        r = await hub.call("session_record_stop", { tabId: args.tabId }, 30_000);
+      } catch (e) {
+        const known = hub.recordingTabs();
+        const fallback = args.tabId != null ? (hub.getRecordingPath(args.tabId) ? args.tabId : undefined) : known.length === 1 ? known[0] : undefined;
+        if (fallback == null) throw e;
+        stopError = e instanceof Error ? e.message : String(e);
+        r = { tabId: fallback };
+      }
       const tabId = r?.tabId;
       // The recorder's final batch is streamed separately and can arrive AFTER this ack; its sink
       // writes are async. Wait (bounded) for the streamed `done` and drain the sink to disk BEFORE
@@ -1635,6 +1652,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         inlinedBytes: report?.bytesInlined ?? 0,
         skipped: report?.skipped ?? [],
         eventsPath,
+        ...(stopError ? { note: `the extension could not stop the recorder (${stopError}); assembled the events already on disk` } : {}),
       });
     }
   );

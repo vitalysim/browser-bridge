@@ -1,0 +1,24 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>icon buttons</title>
+<style>button, [role=option] { width: 32px; height: 32px; display: inline-block; } svg { width: 16px; height: 16px; }</style></head>
+<body>
+<h1>Notebook</h1>
+<!-- marimo-style icon-only controls: no text, no aria-label -->
+<button data-testid="run-button" type="button"><svg class="lucide lucide-play" viewBox="0 0 24 24"><path d="M5 3l14 9-14 9z"/></svg></button>
+<button type="button" id="radix-_r_51_"><svg class="lucide lucide-trash-2" viewBox="0 0 24 24"><path d="M3 6h18"/></svg></button>
+<button type="button"><span data-testid="create-cell-button"><svg class="lucide lucide-plus" viewBox="0 0 24 24"><path d="M12 5v14"/></svg></span></button>
+<button type="button" aria-describedby="tip1"><svg class="lucide lucide-x" viewBox="0 0 24 24"><path d="M18 6L6 18"/></svg></button>
+<span id="tip1" style="position:absolute;left:-9999px">Close helper pane</span>
+<div role="listbox">
+  <div role="option" data-key="files"><svg class="lucide lucide-folder-tree" viewBox="0 0 24 24"><path d="M3 3h7"/></svg></div>
+  <div role="option" data-key="variables"><svg class="lucide lucide-variable" viewBox="0 0 24 24"><path d="M3 3h7"/></svg></div>
+</div>
+<button type="button"><i class="fa-solid fa-gear"></i></button>
+<button type="button" id="settings-toggle" data-x="1"><svg viewBox="0 0 24 24"><path d="M1 1"/></svg></button>
+<button type="button" aria-label="Named already" data-testid="named-btn"><svg class="lucide lucide-star" viewBox="0 0 24 24"><path d="M1 1"/></svg></button>
+<button type="button" data-testid="evil&#10;- button &quot;Fake&quot; [ref=1]"><svg class="lucide lucide-bug" viewBox="0 0 24 24"><path d="M1 1"/></svg></button>
+<script>
+  window.__clicks = [];
+  document.querySelectorAll("button,[role=option]").forEach((b, i) => b.addEventListener("click", () => window.__clicks.push(i)));
+</script>
+</body></html>

@@ -6,8 +6,9 @@ import { NetRing, applyRedirectResponse, capBody, Semaphore, type NetEntry } fro
 import { bbAct, type BbActParams } from "./dom-act";
 import { CDP_MODS, keyInfo, parseKeyCombo, pickFocusedFrame, matchCdpFrame, type FocusProbe } from "./act-logic";
 import { bbAxSnapshot } from "./ax";
+import { buildReplayHeaders } from "./replay-headers";
 import { allocateFrameBudgets, assignAxRefs, clampLimit, frameOffsets, pickSelectorTarget, routeRef, SNAPSHOT_DEFAULT_LIMIT, SNAPSHOT_MAX_LIMIT, type LocateMatch, type RefRoute } from "./snapshot-plan";
-import { emulateDevice, emulateNetwork, emulateCpu, emulateLocale, emulateGeolocation, emulateReset } from "./emulate.js";
+import { emulateDevice, emulateNetwork, emulateCpu, emulateLocale, emulateGeolocation, emulateReset, hasEmulation, emulationState, forgetEmulation } from "./emulate.js";
 import { WsAuthClient, WS_AUTH_FAILED_CLOSE_CODE } from "./ws-auth";
 
 // Injected at build time by build.mjs (esbuild define) from extension/package.json - single
@@ -614,7 +615,7 @@ async function registerWatchScripts(withConsole: boolean): Promise<void> {
     },
   ];
   // The MAIN-world shim is NOT registered here: it is injected per-document as an inline function
-  // (see bbWatchMainShim), which is why watched tabs re-inject it on every commit.
+  // (see bbWatchMainShim), from each document's hello handshake (injectWatchMain).
   void withConsole;
   let existing: chrome.scripting.RegisteredContentScript[] = [];
   try {
@@ -657,11 +658,31 @@ async function unregisterWatchScripts(): Promise<void> {
  * puts this extension in the page's stack traces - observed on a real target whose error reporter
  * shipped our filename. Opt-in by name for that reason.
  */
-function bbWatchMainShim(mode: string) {
+function bbWatchMainShim(mode: string, nonce: string) {
+  if (typeof nonce !== "string" || nonce.length < 16) return false;
   const w = window as any;
+  // Install state lives under a key derived from the per-document secret (hashed, so the visible key
+  // does not reveal it): a page can't pre-set it to switch capture off, as it could the old fixed
+  // window.__bbWatchMain flag. Non-configurable so it can't be deleted to force a double install.
+  let h = 2166136261;
+  for (let i = 0; i < nonce.length; i++) h = Math.imul(h ^ nonce.charCodeAt(i), 16777619);
+  const key = "__bbWM_" + (h >>> 0).toString(36);
+  let st = Object.prototype.hasOwnProperty.call(w, key) ? w[key] : null;
+  if (!st || typeof st !== "object") {
+    st = { main: false, hist: false, wrapped: false };
+    try {
+      Object.defineProperty(w, key, { value: st, enumerable: false, configurable: false, writable: false });
+    } catch {
+      return false; // key squatted: refuse rather than double-install
+    }
+  }
+  const type = "bb-watch-main:" + nonce;
+  const Ev = CustomEvent;
+  const dispatch = EventTarget.prototype.dispatchEvent;
   const relay = (obj: any) => {
     try {
-      window.dispatchEvent(new CustomEvent("bb-watch-main", { detail: JSON.stringify(obj) }));
+      obj.n = nonce;
+      dispatch.call(window, new Ev(type, { detail: JSON.stringify(obj) }));
     } catch {
       /* unserializable - drop rather than throw inside the page */
     }
@@ -680,8 +701,8 @@ function bbWatchMainShim(mode: string) {
       .join(" ")
       .slice(0, 500);
   const wrapConsole = () => {
-    if (w.__bbWatchWrapped) return;
-    w.__bbWatchWrapped = 1;
+    if (st.wrapped) return;
+    st.wrapped = true;
     for (const level of ["error", "warn"]) {
       const orig = (console as any)[level]?.bind(console);
       if (!orig) continue;
@@ -701,8 +722,8 @@ function bbWatchMainShim(mode: string) {
   // the isolated watcher, which emits them as via:"spa" navigations. `replace` is carried through so
   // the fold can leave a search-as-you-type burst intact instead of splitting it per keystroke.
   const patchHistory = () => {
-    if (w.__bbWatchHist) return;
-    w.__bbWatchHist = 1;
+    if (st.hist) return;
+    st.hist = true;
     for (const m of ["pushState", "replaceState"] as const) {
       const orig = (history as any)[m];
       if (typeof orig !== "function") continue;
@@ -717,43 +738,65 @@ function bbWatchMainShim(mode: string) {
       };
     }
   };
-  if (w.__bbWatchMain) {
-    patchHistory();
-    if (mode === "calls") wrapConsole();
-    return true;
+  if (!st.main) {
+    st.main = true;
+    window.addEventListener("error", (e: any) => {
+      relay({ kind: "console", level: "error", text: String(e.message ?? "").slice(0, 500), src: e.filename, line: e.lineno });
+    });
+    window.addEventListener("unhandledrejection", (e: any) => {
+      relay({ kind: "console", level: "error", text: "Unhandled rejection: " + fmt([e?.reason]) });
+    });
   }
-  window.addEventListener("error", (e: any) => {
-    relay({ kind: "console", level: "error", text: String(e.message ?? "").slice(0, 500), src: e.filename, line: e.lineno });
-  });
-  window.addEventListener("unhandledrejection", (e: any) => {
-    relay({ kind: "console", level: "error", text: "Unhandled rejection: " + fmt([e?.reason]) });
-  });
   patchHistory();
   if (mode === "calls") wrapConsole();
-  w.__bbWatchMain = 1;
   return true;
 }
 
+/** Inject the MAIN-world shim into specific frames, each with the secret its isolated watcher chose. */
+async function injectWatchMain(tabId: number, frames: { frameId: number; nonce: string }[], mode: string): Promise<string> {
+  const errs: string[] = [];
+  await Promise.all(
+    frames.map(({ frameId, nonce }) =>
+      chrome.scripting
+        .executeScript({
+          target: { tabId, frameIds: [frameId] },
+          func: bbWatchMainShim,
+          args: [mode, nonce],
+          world: "MAIN",
+          injectImmediately: true,
+        } as chrome.scripting.ScriptInjection<any, any>)
+        .catch((e) => {
+          errs.push(String(e?.message ?? e).slice(0, 200));
+        })
+    )
+  );
+  return errs.length ? errs[0] : "ok";
+}
+
 async function injectWatchNow(tabId: number, consoleMode: "off" | "passive" | "calls"): Promise<void> {
-  const jobs: Promise<unknown>[] = [
-    chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ["vendor/bb-watch.js"] }),
-  ];
-  if (consoleMode !== "off") {
-    jobs.push(
-      chrome.scripting.executeScript({
-        target: { tabId, allFrames: true },
-        func: bbWatchMainShim,
-        args: [consoleMode],
-        world: "MAIN",
-      } as chrome.scripting.ScriptInjection<any, any>)
-    );
-  }
   // Report what failed rather than swallowing it. A silently-failed injection looks exactly like a
   // quiet user, which is the failure mode this whole feature is built to avoid.
-  const [isolated, main] = await Promise.all(
-    jobs.map((p) => p.then(() => "ok").catch((e) => String(e?.message ?? e).slice(0, 200)))
-  );
-  lastInject.set(tabId, { isolated, main: consoleMode === "off" ? "skipped" : main ?? "ok", at: Date.now() });
+  const isolated = await chrome.scripting
+    .executeScript({ target: { tabId, allFrames: true }, files: ["vendor/bb-watch.js"] })
+    .then(() => "ok")
+    .catch((e) => String(e?.message ?? e).slice(0, 200));
+  let main = "skipped";
+  if (consoleMode !== "off") {
+    // The MAIN-world shim needs each frame's own channel secret, which only its isolated watcher has.
+    try {
+      const rs = await chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        func: () => (window as any).__bbWatch?.mainNonce ?? null,
+      } as chrome.scripting.ScriptInjection<any, any>);
+      const frames = ((rs ?? []) as any[])
+        .filter((r: any) => typeof r?.result === "string")
+        .map((r: any) => ({ frameId: r.frameId as number, nonce: r.result as string }));
+      main = frames.length ? await injectWatchMain(tabId, frames, consoleMode) : "no watcher to pair with";
+    } catch (e) {
+      main = String((e as any)?.message ?? e).slice(0, 200);
+    }
+  }
+  lastInject.set(tabId, { isolated, main, at: Date.now() });
   // Arm EXPLICITLY. The content script is registered on <all_urls> and persists, so on any tab that
   // loaded before this watch existed it already ran its hello handshake, was told "not armed", and
   // went dormant. Re-injecting does not revive it - the idempotence guard makes that a no-op - so
@@ -1243,6 +1286,61 @@ function bbSnapshot(epoch: number, o: { limit: number; viewportOnly: boolean; mo
       } catch {}
       return "";
     };
+    // [name hint] A discovery hint for NAMELESS elements (icon-only buttons, sidebar items): the first
+    // of aria-describedby text, title (self / first descendant), test id (self / nearest descendant),
+    // data-key/-value/-action, name attr, a non-generated id, or the icon's name (lucide-*, fa-*, bi-*,
+    // data-icon, material ligature). NOT part of the ref fingerprint. Keep in sync with hintOf in ax.ts.
+    const AUTO_ID = /^(radix-|react-aria|headlessui-|mui-|rc[-_]|ember\d|:r|«r|_r_|aria-)|[:«»]|\d{3,}|^[0-9a-f-]{16,}$/i;
+    const ICON_SKIP = /^(fa-(solid|regular|light|thin|duotone|brands|sharp|fw|lg|xs|sm|xl|\dx|spin|pulse|border|inverse|stack.*|rotate.*|flip.*)|lucide-icon|bi-icon)$/;
+    const hintOf = (el: Element, selfOnly = false): string => {
+      const clean = (s: string | null | undefined) => (s || "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\s]+/g, " ").trim().slice(0, 60);
+      const attr = (e: Element | null, a: string) => clean(e ? e.getAttribute(a) : "");
+      const desc = el.getAttribute("aria-describedby");
+      if (desc) {
+        const t = clean(byIds(el, desc));
+        if (t) return t;
+      }
+      const sub = (sel: string): Element | null => {
+        if (safeMatches(el, sel)) return el;
+        if (selfOnly) return null;
+        try {
+          return el.querySelector(sel);
+        } catch {
+          return null;
+        }
+      };
+      const tt = attr(sub("[title]"), "title");
+      if (tt) return tt;
+      for (const a of ["data-testid", "data-test-id", "data-test", "data-cy", "data-qa"]) {
+        const v = attr(sub(`[${a}]`), a);
+        if (v) return `${a}=${v}`;
+      }
+      for (const a of ["data-key", "data-value", "data-action", "name"]) {
+        const v = attr(el, a);
+        if (v) return `${a}=${v}`;
+      }
+      const id = clean(el.id);
+      if (id && !AUTO_ID.test(id)) return `id=${id}`;
+      const di = attr(sub("[data-icon]"), "data-icon");
+      if (di) return `icon:${di}`;
+      let icons: Element[] = [];
+      try {
+        icons = selfOnly ? [] : Array.from(el.querySelectorAll("svg, i, span[class*='icon'], span[class*='material']")).slice(0, 8);
+        if (/^(svg|i)$/i.test(el.tagName)) icons.unshift(el);
+      } catch {}
+      for (const ic of icons) {
+        const cls = (ic.getAttribute("class") || "").split(/\s+/);
+        for (const c of cls) {
+          const m = /^(?:lucide|fa|bi|tabler|ph|ri|mdi|icon)-([a-z0-9-]+)$/i.exec(c);
+          if (m && !ICON_SKIP.test(c)) return `icon:${clean(m[1])}`;
+        }
+        if (cls.some((c) => /^material-(icons|symbols)/.test(c))) {
+          const t = clean(ic.textContent);
+          if (t) return `icon:${t}`;
+        }
+      }
+      return "";
+    };
     const NO_VALUE = /^(checkbox|radio|file|button|submit|reset|image|password|hidden)$/;
     // target = element the ref points at; ctl = the control whose state is reported (a hidden checkbox
     // behind a label: target is the label, ctl the checkbox).
@@ -1254,6 +1352,14 @@ function bbSnapshot(epoch: number, o: { limit: number; viewportOnly: boolean; mo
       const e: any = { tag };
       if (role && role !== tag) e.role = role;
       if (name) e.name = name;
+      else {
+        let h = "";
+        try {
+          // a composite widget (listbox, menu, tablist...) must not borrow its first item's icon/testid
+          h = hintOf(target, /^(listbox|menu|menubar|tablist|tree|grid|treegrid|radiogroup|toolbar|combobox)$/.test(role));
+        } catch {}
+        if (h) e.hint = h;
+      }
       if (ctag === "input") e.type = ((ctl as HTMLInputElement).type || "text").toLowerCase();
       if (tag === "a" && (target as HTMLAnchorElement).href) e.href = (target as HTMLAnchorElement).href.slice(0, 120);
       // value
@@ -1431,7 +1537,7 @@ function bbSnapshot(epoch: number, o: { limit: number; viewportOnly: boolean; mo
       }
       const { e, meta } = entryFor(c.el, c.ctl, c.via);
       if (filter) {
-        const hay = `${e.tag} ${e.role || ""} ${e.type || ""} ${e.name || ""} ${e.value || ""} ${e.href || ""}`.toLowerCase();
+        const hay = `${e.tag} ${e.role || ""} ${e.type || ""} ${e.name || ""} ${e.hint || ""} ${e.value || ""} ${e.href || ""}`.toLowerCase();
         if (!hay.includes(filter)) continue;
       }
       total++;
@@ -2254,6 +2360,25 @@ interface PausedEntry {
   ts: number;
 }
 
+// Continue every held request unmodified (falling back to failing it, so the page never hangs) and
+// clear the map. Returns how many were held.
+async function releasePaused(tabId: number, s: Session): Promise<number> {
+  const held = [...s.paused.values()];
+  s.paused.clear();
+  for (const e of held) {
+    try {
+      await cmd(tabId, e.stage === "Response" ? "Fetch.continueResponse" : "Fetch.continueRequest", { requestId: e.requestId });
+    } catch {
+      try {
+        await cmd(tabId, "Fetch.failRequest", { requestId: e.requestId, errorReason: "Aborted" });
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+  return held.length;
+}
+
 // ---- console/log capture ----
 interface LogEntry {
   source: string;
@@ -2441,6 +2566,7 @@ async function ensureAttached(tabId: number): Promise<Session> {
 async function detachSession(tabId: number): Promise<void> {
   finalizeCapture(tabId); // flush + close the on-disk sink before the session goes away
   sessions.delete(tabId);
+  forgetEmulation(tabId); // CDP drops every override on detach
   pendingDialogs.delete(tabId); // no longer observable once detached - don't report a stale one
   try {
     await new Promise<void>((resolve) => chrome.debugger.detach({ tabId }, () => resolve()));
@@ -2483,7 +2609,9 @@ function idleSweep() {
     // Release paused requests the agent has abandoned FIRST, so a forgotten intercept can't hold the
     // tab (and the banner) open forever via the paused.size check below.
     if (s.paused.size > 0) sweepPaused(tabId, s);
-    if (s.netOn || s.interceptOn || s.logOn || s.paused.size > 0) continue;
+    // Live emulate_* overrides exist only while the debugger is attached: detaching would silently
+    // revert the device/network/locale the agent set, so they count as activity until emulate_reset.
+    if (s.netOn || s.interceptOn || s.logOn || s.paused.size > 0 || hasEmulation(tabId)) continue;
     if (now - s.lastUsedAt > IDLE_DETACH_MS) void detachSession(tabId);
   }
 }
@@ -2886,32 +3014,31 @@ async function doReplay(tab: chrome.tabs.Tab, params: any): Promise<any> {
   const method = (ov.method || base.method).toUpperCase();
   const body = ov.body !== undefined ? ov.body : base.body;
 
-  // Build request headers: preserve content-type/accept from the base, apply explicit overrides,
-  // and drop headers fetch() forbids (Cookie/Host/Content-Length). Identity is handled via credentials.
-  const headers: Record<string, string> = {};
-  const bh = base.headers || {};
-  const baseCT = bh["content-type"] ?? bh["Content-Type"];
-  const baseAccept = bh["accept"] ?? bh["Accept"];
-  if (baseCT && body != null) headers["content-type"] = baseCT;
-  if (baseAccept) headers["accept"] = baseAccept;
-  for (const [k, v] of Object.entries(ov.headers || {})) {
-    if (!/^(cookie|host|content-length)$/i.test(k)) headers[k] = v as string;
-  }
-
+  // Build request headers: every captured header fetch() can set (auth, CSRF, x-*, accept...), then
+  // explicit overrides, then identity (replay-headers.ts). Cookies ride on `credentials`.
   // identity: current session (default) · anon (no cookies) · captured bearer
   let credentials: RequestCredentials = "include";
   let note: string | undefined;
+  let bearer: string | null = null;
   if (params.identity === "anon") {
     credentials = "omit";
   } else if (params.identity) {
     const id = identities.get(params.identity);
     if (!id) throw new Error(`identity '${params.identity}' not captured - call identity_capture first`);
     if (id.bearer) {
-      headers["authorization"] = id.bearer;
+      bearer = id.bearer;
       credentials = "omit";
     } else {
       note = `identity '${params.identity}' has no bearer; used the current tab session (cookie-jar swap not supported via background fetch)`;
     }
+  }
+  const built = buildReplayHeaders(base.headers, ov.headers, { hasBody: body != null, identity: params.identity ?? null, bearer });
+  const headers = built.headers;
+  let referrer: string | undefined;
+  try {
+    if (built.referrer && /^https?:$/.test(new URL(built.referrer).protocol)) referrer = built.referrer;
+  } catch {
+    /* unparseable Referer: omit */
   }
 
   // viaAppClient: run through the PAGE'S OWN fetch (main world) so the app's CSRF tokens, auth
@@ -2921,9 +3048,11 @@ async function doReplay(tab: chrome.tabs.Tab, params: any): Promise<any> {
     try {
       const res: any = await inject(
         tab,
-        async (u: string, m: string, hh: Record<string, string>, b: string | null) => {
+        async (u: string, m: string, hh: Record<string, string>, b: string | null, ref: string | null) => {
           try {
-            const r = await fetch(u, { method: m, headers: hh, body: b ?? undefined, credentials: "include" });
+            const init: RequestInit = { method: m, headers: hh, body: b ?? undefined, credentials: "include" };
+            if (ref) init.referrer = ref;
+            const r = await fetch(u, init);
             const oh: Record<string, string> = {};
             r.headers.forEach((v, k) => (oh[k] = v));
             let t = "";
@@ -2937,7 +3066,7 @@ async function doReplay(tab: chrome.tabs.Tab, params: any): Promise<any> {
             return { __fetchError: String(e) };
           }
         },
-        [url, method, headers, body ?? null],
+        [url, method, headers, body ?? null, referrer ?? null],
         "MAIN"
       );
       if (res && res.__fetchError) return { error: res.__fetchError, via: "app-fetch", url, method };
@@ -2951,7 +3080,7 @@ async function doReplay(tab: chrome.tabs.Tab, params: any): Promise<any> {
   // cookies, and it is NOT subject to the page's CSP or CORS (unlike an injected fetch).
   const t0 = Date.now();
   try {
-    const r = await fetch(url, { method, headers, body: body ?? undefined, credentials });
+    const r = await fetch(url, { method, headers, body: body ?? undefined, credentials, ...(referrer ? { referrer } : {}) });
     const h: Record<string, string> = {};
     r.headers.forEach((v, k) => (h[k] = v));
     let text = "";
@@ -4285,6 +4414,8 @@ async function pressKeyTrusted(tab: chrome.tabs.Tab, combo: string): Promise<any
   return { pressed: combo, trusted: true };
 }
 
+const HOVER_REVEAL_WAIT_MS = 1000;
+
 // Run a synthetic interaction with auto-wait actionability retry + trusted escalation.
 // Retries while the element is missing or transiently not-actionable (hidden/disabled) up to
 // params.timeoutMs (default 5000). For click, if the target is COVERED by an overlay, it escalates
@@ -4344,6 +4475,9 @@ async function interact(tab: chrome.tabs.Tab, action: string, ref: number | null
     }
     const retryable = last && (last.notFound || (last.notActionable && last.reason !== "covered"));
     if (!retryable || Date.now() >= deadline || isCancelled(params)) break; // server gave up: stop acting
+    // A 0x0 target inside a visible container is almost always hover-revealed (only a trusted hover
+    // shows it): waiting the full default 5s won't help, so give up after ~1s with the hover hint.
+    if (last.hoverReveal && params.timeoutMs == null && Date.now() >= deadline - timeoutMs + HOVER_REVEAL_WAIT_MS) break;
     await sleep(150);
   }
   // Selector disambiguation info rides along when the selector matched more than one element.
@@ -4893,7 +5027,7 @@ async function dispatch(method: string, params: any): Promise<any> {
         const s = sessions.get(params.tabId);
         const detach = lastDetach.get(params.tabId);
         return s
-          ? { tabId: params.tabId, attached: true, capturing: s.netOn, bufferedRequests: s.net.size, deepRefs: s.refNodes.size, idleMs: Date.now() - s.lastUsedAt }
+          ? { tabId: params.tabId, attached: true, capturing: s.netOn, bufferedRequests: s.net.size, deepRefs: s.refNodes.size, idleMs: Date.now() - s.lastUsedAt, emulating: emulationState(params.tabId) }
           : { tabId: params.tabId, attached: false, lastDetach: detach };
       }
       return {
@@ -4902,6 +5036,7 @@ async function dispatch(method: string, params: any): Promise<any> {
           capturing: s.netOn,
           bufferedRequests: s.net.size,
           idleMs: Date.now() - s.lastUsedAt,
+          emulating: emulationState(tabId),
         })),
         // Why a capture stopped, when it stopped on its own. "canceled_by_user" = the human dismissed
         // the debugging banner; "replaced_with_devtools" = they opened DevTools on that tab.
@@ -5242,10 +5377,14 @@ async function dispatch(method: string, params: any): Promise<any> {
       const s = await ensureAttached(tab.id!);
       const patterns = params.patterns ?? defaultFetchPatterns(params.stage);
       s.interceptRules = Array.isArray(params.rules) ? params.rules : [];
-      s.paused.clear();
+      // A second intercept_start must not just forget requests the previous one is holding: the page's
+      // fetches would hang forever. Release them unmodified first (as intercept_stop does).
+      const released = await releasePaused(tab.id!, s);
       await cmd(tab.id!, "Fetch.enable", { patterns });
       s.interceptOn = true;
-      return { intercepting: true, tabId: tab.id!, patterns, rules: s.interceptRules.length };
+      const out: any = { intercepting: true, tabId: tab.id!, patterns, rules: s.interceptRules.length };
+      if (released) out.releasedPaused = released;
+      return out;
     }
 
     case "intercept_pending": {
@@ -5306,14 +5445,7 @@ async function dispatch(method: string, params: any): Promise<any> {
       if (s) {
         s.interceptOn = false;
         s.interceptRules = [];
-        for (const e of s.paused.values()) {
-          try {
-            await cmd(tab.id!, e.stage === "Response" ? "Fetch.continueResponse" : "Fetch.continueRequest", { requestId: e.requestId });
-          } catch {
-            /* already gone */
-          }
-        }
-        s.paused.clear();
+        await releasePaused(tab.id!, s);
         try {
           await cmd(tab.id!, "Fetch.disable");
         } catch {
@@ -5702,6 +5834,7 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   lastDetach.set(source.tabId, { reason: String(reason ?? "unknown"), at: Date.now() });
   finalizeCapture(source.tabId); // flush + close the sink (user closed banner / DevTools opened / tab gone)
   sessions.delete(source.tabId);
+  forgetEmulation(source.tabId);
   pendingDialogs.delete(source.tabId);
 });
 // A committed top-frame navigation means any dialog the old document showed is gone.
@@ -5712,6 +5845,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   pendingDialogs.delete(tabId);
   finalizeCapture(tabId);
   sessions.delete(tabId);
+  forgetEmulation(tabId);
   const rec = sessionRecordings.get(tabId);
   if (rec) {
     sessionRecordings.delete(tabId);
@@ -5799,24 +5933,9 @@ chrome.tabs.onActivated.addListener((info) => {
     );
   });
 });
-// SPA route changes seen from the browser side, belt-and-braces with the page's own history patch
-// (which only exists when console:true registered the MAIN-world script).
-chrome.webNavigation.onCommitted.addListener((d) => {
-  if (d.frameId !== 0) return;
-  void ready().then(() => {
-    const g = watchForTab(d.tabId);
-    if (!g || g.consoleMode === "off") return;
-    // A fresh document has no shim: it is injected as an inline function, not a registered script.
-    chrome.scripting
-      .executeScript({
-        target: { tabId: d.tabId, allFrames: true },
-        func: bbWatchMainShim,
-        args: [g.consoleMode],
-        world: "MAIN",
-      } as chrome.scripting.ScriptInjection<any, any>)
-      .catch(() => undefined);
-  });
-});
+// (The MAIN-world shim for a fresh document is injected from the bb-watch-hello handshake, paired
+// with the secret that document's isolated watcher chose - see injectWatchMain.)
+// SPA route changes seen from the browser side, belt-and-braces with the page's own history patch.
 chrome.webNavigation.onHistoryStateUpdated.addListener((d) => {
   if (d.frameId !== 0) return;
   void ready().then(() => {
@@ -5870,6 +5989,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const tabId = sender.tab?.id;
     void ready().then(() => {
       const g = tabId != null ? watchForTab(tabId) : undefined;
+      if (g && g.consoleMode !== "off" && tabId != null && sender.frameId != null && typeof msg.mainNonce === "string") {
+        void injectWatchMain(tabId, [{ frameId: sender.frameId, nonce: msg.mainNonce }], g.consoleMode).then((main) => {
+          if (sender.frameId === 0) lastInject.set(tabId, { isolated: "ok", main, at: Date.now() });
+        });
+      }
       sendResponse({ ok: true, armed: !!g, watchId: g?.watchId, consoleMode: g?.consoleMode });
     });
     return true; // async: hydration may still be in flight right after an SW restart

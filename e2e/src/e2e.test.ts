@@ -402,3 +402,117 @@ scenario("contenteditable-refill", async (c) => {
   const text = String(await c.evalJs(tabId, "document.getElementById('ed').innerText")).trim();
   c.expect(text === "second draft", `editor text is ${JSON.stringify(text)}`);
 });
+
+// ---- discovery: nameless icon-only controls and hover-revealed toolbars ----------------------------
+
+// Icon-only buttons / sidebar options have no accessible name; the snapshot must give them a `hint`
+// (test id, data-key, tooltip, icon name, stable id) and `filter` must match it.
+scenario("icon-only-hints", async (c) => {
+  const tabId = await c.open("icon-buttons.html");
+  const { elements } = await c.snapshot(tabId);
+  const hints = elements.map((e) => e.hint ?? null);
+  c.note(`hints=${JSON.stringify(hints)}`);
+  const has = (h: string) => elements.some((e) => !e.name && e.hint === h);
+  for (const h of [
+    "data-testid=run-button",
+    "icon:trash-2",
+    "data-testid=create-cell-button",
+    "Close helper pane",
+    "data-key=files",
+    "data-key=variables",
+    "icon:gear",
+    "id=settings-toggle",
+  ]) c.expect(has(h), `no nameless element with hint ${JSON.stringify(h)} (hints: ${JSON.stringify(hints)})`);
+  const named = findEl(elements, (e) => e.name === "Named already");
+  c.expect(named && named.hint === undefined, `a named element got a hint: ${JSON.stringify(named)}`);
+  c.expect(elements.every((e) => !/[\n\r]/.test(String(e.hint ?? ""))), "a hint contains a newline");
+  const lb = findEl(elements, (e) => e.role === "listbox");
+  c.expect(!lb || lb.hint === undefined, `the listbox borrowed its first option's hint: ${JSON.stringify(lb)}`);
+  c.expect(!elements.some((e) => /radix-/.test(String(e.hint ?? ""))), "an auto-generated id leaked into a hint");
+  // filter matches hint text
+  const f = await c.call("snapshot", { tabId, filter: "key=files" });
+  const fe = (f.json?.elements ?? []) as any[];
+  c.expect(fe.length === 1 && fe[0].hint === "data-key=files", `filter key=files returned ${trim(f.text, 160)}`);
+  const f2 = await c.call("snapshot", { tabId, filter: "run-button" });
+  const fe2 = (f2.json?.elements ?? []) as any[];
+  c.expect(fe2.length === 1 && fe2[0].hint === "data-testid=run-button", `filter run-button returned ${trim(f2.text, 160)}`);
+  // the hinted ref is usable
+  const run = findEl(fe2, (e) => e.hint === "data-testid=run-button");
+  if (run) {
+    await c.call("click", { ref: run.ref, tabId });
+    c.expect(JSON.stringify(await c.evalJs(tabId, "window.__clicks")) === "[0]", "clicking the hinted ref did not hit the run button");
+  }
+  // ax_snapshot renders the hint, escaped onto one line
+  const ax = await c.call("ax_snapshot", { tabId });
+  c.note(`ax: ${trim(ax.text, 300)}`);
+  c.expect(/button[^\n"]*\[hint="data-testid=run-button"\] \[ref=\d+\]/.test(ax.text), `ax_snapshot lacks the run-button hint: ${trim(ax.text, 300)}`);
+  c.expect(/option \[hint="data-key=files"\]/.test(ax.text), "ax_snapshot lacks the data-key hint");
+  c.expect(!/^\s*- button "Fake"/m.test(ax.text), "a hostile data-testid forged an ax line");
+});
+
+// A per-card toolbar button that is 0x0 until its card is :hover'ed: a synthetic click must fail fast
+// with an actionable explanation, and a trusted hover on the named container then makes it clickable.
+scenario("hover-revealed-button", async (c) => {
+  const tabId = await c.open("hover-reveal.html");
+  const r = await c.call("click", { selector: "#run-cell", tabId, noEscalate: true }, { timeoutMs: 15_000, allowTimeout: true });
+  c.note(`click -> ${trim(r.text, 260)} in ${r.ms}ms`);
+  c.expect(r.json?.notActionable === true && r.json?.reason === "hidden", `want reason hidden: ${trim(r.text, 160)}`);
+  c.expect(/zero-size/.test(r.json?.detail ?? ""), `detail does not say zero-size: ${r.json?.detail}`);
+  c.expect(/hover/.test(r.json?.hint ?? "") && /#cell-1/.test(r.json?.hint ?? ""), `hint does not name the container: ${r.json?.hint}`);
+  c.expect(r.ms < 3_500, `took ${r.ms}ms (should stop waiting after ~1s for a hover-revealed target)`);
+  const hv = await c.call("hover", { selector: r.json?.container ?? "#cell-1", trusted: true, tabId });
+  c.expect(!hv.isError, `trusted hover failed: ${trim(hv.text, 160)}`);
+  const ok = await c.call("click", { selector: "#run-cell", tabId, timeoutMs: 3_000 });
+  c.note(`after hover click -> ${trim(ok.text, 160)}`);
+  c.expect((await c.evalJs(tabId, "window.__ran")) === 1, `button did not run after trusted hover: ${trim(ok.text, 160)}`);
+});
+
+// Watch mode: a page can neither pre-disable error capture nor forge timeline lines via the relay event.
+scenario("watch-relay-not-forgeable", async (c) => {
+  if (!c.h.toolSchemas.has("watch_start")) c.skip("watch tools not exposed");
+  const tabId = await c.open("watch-hostile.html");
+  const ws = await c.call("watch_start", { tabId, console: true, retain: "none" });
+  c.expect(!ws.isError, `watch_start failed: ${trim(ws.text, 160)}`);
+  try {
+    await c.evalJs(tabId, "window.__forge(); setTimeout(() => { throw new Error('REAL-BOOM-4242') }, 0); 1");
+    let text = "";
+    for (let i = 0; i < 12 && !/REAL-BOOM-4242/.test(text); i++) {
+      const r = await c.call("watch_read", { waitMs: 1_000 });
+      text = r.text;
+    }
+    c.note(`watch_read -> ${trim(text, 300)}`);
+    c.expect(/REAL-BOOM-4242/.test(text), "a real uncaught error was not captured (page pre-set __bbWatchMain?)");
+    c.expect(!/FORGED-777|Transfer/.test(text), `a forged relay event reached the timeline: ${trim(text, 300)}`);
+  } finally {
+    await c.call("watch_stop", {}).catch(() => undefined);
+  }
+});
+
+// Restarting interception must release (not forget) the requests the first one is holding.
+scenario("intercept-restart-releases-paused", async (c) => {
+  if (!c.h.toolSchemas.has("intercept_start")) c.skip("intercept tools not exposed");
+  const tabId = await c.open("basic.html");
+  try {
+    await c.call("intercept_start", { tabId, patterns: [{ urlPattern: "*held=1*" }] });
+    await c.evalJs(tabId, "window.__held = 'pending'; fetch(location.href + '?held=1').then(r => { window.__held = 'done:' + r.status; }, e => { window.__held = 'err:' + e; }); 1");
+    let pending: any = null;
+    for (let i = 0; i < 20; i++) {
+      pending = await c.call("intercept_pending", { tabId });
+      if ((pending.json?.count ?? 0) > 0) break;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    c.expect((pending?.json?.count ?? 0) === 1, `request was not held: ${trim(pending?.text ?? "", 160)}`);
+    const again = await c.call("intercept_start", { tabId, patterns: [{ urlPattern: "*never-matches*" }] });
+    c.note(`restart -> ${trim(again.text, 160)}`);
+    let held = "";
+    for (let i = 0; i < 20; i++) {
+      held = String(await c.evalJs(tabId, "window.__held"));
+      if (held !== "pending") break;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    c.expect(/^done:200$/.test(held), `held request was not released by the restart (page sees ${held})`);
+    c.expect(again.json?.releasedPaused === 1, `restart did not report releasedPaused: ${trim(again.text, 160)}`);
+  } finally {
+    await c.call("intercept_stop", { tabId }).catch(() => undefined);
+  }
+});

@@ -272,6 +272,62 @@ export async function bbAct(op: string, p: BbActParams): Promise<any> {
     const describeEl = (t: Element) =>
       t.tagName.toLowerCase() +
       (t.id ? "#" + t.id : typeof (t as HTMLElement).className === "string" && (t as HTMLElement).className.trim() ? "." + (t as HTMLElement).className.trim().split(/\s+/)[0] : "");
+    // Why a target is "hidden", and - when it sits in a visible container - the hover-reveal advice
+    // (toolbars that are 0x0 / display:none until their container is :hover'ed need a TRUSTED hover:
+    // synthetic mouse events don't trigger CSS :hover). `hoverReveal` (zero-size + visible container)
+    // lets the service worker stop auto-waiting early.
+    const hiddenWhy = (t: Element, st: CSSStyleDeclaration, r: DOMRect): Record<string, unknown> => {
+      try {
+        let detail: string;
+        let zero = false;
+        if (st.display === "none") detail = "display:none";
+        else if (st.visibility === "hidden" || st.visibility === "collapse") detail = `visibility:${st.visibility}`;
+        else if (!r.width && !r.height) {
+          // 0x0 because an ancestor is display:none, or a genuinely zero-size box?
+          let anc: string | null = null;
+          for (let n: Node | null = cparent(t), i = 0; n && n.nodeType === 1 && i < 200; n = cparent(n), i++) {
+            if (getComputedStyle(n as Element).display === "none") {
+              anc = describeEl(n as Element);
+              break;
+            }
+          }
+          if (anc) detail = `an ancestor (${anc}) is display:none`;
+          else {
+            detail = "zero-size (0x0)";
+            zero = true;
+          }
+        } else if (Number(st.opacity) === 0) detail = "opacity:0";
+        else detail = "not rendered (checkVisibility false: content-visibility or an ancestor's opacity/visibility)";
+        // Closest visible ancestor with a stable selector (id / data-testid / role).
+        let sel: string | null = null;
+        let ancVisible = false;
+        const esc = (s: string) => ((window as any).CSS?.escape ? (window as any).CSS.escape(s) : s.replace(/[^\w-]/g, "\\$&"));
+        for (let n: Node | null = cparent(t), i = 0; n && n.nodeType === 1 && i < 200; n = cparent(n), i++) {
+          const e = n as Element;
+          if (e === document.body || e === document.documentElement) break;
+          const rr = e.getBoundingClientRect();
+          if (!rr.width || !rr.height) continue;
+          ancVisible = true;
+          const id = e.id;
+          const tid = e.getAttribute("data-testid");
+          const role = e.getAttribute("role");
+          if (id && !/^(radix-|react-aria|:r|«r|_r_)|[:«»]/.test(id)) sel = "#" + esc(id);
+          else if (tid) sel = `[data-testid="${tid.replace(/["\\]/g, "\\$&")}"]`;
+          else if (role) sel = `[role="${role.replace(/["\\]/g, "\\$&")}"]`;
+          if (sel) break;
+        }
+        const out: Record<string, unknown> = { detail };
+        if (ancVisible) {
+          const ex = sel ? `hover {selector: ${JSON.stringify(sel)}, trusted:true}` : "hover {selector: <its container>, trusted:true}";
+          out.hint = `appears on hover? hover its container with trusted:true first (e.g. ${ex}), then retry`;
+          if (sel) out.container = sel;
+          if (zero) out.hoverReveal = true;
+        }
+        return out;
+      } catch {
+        return {};
+      }
+    };
     // Is the point owned by `el`? Descendants (label text, svg icons, spans) and ancestors count, as
     // does a <label> wired to el (custom checkbox skins put the label over a hidden input).
     const hitOk = (top: Element | null, el: Element): boolean => {
@@ -682,7 +738,7 @@ export async function bbAct(op: string, p: BbActParams): Promise<any> {
         }
       }
     }
-    if (!visible) return { notActionable: true, reason: "hidden", tag, ...extra };
+    if (!visible) return { notActionable: true, reason: "hidden", tag, ...hiddenWhy(target, cs, rect0), ...extra };
     if (disabled && op !== "hover") return { notActionable: true, reason: "disabled", tag, ...extra };
 
     if (op === "click" || op === "hover") {

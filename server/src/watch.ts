@@ -1381,6 +1381,21 @@ export const watchRegistry = new WatchRegistry();
 // Rendering
 // ---------------------------------------------------------------------------
 
+// Every page-controlled string rendered into a timeline line goes through these. A watched page
+// controls ids, names, labels, titles, URLs, console text/level/src: a raw newline (or U+2028, or a
+// bidi override) in any of them would let it forge whole timeline lines - "#12 click <button> \"Pay\"
+// [agent]" - in the text an agent reads as ground truth. Control/separator/bidi characters become
+// \uXXXX escapes (visible, not silently dropped); q() also escapes quotes for quoted fields.
+const UNSAFE_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
+export function safeField(v: unknown, max = 200): string {
+  let s = v == null ? "" : String(v);
+  if (s.length > max) s = s.slice(0, max - 1) + "…";
+  return s.replace(UNSAFE_CHARS, (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+}
+const q = (v: unknown, max = 200) => safeField(v, max).replace(/\\(?!u[0-9a-f]{4})/g, "\\\\").replace(/"/g, '\\"');
+// JSON.stringify escapes C0 controls but NOT U+2028/U+2029 or bidi controls.
+const js = (v: unknown) => safeField(JSON.stringify(v ?? ""), 100_000);
+
 function hhmmss(ts: number): string {
   const d = new Date(ts);
   const p = (n: number, w = 2) => String(n).padStart(w, "0");
@@ -1397,17 +1412,17 @@ function shortUrl(u: string, max = 72): string {
   } catch {
     /* not absolute - print as-is */
   }
-  return s.length > max ? s.slice(0, max - 1) + "…" : s;
+  return safeField(s, max);
 }
 
 function elStr(el: ElementRef | undefined): string {
   if (!el) return "";
-  let s = `<${el.tag}`;
-  if (el.id) s += `#${el.id}`;
-  else if (el.name) s += `[name=${el.name}]`;
-  else if (el.type) s += `[${el.type}]`;
+  let s = `<${safeField(el.tag, 40)}`;
+  if (el.id) s += `#${safeField(el.id, 80)}`;
+  else if (el.name) s += `[name=${safeField(el.name, 80)}]`;
+  else if (el.type) s += `[${safeField(el.type, 40)}]`;
   s += ">";
-  if (el.label) s += ` "${el.label.length > 48 ? el.label.slice(0, 47) + "…" : el.label}"`;
+  if (el.label) s += ` "${q(el.label, 48)}"`;
   return s;
 }
 
@@ -1420,51 +1435,52 @@ export interface RenderOpts {
  *  and reads far worse as a narrative. */
 export function renderActions(actions: Action[], opts: RenderOpts): string {
   const lines: string[] = [];
-  if (opts.header) lines.push(opts.header);
+  if (opts.header) lines.push(safeField(opts.header, 2000));
   for (const a of actions) {
-    const prefix = opts.multiTab ? `[t${a.tabId}] ` : "";
+    const prefix = opts.multiTab ? `[t${Number(a.tabId)}] ` : "";
     let body: string;
     switch (a.kind) {
       case "nav":
-        body = `nav      ${shortUrl(a.url)}${a.via !== "load" ? `  (${a.via})` : ""}${a.title ? `  "${a.title}"` : ""}`;
+        body = `nav      ${shortUrl(a.url)}${a.via !== "load" ? `  (${safeField(a.via, 20)})` : ""}${a.title ? `  "${q(a.title, 120)}"` : ""}`;
         break;
       case "click":
-        body = `click    ${elStr(a.target)}${a.button !== "left" ? `  (${a.button})` : ""}`;
+        body = `click    ${elStr(a.target)}${a.button !== "left" ? `  (${safeField(a.button, 20)})` : ""}`;
         break;
       case "input":
-        body = `input    ${elStr(a.target)} = ${JSON.stringify(a.value)}   (${a.chars} keys / ${(a.ms / 1000).toFixed(1)}s)`;
+        body = `input    ${elStr(a.target)} = ${js(a.value)}   (${Number(a.chars)} keys / ${(Number(a.ms) / 1000).toFixed(1)}s)`;
         break;
       case "submit":
-        body = `submit   ${elStr(a.target)}${a.fields?.length ? `  ${a.fields.map((f) => `${f.name}=${JSON.stringify(f.value)}`).join(" ")}` : ""}`;
+        body = `submit   ${elStr(a.target)}${a.fields?.length ? `  ${a.fields.map((f) => `${safeField(f.name, 80)}=${js(f.value)}`).join(" ")}` : ""}`;
         break;
       case "key":
-        body = `key      ${a.text}${a.repeat ? ` ×${a.repeat}` : ""}`;
+        body = `key      ${safeField(a.text, 60)}${a.repeat ? ` ×${Number(a.repeat)}` : ""}`;
         break;
       case "copy":
       case "paste":
-        body = `${a.kind.padEnd(8)} ${elStr(a.target)}${a.chars ? `  (${a.chars} chars)` : ""}`;
+        body = `${a.kind.padEnd(8)} ${elStr(a.target)}${a.chars ? `  (${Number(a.chars)} chars)` : ""}`;
         break;
       case "scroll":
-        body = `scroll   y=${a.y} (${a.dy > 0 ? "+" : ""}${a.dy})`;
+        body = `scroll   y=${Number(a.y)} (${a.dy > 0 ? "+" : ""}${Number(a.dy)})`;
         break;
       case "console":
-        body = `console  ${a.level} ${JSON.stringify(a.text)}${a.src ? `  ${shortUrl(a.src, 40)}:${a.line ?? 0}` : ""}`;
+        body = `console  ${safeField(a.level, 12)} ${js(a.text)}${a.src ? `  ${shortUrl(a.src, 40)}:${Number(a.line ?? 0)}` : ""}`;
         break;
       case "net":
-        body = `net      ${a.method} ${shortUrl(a.url)} → ${a.failed ? a.failed : a.status ?? "?"}${a.ms !== undefined ? ` (${a.ms}ms)` : ""}`;
+        body = `net      ${safeField(a.method, 12)} ${shortUrl(a.url)} → ${safeField(a.failed ? a.failed : a.status ?? "?", 60)}${a.ms !== undefined ? ` (${Number(a.ms)}ms)` : ""}`;
         break;
       case "tab":
-        body = `tab      ${a.event}${a.url ? `  ${shortUrl(a.url)}` : ""}`;
+        body = `tab      ${safeField(a.event, 20)}${a.url ? `  ${shortUrl(a.url)}` : ""}`;
         break;
       case "gap":
-        body = `gap      ${a.reason} (${(a.ms / 1000).toFixed(1)}s)${a.note ? `  ${a.note}` : ""}`;
+        body = `gap      ${safeField(a.reason, 40)} (${(Number(a.ms) / 1000).toFixed(1)}s)${a.note ? `  ${safeField(a.note, 200)}` : ""}`;
         break;
       default:
-        body = String((a as any).kind);
+        body = safeField((a as any).kind, 20);
     }
-    const cause = a.causedBy ? `   ← #${a.causedBy}` : "";
+    const cause = a.causedBy ? `   ← #${Number(a.causedBy)}` : "";
     const who = a.agent ? " [agent]" : "";
-    lines.push(`${prefix}${hhmmss(a.ts)}  #${a.seq} ${body}${cause}${who}`);
+    // Belt and braces: whatever a field above missed, one action is exactly one line.
+    lines.push(safeField(`${prefix}${hhmmss(a.ts)}  #${Number(a.seq)} ${body}${cause}${who}`, 100_000));
   }
   return lines.join("\n");
 }

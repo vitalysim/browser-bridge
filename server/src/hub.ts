@@ -19,9 +19,16 @@ export const WS_AUTH_FAILED_CLOSE_CODE = 4001;
 // ~1s, so failing instantly turned a routine respawn into a spurious tool error.
 export const RECONNECT_GRACE_MS = 3_000;
 
+// How long capture/session sinks stay open after the extension socket drops. The extension keeps
+// recording across SW restarts and replays its outbox on reconnect, so closing the sinks on close
+// (as before) truncated every recording at the first socket blip. Past this, the sinks are finalized.
+export const SINK_RECONNECT_GRACE_MS = 120_000;
+
 export interface HubOptions {
   /** Override RECONNECT_GRACE_MS (tests). */
   reconnectGraceMs?: number;
+  /** Override SINK_RECONNECT_GRACE_MS (tests). */
+  sinkReconnectGraceMs?: number;
 }
 
 // The `ws` default maxPayload is 100 MiB; a single reply over that closes the socket with 1009 and
@@ -87,9 +94,13 @@ export class ExtensionHub {
   private closedSessionSinks = new Map<number, CaptureSink>();
 
   private reconnectGraceMs: number;
+  private sinkReconnectGraceMs: number;
+  // Set while the socket is down and capture/session sinks are being held open for a reconnect.
+  private sinkGraceTimer: NodeJS.Timeout | null = null;
 
   constructor(httpServer: HttpServer, token: string, private version = "0.0.0", opts: HubOptions = {}) {
     this.reconnectGraceMs = opts.reconnectGraceMs ?? RECONNECT_GRACE_MS;
+    this.sinkReconnectGraceMs = opts.sinkReconnectGraceMs ?? SINK_RECONNECT_GRACE_MS;
     const wss = new WebSocketServer({ noServer: true, maxPayload: WS_MAX_PAYLOAD });
 
     httpServer.on("upgrade", (req, socket, head) => {
@@ -204,6 +215,7 @@ export class ExtensionHub {
         } else if (!skew) {
           this.lastSkewWarned = null;
         }
+        this.readoptSinks(msg);
         // The extension re-announces its live watch state on every connect, so a server restart or a
         // service-worker respawn is recoverable without the agent doing anything.
         for (const w of this.helloWatchers) {
@@ -259,20 +271,9 @@ export class ExtensionHub {
         this.ws = null;
         log("[hub] extension disconnected");
         this.notifyConn(false);
-        for (const sink of this.captureSinks.values()) sink.close();
-        this.captureSinks.clear();
-        // Hand still-open session sinks to closedSessionSinks (as onCapture does on `done`) BEFORE
-        // clearing, so a session_record_stop racing this close still awaits their drain instead of
-        // reading a half-flushed events file. close() only chains the fd-close; drain() awaits it.
-        for (const [tabId, sink] of this.sessionSinks) {
-          sink.close();
-          this.closedSessionSinks.set(tabId, sink);
-        }
-        this.sessionSinks.clear();
-        // Wake any session_record_stop waiting on a streamed `done` that will now never come, so it
-        // falls through to drain whatever was buffered instead of blocking out its full timeout.
-        for (const w of this.sessionDoneWaiters.values()) w();
-        this.sessionDoneWaiters.clear();
+        // Hold capture/session sinks open for a reconnect instead of finalizing them now: the
+        // extension keeps recording across the gap and replays its outbox when it reconnects.
+        this.holdSinksForReconnect();
       }
     });
     ws.on("error", (err) => log(`[hub] ws error: ${err.message}`));
@@ -364,7 +365,8 @@ export class ExtensionHub {
   }
   // {tabId, path, written} for each active session recording (for session_record_status).
   sessionSinkList(): { tabId: number; path: string; written: number }[] {
-    return [...this.sessionSinks.entries()].map(([tabId, s]) => ({ tabId, path: s.path, written: s.written }));
+    const held = this.sinksHeld;
+    return [...this.sessionSinks.entries()].map(([tabId, s]) => ({ tabId, path: s.path, written: s.written, ...(held ? { awaitingReconnect: true } : {}) }));
   }
   // Events-file path bookkeeping for a recording, on the hub so start/stop work across MCP sessions.
   setRecordingPath(tabId: number, path: string): void {
@@ -372,6 +374,10 @@ export class ExtensionHub {
   }
   getRecordingPath(tabId: number): string | undefined {
     return this.recordingPaths.get(tabId);
+  }
+  /** Tabs with a recording the server knows the events file of (active, or stopped but unassembled). */
+  recordingTabs(): number[] {
+    return [...this.recordingPaths.keys()];
   }
   deleteRecordingPath(tabId: number): boolean {
     return this.recordingPaths.delete(tabId);
@@ -386,6 +392,67 @@ export class ExtensionHub {
       ...(this.recordSink ? [this.recordSink.drain()] : []),
     ];
     await Promise.all(pending);
+  }
+
+  // ---- sink lifecycle across an extension reconnect ----
+
+  /** Socket dropped: keep every open sink for the grace period, then finalize whatever is left. */
+  private holdSinksForReconnect(): void {
+    if (this.sinkGraceTimer || (!this.captureSinks.size && !this.sessionSinks.size)) return;
+    log(`[hub] holding ${this.captureSinks.size} capture / ${this.sessionSinks.size} session sink(s) open for ${Math.round(this.sinkReconnectGraceMs / 1000)}s awaiting reconnect`);
+    this.sinkGraceTimer = setTimeout(() => {
+      this.sinkGraceTimer = null;
+      if (this.connected) return; // reconnected without a hello: keep them
+      log("[hub] extension did not reconnect within the sink grace period; finalizing sinks");
+      for (const tabId of [...this.captureSinks.keys()]) this.finalizeCaptureSink(tabId);
+      for (const tabId of [...this.sessionSinks.keys()]) this.finalizeSessionSink(tabId);
+    }, this.sinkReconnectGraceMs);
+    this.sinkGraceTimer.unref?.();
+  }
+
+  /**
+   * The extension (re)announced itself: re-adopt the held sinks. A hello that lists its live
+   * recordings / captures (`recordings` / `captures`: tab ids) re-adopts exactly those and finalizes
+   * the rest; one that doesn't (older extension) re-adopts them all, as they were before the drop.
+   */
+  private readoptSinks(hello: any): void {
+    if (!this.sinkGraceTimer) return;
+    clearTimeout(this.sinkGraceTimer);
+    this.sinkGraceTimer = null;
+    const ids = (v: unknown) => (Array.isArray(v) ? new Set(v.map(Number)) : null);
+    const rec = ids(hello?.recordings);
+    const cap = ids(hello?.captures);
+    if (rec) for (const tabId of [...this.sessionSinks.keys()]) if (!rec.has(tabId)) this.finalizeSessionSink(tabId);
+    if (cap) for (const tabId of [...this.captureSinks.keys()]) if (!cap.has(tabId)) this.finalizeCaptureSink(tabId);
+    log(`[hub] re-adopted ${this.captureSinks.size} capture / ${this.sessionSinks.size} session sink(s) after reconnect`);
+  }
+
+  private finalizeCaptureSink(tabId: number): void {
+    const sink = this.captureSinks.get(tabId);
+    if (!sink) return;
+    sink.close();
+    this.captureSinks.delete(tabId);
+  }
+
+  // Hand the sink to closedSessionSinks (as onCapture does on `done`) so a session_record_stop still
+  // awaits its drain instead of reading a half-flushed events file, and wake a stop waiting on a
+  // streamed `done` that will now never come.
+  private finalizeSessionSink(tabId: number): void {
+    const sink = this.sessionSinks.get(tabId);
+    if (!sink) return;
+    sink.close();
+    this.sessionSinks.delete(tabId);
+    this.closedSessionSinks.set(tabId, sink);
+    const w = this.sessionDoneWaiters.get(tabId);
+    if (w) {
+      this.sessionDoneWaiters.delete(tabId);
+      w();
+    }
+  }
+
+  /** True while the socket is down and sinks are being held open for a reconnect. */
+  get sinksHeld(): boolean {
+    return this.sinkGraceTimer !== null;
   }
 
   // Route a streamed {type:"capture", stream?, tabId, entries, done} message to the right sink.
