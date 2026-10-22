@@ -1,0 +1,9 @@
+<!doctype html><html><head><title>Recording navigation</title></head><body>
+<h1>Recording navigation fixture</h1><p id="out">idle</p>
+<button id="next">Next</button><input id="text">
+<script>
+document.getElementById('next').onclick = () => {
+  document.getElementById('out').textContent = 'FINAL-NAV-MUTATION-741';
+  setTimeout(() => location.href = 'record-page2.html', 20);
+};
+</script></body></html>

@@ -17,7 +17,7 @@ npm test             # builds server + extension, then runs every scenario
 npm run test:nobuild # same, using the existing server/dist + extension/background.js
 ```
 
-Prerequisites: Node 18+, and Playwright's Chromium build **1248** in `~/Library/Caches/ms-playwright`
+Prerequisites: Node 20+, and Playwright's Chromium build **1248** in `~/Library/Caches/ms-playwright`
 (`npx playwright-core install chromium` if it's missing). `npm test` runs `npm ci` in `server/` and
 `extension/` if their `node_modules` are missing, then `npm run build` in both.
 

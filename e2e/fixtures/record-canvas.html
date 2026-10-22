@@ -1,0 +1,25 @@
+<!doctype html><html><head><title>Recording pixels</title>
+<style>
+body{margin:0;background:#eee;font:20px sans-serif}h1{position:absolute;left:20px;top:0;font-size:24px}
+canvas{position:absolute;width:200px;height:120px;top:60px}#two{left:20px}#gl{left:240px}
+iframe{position:absolute;left:20px;top:220px;width:100px;height:60px;border:0}
+#shadow{position:absolute;left:160px;top:220px}#text{position:absolute;left:20px;top:320px}
+</style></head><body><h1>Canvas recording</h1>
+<canvas id="two" width="200" height="120"></canvas><canvas id="gl" width="200" height="120"></canvas>
+<iframe srcdoc="<!doctype html><body style='margin:0'><canvas width='100' height='60'></canvas><script>const c=document.querySelector('canvas').getContext('2d');c.fillStyle='#ffff00';c.fillRect(0,0,100,60);</script>"></iframe>
+<div id="shadow"></div><input id="text">
+<script>
+const second = new URLSearchParams(location.search).has('second');
+window.phase = second ? 1 : 0;
+const c = document.getElementById('two').getContext('2d');
+const gl = document.getElementById('gl').getContext('webgl');
+const root=document.getElementById('shadow').attachShadow({mode:'open'});
+root.innerHTML='<canvas width="100" height="60" style="width:100px;height:60px"></canvas>';
+const shadow=root.querySelector('canvas').getContext('2d');shadow.fillStyle='#00ffff';shadow.fillRect(0,0,100,60);
+function draw(){
+  c.fillStyle=window.phase?'#00ff00':'#ff0000';c.fillRect(0,0,200,120);
+  if(gl){gl.clearColor(window.phase?1:0,window.phase?1:0,window.phase?0:1,1);gl.clear(gl.COLOR_BUFFER_BIT);}
+  requestAnimationFrame(draw);
+}
+draw();
+</script></body></html>

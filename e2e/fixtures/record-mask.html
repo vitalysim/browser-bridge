@@ -1,0 +1,6 @@
+<!doctype html><html><head><title>Recording masking</title></head><body>
+<input id="plain"><input id="password" type="password"><textarea id="area"></textarea>
+<div id="editor" contenteditable="true"></div><div id="host"></div>
+<style>#editor{width:300px;min-height:40px;border:1px solid #999}input,textarea{display:block;margin:12px}</style>
+<script>document.getElementById('host').attachShadow({mode:'open'}).innerHTML='<input id="shadow-password" type="password">';</script>
+</body></html>

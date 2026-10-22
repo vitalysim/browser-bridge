@@ -248,7 +248,11 @@ async function connectNow() {
         // The sinks the server held open across the drop are re-adopted only for what is still live
         // here; the rest are finalized. After a worker respawn the debugger sessions (and so every
         // persisted net capture) are gone, while session recordings are restored from storage.session.
-        recordings: [...sessionRecordings.keys()],
+        // A stopped recorder can still have a final batch in the outbox. Keep its server sink
+        // alive until pumpOutbox delivers that batch and its done marker.
+        recordings: [...new Set([...sessionRecordings.keys(), ...outbox.flatMap((e) => {
+          try { const m = JSON.parse(e.json); return m.stream === "session" ? [m.tabId] : []; } catch { return []; }
+        })])],
         captures: [...sessions.entries()].filter(([, s]) => s.netOn && s.persist).map(([tabId]) => tabId),
       })
     );
@@ -410,6 +414,17 @@ const OUTBOX_MAX_BYTES = 4 * 1024 * 1024;
 let outbox: { json: string; bytes: number }[] = [];
 let outboxBytes = 0;
 let outboxDropped = 0;
+const RECORDING_OUTBOX_KEY = "bb.recordingOutbox.v1";
+let recordingOutboxWrites: Promise<void> = Promise.resolve();
+function persistRecordingOutbox(): Promise<void> {
+  const rows = outbox.filter((e) => {
+    try { return JSON.parse(e.json).stream === "session"; } catch { return false; }
+  });
+  // Serialize snapshots so an older write cannot overwrite a later empty/drained outbox.
+  const write = recordingOutboxWrites.catch(() => {}).then(() => chrome.storage.session.set({ [RECORDING_OUTBOX_KEY]: rows }));
+  recordingOutboxWrites = write;
+  return write;
+}
 
 /**
  * Send now if the socket is up, otherwise hold in the outbox. Returns whether it reached the wire.
@@ -460,6 +475,7 @@ function pumpOutbox(): void {
     outbox.shift();
     outboxBytes -= o.bytes;
   }
+  void persistRecordingOutbox().catch(() => {});
 }
 
 // Send a dispatch reply on the socket it arrived on. When that socket is no longer OPEN the reply is
@@ -2957,6 +2973,9 @@ function finalizeCapture(tabId: number) {
 // via chrome.runtime.sendMessage({cmd:"bb-rec"}); we re-batch and stream them over the WS capture
 // channel with stream:"session" so they land in a distinct sink (not the net-capture sink).
 interface RecState {
+  recordingId: string;
+  seenBatches: Set<string>;
+  stopping?: boolean;
   queue: any[];
   timer: ReturnType<typeof setTimeout> | null;
   allFrames: boolean;
@@ -2978,6 +2997,8 @@ async function persistRecordings(): Promise<void> {
   try {
     const rows = [...sessionRecordings.entries()].map(([tabId, r]) => ({
       tabId,
+      recordingId: r.recordingId,
+      seenBatches: [...r.seenBatches],
       allFrames: r.allFrames,
       maskInputs: r.maskInputs,
       recordCanvas: r.recordCanvas,
@@ -2993,7 +3014,12 @@ async function persistRecordings(): Promise<void> {
 }
 async function restoreRecordings(): Promise<void> {
   try {
-    const got = await chrome.storage.session.get({ [RECORDINGS_KEY]: [] });
+    const got = await chrome.storage.session.get({ [RECORDINGS_KEY]: [], [RECORDING_OUTBOX_KEY]: [] });
+    for (const row of got[RECORDING_OUTBOX_KEY] ?? []) {
+      if (typeof row?.json !== "string" || row.json.length > OUTBOX_MAX_BYTES) continue;
+      outbox.push({ json: row.json, bytes: row.json.length });
+      outboxBytes += row.json.length;
+    }
     for (const row of (got[RECORDINGS_KEY] as any[]) ?? []) {
       if (row?.tabId == null || sessionRecordings.has(row.tabId)) continue;
       try {
@@ -3003,6 +3029,8 @@ async function restoreRecordings(): Promise<void> {
       }
       // Fresh queue/timer; the page recorder is still running and streams into this on the next batch.
       sessionRecordings.set(row.tabId, {
+        recordingId: row.recordingId ?? "legacy",
+        seenBatches: new Set(row.seenBatches ?? []),
         queue: [],
         timer: null,
         allFrames: !!row.allFrames,
@@ -3020,11 +3048,6 @@ async function restoreRecordings(): Promise<void> {
   }
 }
 
-function queueRecord(rec: RecState, tabId: number, events: any[]) {
-  for (const e of events) rec.queue.push({ kind: "rrweb", event: e });
-  if (rec.queue.length >= 50) return void flushRecord(rec, tabId);
-  if (!rec.timer) rec.timer = setTimeout(() => flushRecord(rec, tabId), 300);
-}
 function flushRecord(rec: RecState, tabId: number, done = false) {
   if (rec.timer) {
     clearTimeout(rec.timer);
@@ -3032,7 +3055,8 @@ function flushRecord(rec: RecState, tabId: number, done = false) {
   }
   const entries = rec.queue;
   rec.queue = [];
-  if (entries.length || done) shipOrQueue({ type: "capture", stream: "session", tabId, entries, done });
+  if (entries.length || done) shipOrQueue({ type: "capture", stream: "session", recordingId: rec.recordingId, tabId, entries, done });
+  void persistRecordingOutbox().catch(() => {});
 }
 // Inject + start the recorder in ONE frame, bounded by a timeout. A single allFrames:true
 // executeScript blocks on a wedged cross-origin child (ad/embed that never settles) and can hang the
@@ -3041,12 +3065,15 @@ function flushRecord(rec: RecState, tabId: number, done = false) {
 function injectFrame(tabId: number, frameId: number, rec: RecState, timeoutMs: number): Promise<boolean> {
   const run = (async () => {
     await chrome.scripting.executeScript({ target: { tabId, frameIds: [frameId] }, files: ["vendor/rrweb-record.js"] });
-    await chrome.scripting.executeScript({
+    // A timed-out injection can finish after stop. Never resurrect that recording.
+    if (sessionRecordings.get(tabId) !== rec || rec.stopping) return false;
+    const [result] = await chrome.scripting.executeScript({
       target: { tabId, frameIds: [frameId] },
       func: (opts: any) => (window as any).__bbRec?.start(opts),
       // executeScript rejects `undefined` in args ("Value is unserializable") - coalesce to null.
       args: [
         {
+          recordingId: rec.recordingId,
           allFrames: rec.allFrames,
           maskInputs: rec.maskInputs,
           recordCanvas: rec.recordCanvas,
@@ -3057,12 +3084,10 @@ function injectFrame(tabId: number, frameId: number, rec: RecState, timeoutMs: n
         },
       ],
     });
-    return true;
+    const value = result?.result;
+    return !!value?.started || (value?.reason === "already recording" && value.recordingId === rec.recordingId);
   })();
-  return Promise.race([
-    run.catch(() => false),
-    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs)),
-  ]);
+  return withTimeout(run, timeoutMs, "recorder injection").catch(() => false);
 }
 
 // (Re)inject + start the recorder in a tab's frames. Called on start and on navigation-complete.
@@ -5735,11 +5760,20 @@ async function dispatch(method: string, params: any): Promise<any> {
       return fetchResources(params);
 
     // ---- session recording (rrweb → HTML replay); banner-free, scripting only ----
+    case "session_record_prepare": {
+      const tab = await targetTab(params.tabId);
+      assertScriptable(tab);
+      if (sessionRecordings.has(tab.id!)) throw new Error(`already recording tab ${tab.id}; stop it first`);
+      return { tabId: tab.id };
+    }
     case "session_record_start": {
       const tab = await targetTab(params.tabId);
       assertScriptable(tab);
       const tabId = tab.id!;
+      if (sessionRecordings.has(tabId)) throw new Error(`already recording tab ${tabId}; stop it first`);
       const rec: RecState = {
+        recordingId: params.recordingId || crypto.randomUUID(),
+        seenBatches: new Set(),
         queue: [],
         timer: null,
         allFrames: !!params.allFrames,
@@ -5765,7 +5799,7 @@ async function dispatch(method: string, params: any): Promise<any> {
         sessionRecordings.delete(tabId); // top-frame injection failed - don't strand a dead state
         throw new Error("could not inject the session recorder into the top frame");
       }
-      void persistRecordings(); // survive an SW eviction; the page recorder keeps posting bb-rec
+      await persistRecordings(); // the first post-respawn batch must find the original config
       return { recording: true, tabId, allFrames: rec.allFrames, url: tab.url };
     }
 
@@ -5773,23 +5807,32 @@ async function dispatch(method: string, params: any): Promise<any> {
       const tab = await targetTab(params.tabId);
       const tabId = tab.id!;
       const rec = sessionRecordings.get(tabId);
-      try {
-        await chrome.scripting.executeScript({
-          target: { tabId, allFrames: rec?.allFrames ?? false },
-          func: () => (window as any).__bbRec?.stop(),
-        });
-      } catch {
-        /* tab navigated/closed - the final flush below still ships buffered events */
+      if (rec) rec.stopping = true;
+      const warnings: string[] = [];
+      let ids = [0];
+      if (rec?.allFrames) {
+        try {
+          const frames = await withTimeout(chrome.webNavigation.getAllFrames({ tabId }), 500, "recorder frame list");
+          ids = [...new Set([0, ...(frames ?? []).map((f) => f.frameId)])];
+        } catch { warnings.push("could not enumerate child frames while stopping"); }
       }
-      // The recorder's final batch is relayed via sendMessage (a separate task) - let it reach
-      // onMessage/queueRecord before we flush the `done` marker, or the last events are lost.
-      await sleep(200);
+      await Promise.all(ids.map(async (frameId) => {
+        try {
+          const [reply] = await withTimeout(chrome.scripting.executeScript({
+            target: { tabId, frameIds: [frameId] },
+            func: (recordingId: string | null) => (window as any).__bbRec?.stop(recordingId),
+            args: [rec?.recordingId ?? null],
+          }), frameId === 0 ? 3000 : 1000, `stop recorder frame ${frameId}`);
+          if (reply?.result?.drained === false) warnings.push(`frame ${frameId}: final events were not acknowledged`);
+        } catch { warnings.push(`frame ${frameId}: stop timed out or frame unavailable`); }
+      }));
       if (rec) {
         flushRecord(rec, tabId, true);
+        await persistRecordingOutbox();
         sessionRecordings.delete(tabId);
-        void persistRecordings();
+        await persistRecordings();
       }
-      return { stopped: true, tabId, wasRecording: !!rec };
+      return { stopped: true, tabId, wasRecording: !!rec, ...(warnings.length ? { warnings } : {}) };
     }
 
     // Ground truth for session_record_status. The server can answer from its own sink bookkeeping,
@@ -6145,16 +6188,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // rrweb event batches relayed from an injected recorder → stream to the session sink.
   if (msg?.cmd === "bb-rec") {
     const tabId = sender.tab?.id;
-    if (tabId != null) {
-      // await hydration: a bb-rec message can be what WOKE the worker after an eviction, arriving
-      // before restoreRecordings() has repopulated the map. Without this the first post-respawn batch
-      // would find no rec and be dropped.
-      void ready().then(() => {
-        const rec = sessionRecordings.get(tabId);
-        if (rec) queueRecord(rec, tabId, msg.events || []);
-      });
-    }
-    return false;
+    void ready().then(async () => {
+      const rec = tabId != null ? sessionRecordings.get(tabId) : undefined;
+      if (!rec || (msg.recordingId && msg.recordingId !== rec.recordingId)) {
+        sendResponse({ accepted: false, armed: false });
+        return;
+      }
+      const key = typeof msg.documentId === "string" && Number.isSafeInteger(msg.seq) ? `${msg.documentId}:${msg.seq}` : null;
+      if (!key || !rec.seenBatches.has(key)) {
+        if (key) {
+          rec.seenBatches.add(key);
+          while (rec.seenBatches.size > 512) rec.seenBatches.delete(rec.seenBatches.values().next().value!);
+        }
+        shipOrQueue({ type: "capture", stream: "session", recordingId: rec.recordingId,
+          tabId, documentId: msg.documentId, seq: msg.seq,
+          entries: (msg.events || []).map((event: any) => ({ kind: "rrweb", event })) });
+        await persistRecordings();
+      }
+      // ACK means custody, including a durable session outbox when the socket is down.
+      await persistRecordingOutbox();
+      sendResponse({ accepted: true, armed: true });
+    }).catch(() => sendResponse({ accepted: false, armed: true }));
+    return true;
   }
 
   // ---- watch mode: the content script asking whether this tab is in scope ----
@@ -6206,7 +6261,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 chrome.tabs.onUpdated.addListener((tabId, info) => {
   if (info.status !== "complete") return;
   const rec = sessionRecordings.get(tabId);
-  if (!rec) return;
+  if (!rec || rec.stopping) return;
   void injectRecorder(tabId, rec).catch(() => {
     /* not scriptable / gone */
   });

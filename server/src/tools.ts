@@ -6,6 +6,7 @@ import { homedir, tmpdir } from "os";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
+import { randomUUID } from "crypto";
 import { CALL_TIMEOUT_MS, type ExtensionHub } from "./hub.js";
 import { CaptureSink } from "./capture-sink.js";
 import { inlineAssets } from "./rrweb-inline.js";
@@ -1565,16 +1566,27 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       eventsPath: z.string().optional().describe("Absolute path (or ~/…) for the raw events JSONL; default ~/.browser-bridge/recordings/session-<ts>.events.jsonl"),
     },
     async (args) => {
+      // Resolve/check before opening a file. Register the sink BEFORE injection can emit its base
+      // snapshot, and reserve on the shared hub so concurrent MCP clients cannot replace it.
+      const prepared = await hub.call("session_record_prepare", { tabId: args.tabId });
+      const tabId = prepared?.tabId;
+      if (typeof tabId !== "number") throw new Error("extension did not return the target tabId");
+      hub.reserveSessionStart(tabId);
+      const recordingId = randomUUID();
       const eventsPath = expandHome(
         args.eventsPath ||
-          join(homedir(), ".browser-bridge", "recordings", `session-${new Date().toISOString().replace(/[:.]/g, "-")}.events.jsonl`)
+          join(homedir(), ".browser-bridge", "recordings", `session-${new Date().toISOString().replace(/[:.]/g, "-")}-${recordingId.slice(0, 8)}.events.jsonl`)
       );
-      mkdirSync(dirname(eventsPath), { recursive: true });
-      if (hub.sessionSinkPathInUse(eventsPath)) throw new Error(`another recording is already writing ${eventsPath}`);
-      const sink = new CaptureSink(eventsPath); // opens now -> a bad path fails THIS call
+      let sink: CaptureSink | undefined;
       try {
+        mkdirSync(dirname(eventsPath), { recursive: true });
+        if (hub.sessionSinkPathInUse(eventsPath)) throw new Error(`another recording is already writing ${eventsPath}`);
+        sink = new CaptureSink(eventsPath);
+        hub.registerSessionSink(tabId, sink, recordingId);
+        hub.setRecordingPath(tabId, eventsPath);
         const r = await hub.call("session_record_start", {
-          tabId: args.tabId,
+          tabId,
+          recordingId,
           allFrames: !!args.allFrames,
           maskInputs: !!args.maskInputs,
           recordCanvas: !!args.recordCanvas,
@@ -1584,12 +1596,16 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
           canvasBudgetBytes: args.canvasBudgetMB != null ? Math.round(args.canvasBudgetMB * 1024 * 1024) : undefined,
         });
         if (r?.tabId == null) throw new Error("extension did not return the recorded tabId");
-        hub.registerSessionSink(r.tabId, sink);
-        hub.setRecordingPath(r.tabId, eventsPath);
         return textResult({ ...r, eventsPath });
       } catch (e) {
-        sink.close();
+        if (sink) {
+          hub.closeSessionSink(tabId);
+          await sink.drain();
+          hub.deleteRecordingPath(tabId);
+        }
         throw e;
+      } finally {
+        hub.releaseSessionStart(tabId);
       }
     }
   );
@@ -1632,10 +1648,13 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       // reading, or the tail of the recording is silently lost from the replay.
       await hub.settleSessionSink(tabId);
       const eventsPath = hub.getRecordingPath(tabId);
-      hub.deleteRecordingPath(tabId);
       if (!eventsPath) throw new Error("no recording was active for this tab");
       const events = await parseSessionEventsStream(eventsPath); // line-stream: a recording can be 100s of MB
-      if (!events.length) throw new Error(`recording had no events (${eventsPath}) - did you interact with the page?`);
+      const metaIndex = events.findIndex((e) => e.type === 4 && e.data?.width > 0 && e.data?.height > 0);
+      if (metaIndex < 0 || !events.slice(metaIndex + 1).some((e) => e.type === 2 && e.data?.node)) {
+        hub.deleteRecordingPath(tabId);
+        throw new Error(`recording has no usable Meta/full snapshot pair (${eventsPath}); raw events retained, no replay written`);
+      }
       // Inline external assets so the replay is self-contained/offline-faithful (fetched via the extension).
       const perAssetMaxBytes = Math.round((args.perAssetMB ?? 2) * 1024 * 1024);
       let report: { inlined: number; bytesInlined: number; skipped: any[] } | undefined;
@@ -1655,6 +1674,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       const savePath = expandHome(args.savePath || eventsPath.replace(/\.events\.jsonl$|\.jsonl$/, "") + ".html");
       mkdirSync(dirname(savePath), { recursive: true });
       const htmlBytes = await writeRrwebHtml(savePath, events, { title: args.title, autoplay: !!args.autoplay, skipInactive: !!args.skipInactive });
+      hub.deleteRecordingPath(tabId);
       let min = Infinity, max = 0;
       for (const e of events) {
         const t = e.timestamp || 0;
@@ -1673,6 +1693,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
         inlinedBytes: report?.bytesInlined ?? 0,
         skipped: report?.skipped ?? [],
         eventsPath,
+        ...(r?.warnings?.length ? { warnings: r.warnings } : {}),
         ...(stopError ? { note: `the extension could not stop the recorder (${stopError}); assembled the events already on disk` } : {}),
       });
     }
@@ -1691,7 +1712,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       "opens the replay in a tab, seeks the player frame-by-frame and captures each frame as a lossless PNG at `scale`x " +
       "(the page + green mouse-trail/click/keystroke overlay, no player bars), then ffmpeg -> H.264. Frame-exact, no " +
       "dropped frames. NOTE it drives a focused tab for the whole render (steals focus) and takes a while (~frames * ~0.4s). " +
-      "Returns {saved, frames, fps, scale, durationMs}.",
+      "Returns {saved, frames, fps, scale, width, height, durationMs}.",
     {
       htmlPath: z.string().describe("Absolute path (or ~/…) to a saved replay .html (must be v0.14+ with the export harness)"),
       out: z.string().optional().describe("Absolute path (or ~/…) for the .mp4; default = the .html path with .mp4"),
@@ -1699,7 +1720,7 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       scale: z.number().optional().describe("Resolution multiplier over the recorded viewport (default 2 = ~retina/4K; 1 = native)"),
       crf: z.number().optional().describe("H.264 quality, lower=better (default 16, ~visually lossless)"),
       settleMs: z.number().optional().describe("Wait after each seek before capture (default 40)"),
-      chrome: z.boolean().optional().describe("Include the FRACTURE player chrome (metabar + control bar) in the frame instead of just the page + overlay (default false)"),
+      chrome: z.boolean().optional().describe("Include the minimal unbranded playback controls instead of just the recorded page + interaction overlay (default false)"),
     },
     async (args) => {
       const htmlPath = expandHome(args.htmlPath);
@@ -1709,35 +1730,59 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
       const scale = Math.max(1, Math.min(4, args.scale ?? 2));
       const crf = Math.max(0, Math.min(51, Math.round(args.crf ?? 16)));
       const settleMs = Math.max(0, Math.round(args.settleMs ?? 40));
-      const withChrome = !!args.chrome; // include the FRACTURE metabar + control bar (the framed player look)
+      const withChrome = !!args.chrome;
       const frameDir = mkdtempSync(join(tmpdir(), "bb-frames-"));
-      const evalJs = (tabId: number, code: string) => hub.call("eval_js", { tabId, code }, 20_000);
-
-      const tab = await hub.call("tab_new", { url: "file://" + htmlPath }, 30_000);
-      const tabId = tab?.tabId;
-      if (tabId == null) throw new Error("could not open the replay tab");
+      const evalJs = async (tabId: number, code: string) => {
+        const r = await hub.call("eval_js", { tabId, code, awaitPromise: true }, 20_000);
+        if (r?.error) throw new Error(String(r.error));
+        return r;
+      };
+      let tabId: number | undefined;
+      let encodeDir: string | undefined;
       try {
-        // Wait for the export harness, then enter export framing; read total duration.
+        mkdirSync(dirname(out), { recursive: true });
+        encodeDir = mkdtempSync(join(dirname(out), ".bb-video-"));
+        const tab = await hub.call("tab_new", { url: "file://" + htmlPath, waitUntil: "domcontentloaded" }, 30_000);
+        tabId = tab?.tabId;
+        if (tabId == null) throw new Error("could not open the replay tab");
+        // Read dimensions BEFORE fitting the viewer. Older replays expose vw/vh too; their
+        // synchronous renderAt is awaited via the same Promise-compatible eval path.
         let total = 0;
+        let viewport: { vw: number; vh: number; version?: number; controlsHeight?: number } | undefined;
         for (let i = 0; i < 80; i++) {
           const r = await evalJs(
             tabId,
-            "(function(){ if(!window.__bbExport) return 'nope'; window.__bbExport.enterMode(" + (withChrome ? "true" : "false") + "); return String(window.__bbExport.total||0); })()"
+            "(function(){ var e=window.__bbExport; return e ? JSON.stringify({total:e.total,vw:e.vw,vh:e.vh,version:e.version,controlsHeight:e.controlsHeight}) : 'nope'; })()"
           );
           const v = r?.value;
-          if (v && v !== "nope") { total = parseFloat(v) || 0; break; }
+          if (v && v !== "nope") {
+            const meta = JSON.parse(v);
+            total = meta.total || 0;
+            viewport = meta;
+            break;
+          }
           await sleep(300);
         }
         if (!total) throw new Error("replay export harness not ready (regenerate the replay with v0.14+), or zero duration");
+        if (!viewport || !(viewport.vw > 0 && viewport.vh > 0)) throw new Error("replay has no recorded viewport dimensions");
+        const width = Math.round(viewport.vw);
+        const height = Math.round(viewport.vh) + (withChrome ? viewport.controlsHeight ?? 124 : 0);
+        if (width * scale > 16384 || height * scale > 16384) throw new Error("export dimensions exceed 16384px; lower scale");
+        await hub.call("emulate_device", { tabId, metrics: { width, height, deviceScaleFactor: 1, mobile: false }, touch: false });
+        // Resize listeners in older replay files debounce by 100ms.
+        await sleep(150);
+        await evalJs(tabId, `window.__bbExport.enterMode(${withChrome})`);
 
         // Wait for any captured canvas frames to finish decoding before the first seek, so an exported
         // frame never screenshots a canvas that hasn't been painted yet (older replays lack this and
         // report ready immediately).
+        let ready = false;
         for (let i = 0; i < 100; i++) {
           const r = await evalJs(tabId, "String(!window.__bbExport.framesReady || window.__bbExport.framesReady())");
-          if (r?.value === "true") break;
+          if (r?.value === "true") { ready = true; break; }
           await sleep(100);
         }
+        if (!ready) throw new Error("captured canvas images did not finish decoding");
 
         const nframes = Math.max(1, Math.ceil((total / 1000) * fps));
         for (let f = 0; f < nframes; f++) {
@@ -1748,20 +1793,27 @@ export function registerTools(server: McpServer, hub: ExtensionHub, version = "0
           // we write the frame ourselves.
           const shot = await hub.call(
             "screenshot",
-            withChrome ? { tabId, scale, format: "png" } : { tabId, selector: ".rr-player__frame", scale, format: "png" },
+            { tabId, scale, format: "png" },
             60_000
           );
           if (!shot?.base64) throw new Error(`empty screenshot at frame ${f} (t=${t}ms)`);
           if (shot.format && shot.format !== "png")
             throw new Error(`frame ${f} came back as ${shot.format}, not png (frame too large at scale ${scale}) - lower scale`);
+          const dims = imageDims(Buffer.from(shot.base64, "base64"));
+          if (!dims || dims.width !== Math.round(width * scale) || dims.height !== Math.round(height * scale)) {
+            throw new Error(`export frame ${f} has unexpected dimensions ${dims?.width}x${dims?.height}; expected ${Math.round(width * scale)}x${Math.round(height * scale)}`);
+          }
           writeFileSync(join(frameDir, "f" + String(f).padStart(6, "0") + ".png"), Buffer.from(shot.base64, "base64"));
         }
 
-        await runFfmpeg(frameDir, fps, crf, out);
-        return textResult({ saved: out, frames: nframes, fps, scale, crf, durationMs: total });
+        const encoded = join(encodeDir, "video.mp4");
+        await runFfmpeg(frameDir, fps, crf, encoded);
+        renameSync(encoded, out); // publish only a complete video; failed renders preserve prior output
+        return textResult({ saved: out, frames: nframes, fps, scale, crf, width: Math.floor(Math.round(width * scale) / 2) * 2, height: Math.floor(Math.round(height * scale) / 2) * 2, durationMs: total });
       } finally {
-        await hub.call("tab_close", { tabIds: [tabId] }, 15_000).catch(() => {});
+        if (tabId != null) await hub.call("tab_close", { tabIds: [tabId] }, 15_000).catch(() => {});
         try { rmSync(frameDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+        if (encodeDir) try { rmSync(encodeDir, { recursive: true, force: true }); } catch { /* best-effort */ }
       }
     }
   );
@@ -2557,7 +2609,7 @@ function runFfmpeg(dir: string, fps: number, crf: number, out: string): Promise<
 // the player box is sized to the recorded viewport's aspect scaled to fit the window, so there is no
 // internal letterbox - the only empty space is the dark page background around the replay. It rescales
 // on window/visualViewport resize and honors mid-session viewport changes via the Replayer 'resize'.
-async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: string; autoplay?: boolean; skipInactive?: boolean }): Promise<number> {
+export async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: string; autoplay?: boolean; skipInactive?: boolean }): Promise<number> {
   if (!PLAYER_JS) throw new Error("vendored rrweb-player not found in server/vendor/ - build/vendor it first");
   const title = htmlEsc(meta.title || "Session replay");
   // Escape '<' in the events JSON so a captured "</script>" can't close our inline <script> block.
@@ -2567,7 +2619,7 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
 <title>${title}</title>
 <style>${PLAYER_CSS}</style>
 <style>
-  /* ===== FRACTURE // DS-1 - replay chrome. Monochrome stage; chroma = live/severity, never decoration. ===== */
+  /* Minimal, unbranded replay controls. */
   :root{
     --ink:#000;--ink-2:#050506;--surface:#0a0a0b;--surface-2:#101012;--surface-3:#17171a;
     --white:#fff;--text:#ededee;--text-2:#a2a2a7;--text-3:#6c6c73;--text-4:#3b3b41;
@@ -2575,31 +2627,19 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
     --live:#4ade80;--live-line:rgba(74,222,128,.42);--live-bg:rgba(74,222,128,.10);
     --font-mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
     --font-disp:"Inter Tight","Helvetica Neue",Helvetica,Arial,sans-serif;
-    --bar-top:46px;--bar-bot:78px;
+    --bar-top:0px;--bar-bot:64px;
   }
   *{box-sizing:border-box}
   html,body{margin:0;height:100%;background:var(--ink);color:var(--text);font-family:var(--font-mono);overflow:hidden}
-  body::after{content:"";position:fixed;inset:0;z-index:1;pointer-events:none;background:radial-gradient(130% 92% at 50% 0%,transparent 0,transparent 44%,rgba(0,0,0,.72) 100%)}
-  /* stage: the replay is centered in the band between the top metabar and the bottom control bar.
+  /* stage: the replay is centered above the compact bottom control bar.
      Do NOT touch .rr-player__frame width or .replayer-wrapper transform - it breaks the computed scale. */
   #bb-player{position:relative;z-index:2;display:flex;align-items:center;justify-content:center;width:100vw;height:100vh;padding:var(--bar-top) 0 var(--bar-bot);overflow:hidden}
   #bb-player .rr-player{float:none;border-radius:2px;background:var(--ink);box-shadow:0 0 0 1px var(--line),0 40px 90px rgba(0,0,0,.62);margin-bottom:-80px}
   /* ^ .rr-player still reserves the HIDDEN 80px controller at its bottom (frame + 80); negate it via
      CSS (the player only ever sets inline width/height, never margin, so this persists) so the visible
-     FRAME - not the frame+controller box - is what centers in the band between the metabar and the bar. */
+     FRAME - not the frame+controller box - is what centers above the controls. */
   #bb-player .rr-player__frame{border-radius:2px}
   #bb-player .rr-controller{display:none!important} /* hidden: still mounts + emits ui-update time/state to our bar */
-
-  /* ---- top metabar ---- */
-  #bb-meta{position:fixed;top:0;left:0;right:0;z-index:30;height:var(--bar-top);display:flex;align-items:center;gap:18px;padding:0 22px;background:rgba(0,0,0,.72);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-bottom:1px solid var(--line);font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--text-3)}
-  #bb-meta .mark{color:var(--white);font-weight:700;letter-spacing:.26em}
-  #bb-meta .sep{color:var(--text-4)}
-  #bb-meta .ttl{font-family:var(--font-disp);font-weight:600;font-size:12px;letter-spacing:-.01em;text-transform:none;color:var(--text)}
-  #bb-meta .spacer{flex:1}
-  #bb-meta .stat b{color:var(--white);font-weight:600}
-  #bb-meta .live{display:inline-flex;align-items:center;gap:7px;color:var(--live)}
-  #bb-meta .live .d{width:5px;height:5px;border-radius:50%;background:var(--live);box-shadow:0 0 8px var(--live)}
-  @media(max-width:720px){#bb-meta .hide-sm{display:none}}
 
   /* ---- bottom control bar ---- */
   #bb-bar{position:fixed;left:0;right:0;bottom:0;z-index:30;height:var(--bar-bot);display:flex;align-items:center;gap:16px;padding:0 22px;background:rgba(5,5,6,.86);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-top:1px solid var(--line);font-family:var(--font-mono)}
@@ -2633,7 +2673,6 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
   .bb-key.mod{color:var(--live);border-color:var(--live-line);background:var(--live-bg)}
 </style>
 </head><body>
-<div id="bb-meta"><span class="mark">FRACTURE</span><span class="sep">//</span><span class="ttl">${title}</span><span class="spacer"></span><span class="stat hide-sm">EVENTS <b id="bb-ev">0</b></span><span class="stat hide-sm">DUR <b id="bb-dur">0:00</b></span><span class="live"><span class="d"></span>REPLAY</span></div>
 <div id="bb-player"></div>
 <div id="bb-bar">
   <button id="bb-play" class="bb-ic" title="Play / pause"></button>
@@ -2657,7 +2696,8 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
   // pixels, so the fit math is DPR-correct by construction - never multiply by devicePixelRatio.
   var m = events.find(function(e){ return e.type === 4; });
   var vw = (m && m.data && m.data.width) || 1024, vh = (m && m.data && m.data.height) || 576;
-  var CTRL = 46 + 78; // reserve the top metabar (46) + bottom control bar (78) so the replay fits between them
+  var recordedWidth=vw, recordedHeight=vh, exportChrome=false, exportMode=false;
+  var CTRL = 64; // compact bottom controls; no header or branding
   var player = new P({ target: document.getElementById('bb-player'),
     props: { events: events, showController: true, autoPlay: ${meta.autoplay ? "true" : "false"},
              skipInactive: ${meta.skipInactive ? "true" : "false"}, speedOption: [1,2,4,8],
@@ -2665,7 +2705,7 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
              mouseTail: false, /* disable rrweb's red, hard-cornered trail; we draw a smooth one below */
              maxScale: 0 /* uncap scaling so small/mobile recordings upscale to fill; relies on the vendored player's "a && push(a)" falsy-guard */ } });
   function fit(){
-    var s = Math.min(window.innerWidth / vw, (window.innerHeight - CTRL) / vh);
+    var s = Math.min(window.innerWidth / vw, (window.innerHeight - (exportMode ? (exportChrome ? CTRL : 0) : CTRL)) / vh);
     if (!(s > 0)) s = 0.1;
     try { player.$set({ width: Math.round(vw * s), height: Math.round(vh * s) }); } catch(e){}
     try { if (player.triggerResize) player.triggerResize(); } catch(e){}
@@ -2693,15 +2733,15 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
     var pts = [];                 // {x,y,t} recent mouse points for the smooth trail
     var LIFE = 700;               // trail fade window (ms)
     var wrap=null, trail=null, ctx=null, hud=null, mouseEl=null;
-    var exportMode=false;         // when true, the live rAF trail + event-cast overlay yield to __bbExport.renderAt
     var lastVal = {};             // per-input last value (typed-text fallback / paste detection)
     var hudTokens = [], hudTimer=null;
     // Canvas/WebGL frames the recorder streamed as CanvasMutation events. rrweb ignores them
-    // (UNSAFE_replayCanvas stays false); WE paint the latest frame at-or-before the play head onto the
-    // replayed <canvas> node, matched by rrweb id. Images are preloaded so export draws synchronously.
+    // (UNSAFE_replayCanvas stays false); an inert bitmap layer displays the latest captured frame
+    // on each replayed canvas, scoped by document and node id. Export waits for decoding and layout.
     var canvasFrames = {};        // id -> [{t, img}] sorted by relative time
     var canvasIds = [];           // Object.keys(canvasFrames) cached
-    var canvasPending = 0, canvasLoaded = 0, liveT = 0;
+    var canvasPending = 0, canvasLoaded = 0, canvasFailed = 0, liveT = 0;
+    var canvasSegments=[], canvasBackgrounds=new Map();
     var canvasBase = events.length ? (events[0].timestamp||0) : 0; // player time 0 = first event
 
     function ensure(){
@@ -2729,10 +2769,11 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
         var settle=setInterval(function(){ if(!exportMode) paintCanvasesAt(liveT); if(canvasLoaded>=canvasPending){ clearInterval(settle); } }, 200);
       }
     }
-    // Reconstruct each captured frame as a preloaded <img> (Blob object-URL) indexed per canvas id.
-    function b64ToBlob(b64, type){ var bin=atob(b64), n=bin.length, u8=new Uint8Array(n); for(var i=0;i<n;i++) u8[i]=bin.charCodeAt(i); return new Blob([u8],{type:type||'image/webp'}); }
+    // Data URLs also work inside sandboxed child documents and shadow-root CSS (no blob-origin dependency).
     function buildCanvasIndex(){
+      var segment='legacy-0', legacy=0;
       for(var i=0;i<events.length;i++){ var e=events[i];
+        if(e && e.type===4){ segment=e.bbDocumentId || ('legacy-'+(++legacy)); canvasSegments.push({t:(e.timestamp||0)-canvasBase,id:segment}); }
         if(!e || e.type!==3 || !e.data || e.data.source!==9 || typeof e.data.id!=='number') continue;
         var cmds=e.data.commands, img64=null, mime='';
         if(cmds) for(var j=0;j<cmds.length;j++){ var c=cmds[j];
@@ -2743,24 +2784,55 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
         }
         if(!img64) continue;
         var im=new Image(); canvasPending++;
-        im.onload=function(){ canvasLoaded++; }; im.onerror=function(){ canvasLoaded++; };
-        try{ im.src=URL.createObjectURL(b64ToBlob(img64,mime)); }catch(err){ canvasLoaded++; continue; }
-        var id=e.data.id; if(!canvasFrames[id]) canvasFrames[id]=[];
+        im.onload=function(){ canvasLoaded++; }; im.onerror=function(){ canvasLoaded++; canvasFailed++; };
+        try{ im.src='data:'+(mime||'image/webp')+';base64,'+img64; }catch(err){ canvasLoaded++; canvasFailed++; continue; }
+        var id=(e.bbDocumentId || segment)+'|'+e.data.id; if(!canvasFrames[id]) canvasFrames[id]=[];
         canvasFrames[id].push({t:(e.timestamp||0)-canvasBase, img:im});
       }
       for(var k in canvasFrames){ canvasFrames[k].sort(function(a,b){return a.t-b.t;}); }
       canvasIds=Object.keys(canvasFrames);
     }
-    // Draw the latest captured frame at-or-before t into each replayed canvas (matched by rrweb id).
+    // Sandboxed, script-disabled replay canvases can have readable pixels yet composite blank in
+    // Chromium. An inert CSS bitmap paints reliably without enabling scripts in recorded content.
     function paintCanvasesAt(t){
+      var props=['background-image','background-size','background-position','background-repeat','display','width','height'];
+      canvasBackgrounds.forEach(function(state,node){
+        for(var i=0;i<props.length;i++){ var p=props[i];
+          if(node.style.getPropertyValue(p)===state.applied[p]){
+            if(state.original[p]) node.style.setProperty(p,state.original[p].value,state.original[p].priority);
+            else node.style.removeProperty(p);
+          }
+        }
+      });
+      canvasBackgrounds.clear();
       if(!canvasIds.length || !replayer || !replayer.getMirror) return;
+      var segment=canvasSegments.length?canvasSegments[0].id:'legacy-0';
+      for(var i=0;i<canvasSegments.length;i++){ if(canvasSegments[i].t>t) break; segment=canvasSegments[i].id; }
       var mirror; try{ mirror=replayer.getMirror(); }catch(e){ return; }
-      for(var i=0;i<canvasIds.length;i++){ var id=canvasIds[i], list=canvasFrames[id], frame=null;
+      for(var i=0;i<canvasIds.length;i++){ var key=canvasIds[i], split=key.lastIndexOf('|');
+        if(key.slice(0,split)!==segment) continue;
+        var list=canvasFrames[key], frame=null;
         for(var j=0;j<list.length;j++){ if(list[j].t<=t) frame=list[j]; else break; }
-        if(!frame || !frame.img.complete || frame.img.naturalWidth===0) continue;
-        var node=mirror.getNode(parseInt(id,10));
+        if(frame && (!frame.img.complete || frame.img.naturalWidth===0)) continue;
+        var node=mirror.getNode(parseInt(key.slice(split+1),10));
         if(!node || node.nodeName!=='CANVAS') continue;
-        try{ var cx=node.getContext('2d'); if(!cx) continue; cx.clearRect(0,0,node.width,node.height); cx.drawImage(frame.img,0,0,node.width,node.height); }catch(e){}
+        try{
+          var win=node.ownerDocument.defaultView, css=win.getComputedStyle(node), original={}, applied={};
+          var display=css.display, savedDisplay=node.style.getPropertyValue('display'), savedPriority=node.style.getPropertyPriority('display');
+          // With scripts disabled Chromium lays canvas out as fallback content, losing its replaced
+          // element dimensions. Probe authored sizing as inline, then restore intrinsic dimensions
+          // where CSS says auto, and make default inline canvases paint as inline-blocks.
+          node.style.setProperty('display','inline','important');
+          var sizing=win.getComputedStyle(node), width=sizing.width, height=sizing.height;
+          if(savedDisplay) node.style.setProperty('display',savedDisplay,savedPriority); else node.style.removeProperty('display');
+          css=win.getComputedStyle(node);
+          var values=[frame?'url("'+frame.img.src+'"), '+css.backgroundImage:css.backgroundImage,frame?'100% 100%, '+css.backgroundSize:css.backgroundSize,frame?'0 0, '+css.backgroundPosition:css.backgroundPosition,frame?'no-repeat, '+css.backgroundRepeat:css.backgroundRepeat,display==='inline'?'inline-block':display,width==='auto'?node.width+'px':width,height==='auto'?node.height+'px':height];
+          for(var j=0;j<props.length;j++){ var p=props[j], v=node.style.getPropertyValue(p);
+            original[p]=v?{value:v,priority:node.style.getPropertyPriority(p)}:null;
+            node.style.setProperty(p,values[j],'important'); applied[p]=node.style.getPropertyValue(p);
+          }
+          canvasBackgrounds.set(node,{original:original,applied:applied});
+        }catch(e){}
       }
     }
     function fmt(ms){ var s=Math.max(0,Math.round(ms/1000)); var m=Math.floor(s/60); s=s%60; return m+':'+(s<10?'0':'')+s; }
@@ -2770,8 +2842,6 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
       var play=document.getElementById('bb-play');
       if(!play){ requestAnimationFrame(buildBar); return; }
       var total=1; try{ total=(player.getMetaData()||{}).totalTime||1; }catch(e){}
-      var evEl=document.getElementById('bb-ev'); if(evEl) evEl.textContent=String(events.length);
-      var durEl=document.getElementById('bb-dur'); if(durEl) durEl.textContent=fmt(total);
       var totEl=document.getElementById('bb-total'); if(totEl) totEl.textContent=fmt(total);
       var curEl=document.getElementById('bb-cur');
       var fill=document.querySelector('#bb-track .fill'), knob=document.querySelector('#bb-track .knob'), track=document.getElementById('bb-track');
@@ -2838,7 +2908,7 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
         for(var s=1;s<=SEG;s++){
           var pt=catmull(p0,p1,p2,p3,s/SEG);
           var frac=(i+s/SEG)/(n-1);        // 0 = oldest tail .. 1 = newest head
-          ctx.strokeStyle='rgba(74,222,128,'+(0.12+0.62*frac).toFixed(3)+')'; // FRACTURE "live" green
+          ctx.strokeStyle='rgba(74,222,128,'+(0.12+0.62*frac).toFixed(3)+')'; // interaction overlay green
           ctx.lineWidth=1.2+3.3*frac;      // taper: thin faint tail -> thick bright head
           ctx.beginPath(); ctx.moveTo(prev.x,prev.y); ctx.lineTo(pt.x,pt.y); ctx.stroke();
           prev=pt;
@@ -2973,31 +3043,31 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
       exPrepare();
       window.__bbExport = {
         total: (function(){ try{ return (player.getMetaData()||{}).totalTime||0; }catch(e){ return 0; } })(),
-        vw: vw, vh: vh,
-        // Enter export framing: hide the bars, fill the window with the frame at recorded aspect, and
-        // move the HUD inside the frame so an element-clip screenshot of .rr-player__frame includes it.
+        vw: recordedWidth, vh: recordedHeight,
+        version: 2,
+        controlsHeight: CTRL,
+        // The exporter fixes the tab viewport to the initial recording dimensions. Later viewport
+        // changes fit inside that same output frame, so ffmpeg never sees varying frame sizes.
         enterMode: function(keepChrome){
-          exportMode=true;
-          // Kill the cursor's 50ms slide so goto() snaps it to the exact frame position (else the settle
-          // screenshots it mid-transition and the trail head drifts off the cursor).
-          try{ var mEl=document.querySelector('.replayer-mouse'); if(mEl) mEl.style.transition='none'; }catch(e){}
-          if(keepChrome){ // keep the FRACTURE metabar+bar (video shows the whole player); capture full viewport
-            try{ if(player.triggerResize) player.triggerResize(); }catch(e){}
-            return true;
-          }
-          var mb=document.getElementById('bb-meta'), br=document.getElementById('bb-bar');
-          if(mb) mb.style.display='none'; if(br) br.style.display='none';
-          document.getElementById('bb-player').style.padding='0';
-          var s=Math.min(window.innerWidth/vw, window.innerHeight/vh); if(!(s>0)) s=0.1;
-          try{ player.$set({width:Math.round(vw*s),height:Math.round(vh*s)}); if(player.triggerResize) player.triggerResize(); }catch(e){}
-          try{ var fr=document.querySelector('.rr-player__frame').getBoundingClientRect(); hud.style.bottom=Math.max(8,(window.innerHeight - fr.bottom + Math.round(fr.height*0.03)))+'px'; }catch(e){}
+          exportMode=true; exportChrome=!!keepChrome;
+          var br=document.getElementById('bb-bar');
+          if(br) br.style.display=keepChrome?'flex':'none';
+          document.getElementById('bb-player').style.padding=keepChrome?'0 0 '+CTRL+'px':'0';
+          hud.style.bottom=(keepChrome?CTRL+16:16)+'px';
+          fit();
           return true;
         },
         // Seek to ms and draw the reconstructed overlay for that instant (call, wait a beat, screenshot).
-        renderAt: function(ms){
+        renderAt: async function(ms){
           try{ player.pause(); }catch(e){}
           try{ player.goto(ms); }catch(e){}
           try{ player.pause(); }catch(e){}
+          // goto() and the Svelte frame sizing can rebuild asynchronously. Paint only once the
+          // current document, its layout and decoded bitmaps are ready.
+          await new Promise(function(resolve){requestAnimationFrame(function(){requestAnimationFrame(resolve);});});
+          if(canvasLoaded<canvasPending || canvasFailed) throw new Error('captured canvas images are not ready');
+          fit();
+          await new Promise(function(resolve){requestAnimationFrame(resolve);});
           // Do NOT trust the seeked sprite: rrweb snaps it to the last ~500ms MouseMove BATCH, so it lags
           // and steps. Interpolate the exact-ms cursor from the dense EX_MOVES and OVERRIDE the sprite (after
           // goto, transition already off) so the visible cursor, comet head, and trail body are ONE source -
@@ -3007,7 +3077,8 @@ async function writeRrwebHtml(savePath: string, events: any[], meta: { title?: s
           if(trail.width!==vw||trail.height!==vh){ trail.width=vw; trail.height=vh; }
           ctx.clearRect(0,0,trail.width,trail.height);
           exTrail(ms, cur?cur.x:null, cur?cur.y:null); exClicks(ms); exHud(ms);
-          paintCanvasesAt(ms); // draw the captured canvas frame for this instant (images preloaded)
+          paintCanvasesAt(ms);
+          await new Promise(function(resolve){requestAnimationFrame(function(){requestAnimationFrame(resolve);});});
           return true;
         },
         // True once every captured canvas image has decoded - the exporter waits on this before the

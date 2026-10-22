@@ -6,6 +6,7 @@ import { record } from "rrweb";
 import { startCanvasCapture, type CanvasCaptureHandle } from "./canvas-capture";
 
 type StartOpts = {
+  recordingId?: string;
   allFrames?: boolean;
   maskInputs?: boolean;
   recordCanvas?: boolean;
@@ -30,34 +31,78 @@ const FLUSH_BYTES = 512 * 1024;
   let batch: any[] = [];
   let batchBytes = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  let recordingId = "";
+  let documentId = "";
+  let seq = 0;
+  const pending: { seq: number; events: any[] }[] = [];
+  let sending: Promise<void> | null = null;
 
-  const flush = () => {
+  async function deliver(item: { seq: number; events: any[] }): Promise<boolean> {
+    try {
+      const reply = await chrome.runtime.sendMessage({ cmd: "bb-rec", recordingId, documentId, ...item });
+      if (reply?.accepted) {
+        const i = pending.indexOf(item);
+        if (i >= 0) pending.splice(i, 1);
+        return true;
+      }
+      if (reply?.armed === false) {
+        pending.length = 0;
+        // A document restored from BFCache may outlive the tab's stopped recording.
+        if (w.__bbRec.recording) void w.__bbRec.stop(recordingId);
+      }
+    } catch { /* keep custody until the worker acknowledges this batch */ }
+    return false;
+  }
+  function pump(): Promise<void> {
+    if (sending) return sending;
+    sending = (async () => {
+      while (pending.length && await deliver(pending[0])) { /* ordered, acknowledged transfer */ }
+    })().finally(() => {
+      sending = null;
+      if (pending.length && !retryTimer) retryTimer = setTimeout(() => { retryTimer = null; void pump(); }, 250);
+    });
+    return sending;
+  }
+
+  const flush = (final = false) => {
     if (timer) {
       clearTimeout(timer);
       timer = null;
     }
-    if (!batch.length) return;
-    const events = batch;
-    batch = [];
-    batchBytes = 0;
-    // sendMessage wakes a sleeping MV3 service worker, so a long idle session still delivers.
-    try {
-      chrome.runtime.sendMessage({ cmd: "bb-rec", events });
-    } catch {
-      /* SW gone/asleep — the next batch retries; the periodic checkout bounds any loss */
+    if (batch.length) {
+      pending.push({ seq: ++seq, events: batch });
+      batch = [];
+      batchBytes = 0;
     }
+    // A dying document cannot wait for an earlier ACK before sending its tail. Duplicate delivery
+    // is harmless: the worker dedupes by documentId + seq.
+    if (final) for (const item of [...pending]) void deliver(item);
+    return pump();
   };
   const emit = (e: any) => {
-    batch.push(e);
+    batch.push({ ...e, bbDocumentId: documentId });
     batchBytes += eventBytes(e);
     if (batch.length >= 50 || batchBytes >= FLUSH_BYTES) flush();
-    else if (!timer) timer = setTimeout(flush, 300);
+    else if (!timer) timer = setTimeout(() => void flush(), 300);
   };
+  window.addEventListener("pagehide", () => { if (w.__bbRec.recording) void flush(true); });
+  window.addEventListener("pageshow", (e) => {
+    // A BFCache restore reuses this document. A fresh snapshot makes it a usable segment again.
+    if (e.persisted && w.__bbRec.recording) {
+      (record as any).takeFullSnapshot?.(true);
+      void flush();
+    }
+  });
 
   w.__bbRec = {
     recording: false,
     start(opts: StartOpts = {}) {
-      if (this.recording) return { started: false, reason: "already recording" };
+      if (this.recording) return { started: false, reason: "already recording", recordingId };
+      recordingId = opts.recordingId ?? "legacy";
+      documentId = crypto.randomUUID();
+      seq = 0;
+      pending.length = 0;
       const isTop = window === window.top;
       let crossOrigin = false;
       if (!isTop) {
@@ -81,6 +126,7 @@ const FLUSH_BYTES = 512 * 1024;
           recordCanvas: false,
           checkoutEveryNms: 30_000, // periodic full snapshot bounds loss on SW death
           maskAllInputs: !!opts.maskInputs,
+          maskTextSelector: opts.maskInputs ? '[contenteditable]:not([contenteditable="false"]), [contenteditable]:not([contenteditable="false"]) *' : undefined,
           sampling: { mousemove: 16 }, // ~60fps mouse sampling so the replay trail is dense enough to render smoothly
           inlineStylesheet: true,
           collectFonts: false,
@@ -103,19 +149,22 @@ const FLUSH_BYTES = 512 * 1024;
       keyHandler = (e: KeyboardEvent) => {
         try {
           let key = e.key;
+          let code = e.code;
           // Honor maskInputs: don't leak, in cleartext keystrokes, what input-masking would redact.
           if (mask && typeof key === "string" && key.length === 1) {
-            const t = e.target as any;
-            const tag = t && t.tagName;
-            const masked =
-              tag === "TEXTAREA" ||
-              (t && t.isContentEditable) ||
-              (tag === "INPUT" && /^(text|password|search|email|tel|url|number|)$/i.test(t.type || ""));
-            if (masked) key = "•";
+            const path = e.composedPath();
+            let focused: any = document.activeElement;
+            while (focused) {
+              path.push(focused);
+              focused = focused.shadowRoot?.activeElement;
+            }
+            const masked = path.some((t: any) => t?.tagName === "TEXTAREA" || t?.isContentEditable ||
+              (t?.tagName === "INPUT" && !/^(button|submit|reset|checkbox|radio|range|color|file|hidden)$/i.test(t.type || "")));
+            if (masked) { key = "•"; code = ""; }
           }
           (record as any).addCustomEvent("bb-key", {
             key,
-            code: e.code,
+            code,
             ctrl: e.ctrlKey,
             meta: e.metaKey,
             alt: e.altKey,
@@ -129,7 +178,8 @@ const FLUSH_BYTES = 512 * 1024;
       this.recording = true;
       return { started: true, top: isTop, crossOrigin };
     },
-    stop() {
+    async stop(expectedId?: string) {
+      if (expectedId && expectedId !== recordingId) return { stopped: false, reason: "different recording" };
       if (keyHandler) {
         try {
           document.removeEventListener("keydown", keyHandler, true);
@@ -150,9 +200,11 @@ const FLUSH_BYTES = 512 * 1024;
         /* already stopped */
       }
       stopFn = null;
-      flush();
       this.recording = false;
-      return { stopped: true };
+      // Stop the producer first, then wait for the worker to own the tail before the done marker.
+      await Promise.race([flush(), new Promise((resolve) => setTimeout(resolve, 2000))]);
+      if (!pending.length && retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+      return { stopped: true, drained: pending.length === 0 };
     },
   };
 })();

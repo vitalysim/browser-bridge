@@ -23,6 +23,12 @@ session_record_stop({ savePath, title?, autoplay? })   → { saved, htmlBytes, e
   canvas-heavy or very long recording (hundreds of MB) doesn't have to be slurped into memory whole.
 - **`session_record_status`** lists active recordings (tab, file, events so far).
 
+A second start on an already-recording tab is rejected without replacing its recorder or touching another output file.
+Startup registers the disk sink before injection. Navigation flushes queued clicks and mutations; batches are
+acknowledged and deduplicated by document and sequence number. Stop times out individual unresponsive frames and
+returns `warnings` while preserving the usable events. A stream without a base Meta/full snapshot is rejected;
+the raw JSONL remains available.
+
 Start options: `allFrames:true` also records **cross-origin iframes** (best-effort: injected per-frame with a per-frame
 timeout, so one wedged ad/embed frame can't stall the start); `maskInputs:true` redacts form values; `recordCanvas:true`
 captures **`<canvas>`/WebGL** as periodic image frames the replay paints (see **Canvas / WebGL** below). Stop options:
@@ -34,10 +40,10 @@ The replay **fills the viewer window at the recorded page's exact aspect ratio**
 sized to the recorded viewport and scaled to fit, so there's no wasted letterbox - just a dark margin around a
 correctly-proportioned replay. It **rescales on window resize** and follows mid-session viewport changes.
 
-The replay ships with a custom **FRACTURE**-styled player chrome: a monochrome black stage, a top metabar
-(`FRACTURE // <title>` + event count, duration, a live indicator) and a bottom control bar (play/pause, a mono
-timecode, a scrubber, `1×/2×/4×/8×` speed chips, skip-idle, the interactions toggle, and fullscreen). rrweb's default
-controller is hidden; the bar is wired to the player API.
+The replay is an **unbranded, minimal player**: the recorded page above a compact bottom bar with
+play/pause, time, a scrubber, `1×/2×/4×/8×` speeds, skip-idle, an interactions toggle and fullscreen.
+There is no logo or decorative header. The supplied title stays in the HTML document metadata.
+Previously generated HTML keeps its old appearance; regenerate from retained events to use the new player.
 
 ### Interaction overlay (mouse trail, clicks, keystrokes)
 - **Smooth mouse trail.** The replay draws a soft, rounded, brand-colored trail behind the cursor (replacing rrweb's
@@ -49,14 +55,15 @@ controller is hidden; the bar is wired to the player API.
     text**, and pastes/autofills are surfaced either way.
 - **Privacy.** Physical-key capture logs every keystroke, so with masking **off** (the default) it will show passwords
   key-by-key. Recording with `maskInputs:true` redacts printable keys typed into inputs (shown as `•`), consistent with
-  how it masks input values. Treat a recording as sensitive as the session it captured.
+  how it masks input values. Masking covers open shadow-root inputs and contenteditable text; identifying
+  printable key codes are removed as well. Treat a recording as sensitive as the session it captured.
 
 ## Canvas / WebGL (`recordCanvas:true`)
 
 Session replay reconstructs the DOM + CSS, not the page's JS runtime, so raw `<canvas>`/WebGL drawing is otherwise
 lost. With `recordCanvas:true` the recorder **samples each canvas as an image on a timer** and streams those frames
-alongside the DOM events; the replay player **paints the latest frame at-or-before the play head onto the replayed
-canvas** (matched by rrweb node id). It's off by default and adds weight, so turn it on only when the canvas is the
+alongside the DOM events; the replay player **displays the latest frame at-or-before the play head as a CSS bitmap on the replayed
+canvas** (matched by document segment and rrweb node id). It's off by default and adds weight, so turn it on only when the canvas is the
 point.
 
 - **How it reads pixels.** 2D canvases read back anytime. A WebGL canvas with the common `preserveDrawingBuffer:false`
@@ -78,8 +85,8 @@ point.
   frame) may be sampled between paints and read blank (also skipped + noted); continuously-animating canvases are the
   solid case. `canvas.captureStream()` would sidestep the rAF-timing issue for WebGL and is a possible future
   enhancement.
-- **Export.** The MP4 export (`render_recording_video`) waits until each frame's canvas image has decoded before it
-  screenshots, so exported canvas frames aren't stale. Regenerate the replay with this version for canvas frames to
+- **Export.** The MP4 export (`render_recording_video`) waits for decoded canvas images, replay reconstruction,
+  layout and painting before each screenshot. Script-disabled replay iframes stay script-disabled. Regenerate the replay with this version for canvas frames to
   appear.
 
 ## What makes this better than page-level rrweb
@@ -130,16 +137,19 @@ Turn a saved replay `.html` into a **high-resolution MP4**:
 
 ```
 render_recording_video({ htmlPath, out?, fps?, scale?, crf?, settleMs? })
-   → { saved, frames, fps, scale, durationMs }
+   → { saved, frames, fps, scale, width, height, durationMs }
 ```
 
 - **Deterministic + high-res.** It opens the replay in a tab and, for each frame, **seeks the player to an exact time,
   reconstructs the mouse-trail / click / keystroke overlay for that instant, and captures a lossless PNG at `scale`×**
-  the recorded viewport (default `2` ≈ retina/4K; `1` = native). Frame-exact - no dropped frames, no realtime capture.
+  the initial recorded viewport (default `2` ≈ retina/4K; `1` = native). Frame-exact - no dropped frames, no realtime capture.
+- A 1600×1000 recording produces 1600×1000 at `scale:1`, or 3200×2000 at `scale:2`, regardless of the viewer window.
+  Later viewport changes fit proportionally inside that fixed output frame. Odd dimensions round down to even
+  for H.264. With `chrome:true`, the 64px control bar is added to the initial viewport height before scaling.
 - The video is the **recorded page + the green interaction overlay, without the player bars**. `ffmpeg` encodes the
   frames to H.264 (`crf` default 16 ≈ visually lossless, `yuv420p` for universal playback).
 - **Options:** `fps` (default 30), `scale` (1-4), `crf` (0-51), `settleMs` (post-seek wait, default 40), `chrome`
-  (include the FRACTURE player metabar + control bar in the frame, not just the page + overlay), `out` (default = the
+  (include the unbranded bottom controls, not just the page + overlay), `out` (default = the
   `.html` path with `.mp4`).
 - **Caveats:** it drives a **focused** tab for the whole render (steals focus) and is not instant - roughly
   `frames × ~0.4-0.7 s` (a 30 s clip at 30 fps ≈ several minutes); lower `fps`/`scale` to go faster. Needs `ffmpeg` on

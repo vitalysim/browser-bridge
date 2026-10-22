@@ -56,6 +56,7 @@ interface Pending {
 export interface StreamMsg {
   type: "capture" | "watch";
   stream?: "session";
+  recordingId?: string;
   watchId?: string;
   tabId: number;
   frameId?: number;
@@ -89,6 +90,9 @@ export class ExtensionHub {
   // per-MCP-session tool closure) so session_record_stop can resolve the path regardless of which
   // MCP client/session issued session_record_start (start+stop need not share a session).
   private recordingPaths = new Map<number, string>();
+  private recordingStarts = new Set<number>();
+  private recordingIds = new Map<number, string>();
+  private recordingBatches = new Map<number, Set<string>>();
   // Last version-skew warning already logged, so a reconnecting extension doesn't spam the log.
   private lastSkewWarned: string | null = null;
   // session_record_stop waits for the recorder's streamed `done` before reading the events file.
@@ -360,9 +364,20 @@ export class ExtensionHub {
     for (const s of this.sessionSinks.values()) if (s.path === path) return true;
     return false;
   }
-  registerSessionSink(tabId: number, sink: CaptureSink): void {
+  registerSessionSink(tabId: number, sink: CaptureSink, recordingId?: string): void {
     this.sessionSinks.get(tabId)?.close();
     this.sessionSinks.set(tabId, sink);
+    if (recordingId) this.recordingIds.set(tabId, recordingId);
+    this.recordingBatches.set(tabId, new Set());
+  }
+  reserveSessionStart(tabId: number): void {
+    if (this.recordingStarts.has(tabId) || this.recordingPaths.has(tabId) || this.sessionSinks.has(tabId)) {
+      throw new Error(`a recording is already active or awaiting assembly for tab ${tabId}; stop it first`);
+    }
+    this.recordingStarts.add(tabId);
+  }
+  releaseSessionStart(tabId: number): void {
+    this.recordingStarts.delete(tabId);
   }
   closeSessionSink(tabId: number): number | undefined {
     const s = this.sessionSinks.get(tabId);
@@ -388,6 +403,8 @@ export class ExtensionHub {
     return [...this.recordingPaths.keys()];
   }
   deleteRecordingPath(tabId: number): boolean {
+    this.recordingIds.delete(tabId);
+    this.recordingBatches.delete(tabId);
     return this.recordingPaths.delete(tabId);
   }
 
@@ -469,9 +486,18 @@ export class ExtensionHub {
     // (!sink) return` below would never reach it.
     this.emitTaps(msg);
     const tabId = msg.tabId;
+    const recordingId = this.recordingIds.get(tabId);
+    if (msg.stream === "session" && recordingId && msg.recordingId !== recordingId) return;
     const sinks = msg.stream === "session" ? this.sessionSinks : this.captureSinks;
     const sink = sinks.get(tabId);
     if (!sink) return; // no sink (already closed, or capture wasn't started for this stream)
+    if (msg.stream === "session" && typeof msg.documentId === "string" && Number.isSafeInteger(msg.seq)) {
+      const seen = this.recordingBatches.get(tabId)!;
+      const key = `${msg.documentId}:${msg.seq}`;
+      if (seen?.has(key)) return;
+      seen?.add(key);
+      if (seen && seen.size > 4096) seen.delete(seen.values().next().value!);
+    }
     if (Array.isArray(msg.entries) && msg.entries.length) sink.append(msg.entries);
     if (msg.done) {
       sink.close();
