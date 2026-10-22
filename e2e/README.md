@@ -74,5 +74,9 @@ Chromium build spawned directly with `--remote-debugging-pipe`, configured throu
 to the extension's service worker only (no page is attached), with its own bridge server
 (`server-raw.log`). `harness.rawCdp` stays available for measurements. No dialog tracking in that mode.
 
+Known Linux limitation: focus emulation can leave frames throttled, delaying trusted actions and
+rAF commits despite `keptAlive:true`. `hidden-tab-raf-commit` retains its timing and commit assertions
+to expose this issue. Recording capture, canvas replay and MP4 export are covered independently.
+
 `trusted-click-sanity` is a harness self-check: it proves the `chrome.debugger` (CDP) path works in
 this Playwright-launched Chromium, so failures involving trusted escalation are product failures.
