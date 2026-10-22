@@ -438,6 +438,9 @@ export class Harness {
       [
         `--user-data-dir=${this.userDataDir}`,
         "--remote-debugging-pipe",
+        // Match Playwright's isolated Linux launch defaults. Ubuntu CI restricts unprivileged
+        // sandbox namespaces; the raw fixture browser otherwise exits before opening its pipe.
+        ...(process.platform === "linux" ? ["--no-sandbox", "--disable-dev-shm-usage"] : []),
         ...(this.headless ? ["--headless=new"] : []),
         `--disable-extensions-except=${extDir}`,
         `--load-extension=${extDir}`,
@@ -452,14 +455,18 @@ export class Harness {
         "--use-mock-keychain",
         "about:blank",
       ],
-      { stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"] }
+      { stdio: ["ignore", "ignore", "pipe", "pipe", "pipe"] }
     );
     this.browserProc = proc;
+    proc.stderr!.pipe(this.serverLog!, { end: false });
     const out = proc.stdio[3] as NodeJS.WritableStream;
     const inp = proc.stdio[4] as NodeJS.ReadableStream;
     let id = 0;
     let buf = "";
     const pending = new Map<number, (m: any) => void>();
+    proc.once("exit", (code, signal) => {
+      for (const reply of pending.values()) reply({ error: { message: `raw Chromium exited (${signal ?? code}); see ${this.opts.logName ?? "server.log"}` } });
+    });
     inp.on("data", (d: Buffer) => {
       buf += d.toString("utf8");
       let i: number;
@@ -476,6 +483,10 @@ export class Harness {
     out.on("error", () => {});
     const send = (method: string, params: any = {}, sessionId?: string) =>
       new Promise<any>((res, rej) => {
+        if (proc.exitCode !== null || proc.signalCode !== null) {
+          rej(new Error(`raw Chromium is not running; see ${this.opts.logName ?? "server.log"}`));
+          return;
+        }
         const i = ++id;
         const timer = setTimeout(() => (pending.delete(i), rej(new Error(`${method}: no answer in 10s`))), 10_000);
         pending.set(i, (m) => {

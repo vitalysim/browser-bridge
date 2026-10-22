@@ -21,6 +21,10 @@ Prerequisites: Node 20+, and Playwright's Chromium build **1248** in `~/Library/
 (`npx playwright-core install chromium` if it's missing). `npm test` runs `npm ci` in `server/` and
 `extension/` if their `node_modules` are missing, then `npm run build` in both.
 
+Recording/export scenarios also require **ffmpeg and ffprobe** on PATH (`brew install ffmpeg` on macOS,
+`sudo apt-get install ffmpeg` on Ubuntu). CI installs them explicitly. Its raw Chromium fixture uses the
+same Linux sandbox/shared-memory launch flags as Playwright; this only affects the isolated test browser.
+
 Environment knobs:
 
 | var | effect |

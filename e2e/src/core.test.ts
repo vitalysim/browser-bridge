@@ -568,6 +568,14 @@ scenario("input-coordinate-actions", async (c) => {
   e = await ev();
   c.expect(e.some((x) => x.t === "mousemove" && x.x === 200 && x.y === 210), `mouse_move events ${JSON.stringify(e)}`);
   await c.call("input", { action: "left_click_drag", x: 100, y: 100, x2: 300, y2: 250, tabId });
+  // Linux may acknowledge the final CDP dispatch before the renderer consumes the mouseup.
+  // Wait for the actual event, then retain the same coordinate assertions below.
+  await c.evalJs(tabId, `(async () => {
+    const deadline = Date.now() + 2000;
+    while (!window.__ev.some(e => e.t === 'mouseup' && e.x === 300 && e.y === 250) && Date.now() < deadline)
+      await new Promise(r => setTimeout(r, 20));
+    return true;
+  })()`);
   e = await ev();
   const down = e.find((x) => x.t === "mousedown");
   const up = e.find((x) => x.t === "mouseup");

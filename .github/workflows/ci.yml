@@ -69,6 +69,11 @@ jobs:
         working-directory: e2e
         run: npx playwright-core install --with-deps chromium
 
+      - name: Install recording export dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
       - name: Run the e2e suite
         working-directory: e2e
         run: xvfb-run --auto-servernum -- npm test
@@ -79,4 +84,5 @@ jobs:
         with:
           name: e2e-artifacts
           path: e2e/.artifacts
+          include-hidden-files: true
           retention-days: 7
