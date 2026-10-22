@@ -7,6 +7,7 @@ export interface DownloadStatus {
   state?: string; // "in_progress" | "complete" | "interrupted"
   bytesReceived?: number;
   totalBytes?: number;
+  fileSize?: number;
   danger?: string;
   paused?: boolean;
   error?: string;
@@ -35,15 +36,22 @@ export function downloadVerdict(
   opts: { now: number; cap?: number; stallMs?: number; downloadId?: number }
 ): DownloadVerdict {
   const id = opts.downloadId != null ? ` (downloadId ${opts.downloadId})` : "";
-  if (status.state === "complete") return { kind: "complete" };
   if (status.state === "interrupted") {
     return { kind: "fail", message: `Download interrupted: ${status.error ?? "unknown reason"}`, cancel: false };
   }
   const received = status.bytesReceived ?? 0;
-  const seen = (status.totalBytes ?? 0) > 0 ? status.totalBytes! : received;
-  if (opts.cap && seen > opts.cap) {
-    return { kind: "fail", message: `Download exceeded maxBytes (${opts.cap}); cancelled after ~${received} bytes.`, cancel: true };
+  // Fast transfers may finish before the first poll. Enforce the cap on every
+  // successful transfer, using all sizes Chrome knows before accepting completion.
+  const seen = Math.max(received, status.totalBytes ?? 0, status.fileSize ?? 0);
+  if (opts.cap !== undefined && seen > opts.cap) {
+    const cancel = status.state !== "complete";
+    return {
+      kind: "fail",
+      message: `Download exceeded maxBytes (${opts.cap}); ${cancel ? "cancelled after" : "received"} ~${seen} bytes.`,
+      cancel,
+    };
   }
+  if (status.state === "complete") return { kind: "complete" };
   const danger = status.danger;
   if (danger && !OK_DANGER.has(danger) && !SCANNING_DANGER.has(danger)) {
     return {

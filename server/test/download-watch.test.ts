@@ -61,3 +61,16 @@ test("maxBytes: enforced when given, unlimited when omitted", () => {
   assert.equal(v.kind, "fail");
   assert.equal((v as any).cancel, true);
 });
+
+test("maxBytes also rejects transfers completed before the first poll", () => {
+  for (const size of [{ bytesReceived: 5000 }, { totalBytes: 5000 }, { fileSize: 5000 }]) {
+    const v = downloadVerdict({ state: "complete", ...size }, fresh(), { now: T0, cap: 100 });
+    assert.equal(v.kind, "fail");
+    if (v.kind !== "fail") assert.fail("oversized completed transfer must fail");
+    assert.match(v.message, /exceeded maxBytes/);
+    assert.equal(v.cancel, false, "a completed transfer cannot be cancelled");
+  }
+  assert.equal(downloadVerdict({ state: "complete", fileSize: 100 }, fresh(), { now: T0, cap: 100 }).kind, "complete");
+  assert.equal(downloadVerdict({ state: "complete", fileSize: 5000 }, fresh(), { now: T0 }).kind, "complete");
+  assert.equal(downloadVerdict({ state: "complete", fileSize: 1 }, fresh(), { now: T0, cap: 0 }).kind, "fail");
+});
